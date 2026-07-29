@@ -30,9 +30,10 @@ pi-asd/
 ├── package.json          # pi 包：keywords ["pi-package"], pi.extensions ["./extensions"]
 ├── tsconfig.json
 ├── extensions/asd/
-│   ├── index.ts          # 唯一接触 pi 的文件：注册工具 + 挂事件
+│   ├── index.ts          # 唯一接触 pi 的文件：把 tools.ts 包成 pi 工具 + 挂事件
+│   ├── tools.ts          # 六个工具的实际逻辑，纯依赖注入，不 import pi
 │   ├── cli.ts            # asd 命令行封装：参数拼装、--json 解析、退出码分流
-│   ├── registry.ts       # 本次 boss spawn 出来的台账 + 命名（前缀、洗名、避重、对账）
+│   ├── registry.ts       # 本次 boss spawn 出来的台账 + 命名 + 复用挑选 + kill 守卫
 │   ├── watcher.ts        # 后台 follow 子进程的生命周期 + 结束回调
 │   └── prompt.ts         # boss mode 系统提示词拼装
 ├── test/                 # node:test
@@ -40,13 +41,17 @@ pi-asd/
 │   ├── registry.test.ts
 │   ├── watcher.test.ts
 │   ├── prompt.test.ts
+│   ├── tools.test.ts
 │   └── e2e.test.ts
 └── README.md / LICENSE
 ```
 
 ### 依赖边界
 
-`cli.ts`、`registry.ts`、`watcher.ts`、`prompt.ts` **都不 import pi**。
+`cli.ts`、`registry.ts`、`watcher.ts`、`prompt.ts`、`tools.ts` **都不 import pi**。
+`index.ts` 只做接线：把 `pi.exec` 适配成注入的 `exec`、把 `pi.sendMessage` 适配成
+注入的 `notify`、把 `tools.ts` 的六个函数包成 `pi.registerTool` 调用。工具逻辑
+本身（尤其 kill 守卫）因此能在 `tools.test.ts` 里用假 `exec` 直接测。
 
 - `cli.ts` 接收一个注入的 `exec(cmd: string, args: string[], opts?) => Promise<{ stdout, stderr, exitCode }>`。
 - `watcher.ts` 接收同一个 `exec` 再加一个 `notify(text: string) => void` 回调。
@@ -287,7 +292,7 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 
 ## 测试策略
 
-四个纯模块用假 `exec` 全测：
+五个纯模块用假 `exec` 全测：
 
 - **`cli.test.ts`** — 每个命令的参数拼装（尤其 `--cmd` 那串 env 前缀 +
   shellEscape）、`asd list --json` 解析、退出码 0/3/4 的分流、stderr 透传。
@@ -295,7 +300,11 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
   连续 `-`）、64 字符截断；对账：`asd list` 里消失的条目被移除；复用挑选：
   agent/cwd 都匹配且 idle 才算候选，多个候选取 `idle_ms` 最大，`running` 的不算，
   给了 `name` 时只认同名那个；**kill 守卫：台账外的名字拒绝、`createdByUs !== true`
-  的记录拒绝，两种情况都断言假 exec 上没有发生过任何 `asd kill` 调用**。
+  的记录拒绝。
+- **`tools.test.ts`** — 六个工具的行为：spawn 命中复用走 `send` 而不是 `new`、
+  未命中才 `new`、`reuse: false` 强制新建、`watch: false` 不挂 watcher；steer
+  成功后重挂 watcher；peek/follow 撞上 session 消失时清台账；**kill 守卫的两种
+  拒绝路径都要断言假 exec 上没有发生过任何 `asd kill` 调用**。
 - **`watcher.test.ts`** — 状态机：follow 返回 → 触发 peek → 触发 notify；退出码 3
   走"已结束"文案；退出码 4 走"超时"文案且不重挂；abort 后不再 notify；同一 session
   不重复挂。
