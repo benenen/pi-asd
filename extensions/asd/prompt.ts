@@ -13,6 +13,13 @@ export interface PromptAgent {
 }
 
 export interface PromptInput {
+  /**
+   * boss mode 开关。**默认关闭**，由 `/asd:boss-start` 打开。
+   *
+   * 关闭时整个函数返回空串 —— 系统提示词一个字都不加。这个判断放在这里而不是
+   * `index.ts`，是因为 `index.ts` 是唯一 import pi 的文件、没有单测夹具。
+   */
+  enabled: boolean;
   agents: PromptAgent[];
   /** boss 自己所在的 asd session（`ASD_SESSION`），可能没有。 */
   bossSession?: string;
@@ -26,6 +33,8 @@ function preview(task: string): string {
 }
 
 export function bossModePrompt(input: PromptInput): string {
+  if (!input.enabled) return "";
+
   const sections: string[] = [];
 
   const definition = [

@@ -75,6 +75,11 @@ export default function (pi: ExtensionAPI): void {
   // parentSession 那样随 session_start 变化 —— 一次性读出来注入即可。
   // `tools.ts` 不读 process.env，这是它拿到这个值的唯一路径。
   const bossSession = process.env.ASD_SESSION;
+  /**
+   * boss mode 开关，默认关闭 —— 只有 `/asd:boss-start` 才打开。
+   * 进程内状态，不持久化（和台账一致），重启后回到关闭。
+   */
+  let bossMode = false;
   const tools = createTools({
     asd,
     registry,
@@ -99,6 +104,7 @@ export default function (pi: ExtensionAPI): void {
     systemPrompt:
       event.systemPrompt +
       bossModePrompt({
+        enabled: bossMode,
         bossSession,
         agents: registry.list().map((r) => ({
           session: r.session,
@@ -268,6 +274,36 @@ export default function (pi: ExtensionAPI): void {
     }),
     async execute(_id, params) {
       return toolResult(await tools.kill(params));
+    },
+  });
+
+  pi.registerCommand("asd:boss-start", {
+    description: "打开 boss mode：把任务拆开派给跑在独立 asd session 里的子 agent",
+    handler: async (_args, ctx) => {
+      if (bossMode) {
+        ctx.ui.notify("boss mode 已经是开着的。", "info");
+        return;
+      }
+      bossMode = true;
+      ctx.ui.notify("boss mode 已打开。下一轮起会注入拆任务和监控的提示词。", "info");
+    },
+  });
+
+  pi.registerCommand("asd:boss-stop", {
+    description: "关闭 boss mode：不再注入提示词（已派出去的 agent 不受影响）",
+    handler: async (_args, ctx) => {
+      if (!bossMode) {
+        ctx.ui.notify("boss mode 本来就是关着的。", "info");
+        return;
+      }
+      bossMode = false;
+      const alive = registry.names().length;
+      ctx.ui.notify(
+        alive > 0
+          ? `boss mode 已关闭。${alive} 个 agent 仍在跑，它们停下时结果照样会推给你；要结束用 asd_kill。`
+          : "boss mode 已关闭。",
+        "info",
+      );
     },
   });
 }
