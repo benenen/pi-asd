@@ -6,7 +6,7 @@ import { formatDuration, WatcherPool } from "../extensions/asd/watcher.ts";
 interface Harness {
   pool: WatcherPool;
   notes: string[];
-  /** 放行某个 session 的 follow，交出结果。 */
+  /** 放行某个 session 的 follow，交出结果。仅在 `instantFollow` 未设置时有用。 */
   settle(session: string, outcome: FollowOutcome): void;
   /** 放行某个 session 悬着的 peek，交出屏幕内容。仅在 `pausePeek: true` 时有用。 */
   settlePeek(session: string, screen: string | null): void;
@@ -24,8 +24,23 @@ interface Harness {
  * `pausePeek: true` 时 peek 同样会挂住，直到测试调 settlePeek()/rejectPeek() ——
  * 这是为了能造出"follow 已经 settle、peek 还没回来"这个竞态窗口，不然 stop()
  * 在这个窗口期是否还生效根本测不出来。
+ *
+ * `instantFollow` 设置时 follow 立刻自解（不进 pendingFollow，不用 settle()）——
+ * 用来模拟真 asd 对一个已经安静的 session 的行为（C2 回归：这种 session
+ * follow 是立即返回的，不是再等 2 秒）。
+ *
+ * `earlyRetryDelayMs` 透传给 WatcherPool，默认 0——测试不需要真的等
+ * `EARLY_RETRY_DELAY_MS` 那么久；需要验证真实等待本身时才显式传一个很小的
+ * 真实值。
  */
-function harness(o: { peek?: string | null; pausePeek?: boolean } = {}): Harness {
+function harness(
+  o: {
+    peek?: string | null;
+    pausePeek?: boolean;
+    instantFollow?: FollowOutcome;
+    earlyRetryDelayMs?: number;
+  } = {},
+): Harness {
   const pendingFollow = new Map<string, (out: FollowOutcome) => void>();
   const pendingPeek = new Map<string, { resolve: (s: string | null) => void; reject: (e: Error) => void }>();
   const followCalls: string[] = [];
@@ -55,6 +70,7 @@ function harness(o: { peek?: string | null; pausePeek?: boolean } = {}): Harness
     },
     async follow(name: string) {
       followCalls.push(name);
+      if (o.instantFollow !== undefined) return o.instantFollow;
       return new Promise<FollowOutcome>((resolve) => pendingFollow.set(name, resolve));
     },
     async kill() {
@@ -67,6 +83,7 @@ function harness(o: { peek?: string | null; pausePeek?: boolean } = {}): Harness
     notify: (t) => notes.push(t),
     timeout: "30m",
     now: () => clock.t,
+    earlyRetryDelayMs: o.earlyRetryDelayMs ?? 0,
   });
 
   return {
@@ -271,6 +288,95 @@ test("冷启动止损有次数上限 —— 屏幕一直空着，重挂到上限
   assert.match(h.notes[0], /已停下/);
   assert.equal(h.pool.isWatching("pi-a"), false);
   assert.ok(rounds < 20, "重挂次数应该在到达上限时自己停下，不是被外层循环的余量强行截断");
+});
+
+// --- C2 量纲修复回归 ---
+//
+// 真机复现：`asd follow` 对一个已经安静的 session 是立即返回的（不是再等 2
+// 秒），实测重挂一次只要几十毫秒。旧实现在决定"悄悄重挂"之后立刻同步重挂，
+// 不做任何真实等待 —— 于是 EARLY_MAX_RETRIES(10) 次重挂在远不到 1 秒内就会
+// 全部烧光，EARLY_GRACE_MS(20 秒) 这个宽限期在真机上从未真正生效过。下面
+// 两个测试直接钉住这一点：真的量出"重挂之间有没有真实等待"，而不是像旧的
+// C2 测试那样只靠可以手动摆布的假 follow + 手动 settle 来分阶段断言。
+
+test("C2 回归：follow 对已安静的 session 立即自解时，重挂之间必须真的流逝时间，不能几十毫秒就把 10 次重挂全部烧光", async () => {
+  // instantFollow + peek 恒为空：完全复刻真机行为——follow 立刻 settled，
+  // 屏幕一直没有内容。earlyRetryDelayMs 给一个很小但真实的值（不是 0），
+  // 这样测试用真实的 setTimeout 轮询就能测到"重挂之间确实有等待"，又不用
+  // 真的等上秒级。
+  const h = harness({
+    instantFollow: { kind: "settled", text: "" },
+    peek: "",
+    earlyRetryDelayMs: 15,
+  });
+
+  const t0 = Date.now();
+  h.pool.watch("iso-late");
+
+  // 用真实的小段轮询等它收尾（次数上限最终会兜底，见上面那个测试）——这里
+  // 不能用 waitFor：waitFor 纯靠微任务自旋，旧 bug 和新实现在微任务层面
+  // 看起来完全一样（都是"重挂→再重挂"），只有真实挂钟时间能把两者分开。
+  while (h.pool.isWatching("iso-late")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const elapsed = Date.now() - t0;
+
+  assert.equal(h.notes.length, 1, "重挂次数到了上限之后必须照常通知一次");
+  assert.match(h.notes[0], /已停下/);
+  // 旧 bug：10 次重挂总共只花几十毫秒（每次几毫秒开销）。修复之后，重挂
+  // 之间应该有 earlyRetryDelayMs 量级的真实等待——哪怕只挂起了几轮也该有
+  // 明显可测的挂钟耗时，而不是旧 bug 那种"瞬间烧光"。
+  assert.ok(
+    elapsed >= 15 * 3,
+    `重挂之间应该有真实等待，实际总耗时只有 ${elapsed}ms（旧 bug 下这里通常 < 10ms）`,
+  );
+});
+
+test("C2 回归：时钟推过 EARLY_GRACE_MS 后立刻通知，不等次数上限", async () => {
+  // pausePeek 给出一个"peek 已发出、还没结果"的检查点，让测试能在这个
+  // 节点上手动把（可注入的）时钟往前拨，模拟"宽限期内" vs "宽限期已过"
+  // 两种情况，而不用真的等 20 秒。
+  const h = harness({ instantFollow: { kind: "settled", text: "" }, pausePeek: true, earlyRetryDelayMs: 0 });
+  h.pool.watch("iso-late"); // mountedAt = clock.t = 0，attempts = 0
+
+  await waitFor(() => h.peekCalls.length === 1);
+  h.clock.t = 5_000; // 还在 20 秒宽限期内
+  h.settlePeek("iso-late", ""); // 屏幕仍是空的
+  await waitFor(() => h.followCalls.length === 2);
+  assert.deepEqual(h.notes, [], "才 5 秒，还在宽限期内，不该通知");
+  assert.equal(h.pool.isWatching("iso-late"), true);
+
+  await waitFor(() => h.peekCalls.length === 2);
+  h.clock.t = 21_000; // 推过 20 秒宽限线——此时只重挂了 1 次，远没到 10 次上限
+  h.settlePeek("iso-late", "");
+  await h.pool.idle();
+
+  assert.equal(h.followCalls.length, 2, "宽限期已过，不该再重挂第三次");
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0], /已停下/);
+  assert.equal(h.pool.isWatching("iso-late"), false);
+});
+
+test("C2 量纲修复：重挂前的真实等待期间，isWatching 必须全程保持 true", async () => {
+  // 真实但很小的等待（40ms），配合真实的 setTimeout 轮询——这钉住"sleep 必须
+  // 放在 #finish 之前"这条不变量：等待窗口里 #running 不能被提前摘掉，否则
+  // asd_agents() 会谎报没在挂，rewatch() 还可能借机叠一个新 watcher 上去。
+  const h = harness({ instantFollow: { kind: "settled", text: "" }, peek: "", earlyRetryDelayMs: 40 });
+  h.pool.watch("iso-late");
+
+  let sawWatchingDuringWait = false;
+  const deadline = Date.now() + 500;
+  while (h.pool.isWatching("iso-late") && Date.now() < deadline) {
+    assert.equal(h.pool.isWatching("iso-late"), true, "等待窗口期间 isWatching 不能变成 false");
+    sawWatchingDuringWait = true;
+    await new Promise((resolve) => setTimeout(resolve, 3));
+  }
+  assert.ok(sawWatchingDuringWait, "测试本身要至少探测到一次等待中的状态，不然这条断言没测到东西");
+
+  while (h.pool.isWatching("iso-late")) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(h.notes.length, 1, "最终应该照常收尾并通知一次");
 });
 
 test("follow 已经 settle、peek 还没回来时调 stop —— 这个窗口期 stop 必须仍然生效", async () => {

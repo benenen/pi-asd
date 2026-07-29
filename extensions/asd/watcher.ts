@@ -16,6 +16,13 @@ export interface WatcherDeps {
   /** 传给 `asd follow --timeout` 的时长串，例如 "30m"。 */
   timeout: string;
   now: () => number;
+  /**
+   * 冷启动止损重挂前的真实等待（毫秒）。默认 `EARLY_RETRY_DELAY_MS`。
+   *
+   * 只在测试里需要覆盖成 0 —— 生产代码永远不传这个字段，吃默认值。见
+   * `EARLY_RETRY_DELAY_MS` 上面那段注释：这就是 C2 量纲修复的核心。
+   */
+  earlyRetryDelayMs?: number;
 }
 
 /** `252000` → `"4m12s"`。 */
@@ -38,6 +45,16 @@ export function formatDuration(ms: number): string {
  */
 const EARLY_GRACE_MS = 20_000;
 const EARLY_MAX_RETRIES = 10;
+
+/**
+ * C2 量纲修复：`asd follow` 对一个已经安静了一段时间的 session 是**立即
+ * 返回**的（不是再等 2 秒）—— 实测重挂一次的真实成本只有几十毫秒。如果重挂
+ * 之间不主动等待，`EARLY_GRACE_MS` 这 20 秒宽限期在真机上就是死代码：
+ * `EARLY_MAX_RETRIES` 次重挂在远不到 1 秒内就会全部烧光，冷启动稍慢的 agent
+ * 照样会被误判成"已经停下"。所以每次决定悄悄重挂之前，先真等这么久，让
+ * "宽限期"真的对应真实流逝的时间，而不是重挂次数。
+ */
+const EARLY_RETRY_DELAY_MS = 1_000;
 
 export class WatcherPool {
   readonly #deps: WatcherDeps;
@@ -132,9 +149,7 @@ export class WatcherPool {
       // 冷启动止损：屏幕真的是空的（不是 null —— null 是"session 已经不在
       // 了"，那是完全不同的情况，必须照常通知，见下面的默认分支），而且这个
       // session 还在"刚挂上没多久"的宽限期里、重挂次数也没到上限 —— 这更像
-      // "agent 还没来得及吐出第一帧"，不是"真的做完了"。摘掉这一代、悄悄
-      // 重挂一代新的，不通知；`isWatching()` 全程保持 true（#finish 和
-      // watch() 之间没有任何 await，外部观察不到"没在挂"的空档）。
+      // "agent 还没来得及吐出第一帧"，不是"真的做完了"。
       const early = this.#early.get(session);
       const screenIsEmpty = screen !== null && screen.trim().length === 0;
       if (
@@ -144,6 +159,14 @@ export class WatcherPool {
         early.attempts < EARLY_MAX_RETRIES
       ) {
         early.attempts += 1;
+        // 真等一会儿再重挂（见 EARLY_RETRY_DELAY_MS 上面的注释）—— 这段等待
+        // 必须放在 #finish 之前：#running 里这一代的 controller 还没被摘掉，
+        // isWatching() 全程保持 true。等待本身要响应 abort：stop()/stopAll()
+        // 在这期间调用会立刻让 #sleep 返回，下面 `ctrl.signal.aborted` 一
+        // 检查就安静退出，不会补发通知，也不会再重挂出下一代。
+        await this.#sleep(this.#deps.earlyRetryDelayMs ?? EARLY_RETRY_DELAY_MS, ctrl.signal);
+        if (ctrl.signal.aborted) return;
+        // #finish 和 watch() 之间没有任何 await，外部观察不到"没在挂"的空档。
         this.#finish(session, ctrl);
         this.watch(session);
         return;
@@ -176,6 +199,26 @@ export class WatcherPool {
    */
   #finish(session: string, ctrl: AbortController): void {
     if (this.#running.get(session) === ctrl) this.#running.delete(session);
+  }
+
+  /**
+   * 真等 `ms` 毫秒，但响应 abort —— `signal` 一 abort 立刻 resolve，不会让
+   * stop()/stopAll() 卡在这里等一整个 `EARLY_RETRY_DELAY_MS`。`ms <= 0`
+   * 直接同步 resolve（测试用，注入 0 跳过真实等待）。
+   */
+  #sleep(ms: number, signal: AbortSignal): Promise<void> {
+    if (ms <= 0 || signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   /**
