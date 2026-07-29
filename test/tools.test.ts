@@ -471,6 +471,25 @@ test("candidates 标出哪些不是本 boss 建的", async () => {
   assert.match(foreign.text, /不能 kill/);
 });
 
+test("candidates 里已经收养过的 session（在台账里但 createdByUs=false）仍然标不能 kill", async () => {
+  const h = harness({
+    live: [info("mem", { running: false, command: "claude" })],
+    cards: [card("mem", "/w/mem")],
+  });
+  // 模拟"已经被收养过一次"：在台账里，但不是我们建的。
+  h.registry.add({
+    session: "mem",
+    task: "上一轮的任务",
+    cwd: "/w/mem",
+    agent: "claude",
+    createdAt: 0,
+    createdByUs: false,
+    watching: false,
+  });
+  const r = await h.tools.candidates({});
+  assert.match(r.text, /不能 kill/, "mine 的判据必须是 createdByUs，不是「在不在台账里」");
+});
+
 test("candidates 一个都没有时明确说明", async () => {
   const h = harness();
   const r = await h.tools.candidates({});
@@ -539,6 +558,53 @@ test("收养来的 session 永远不能被 kill —— 守卫承重", async () =
   assert.match(r.text, /不是 pi-asd 新建/);
   assert.equal(h.calls.length, before, "kill 拒绝路径上不该有任何新的 asd 调用");
   assert.equal(h.registry.size, 1, "被拒绝的记录不该被摘掉");
+});
+
+test("并发指名收养同一个 session：只有一次真正送达，另一次被屏障挡下", async () => {
+  const h = harness({
+    live: [info("mem", { running: false, command: "claude --dangerously-skip-permissions" })],
+    cards: [card("mem", "/w/mem")],
+  });
+
+  // 屏障必须在第一次 await 之前同步占住，顺序 await 两次测不出这条缝隙 ——
+  // 必须用 Promise.all 真并发触发。
+  const [r1, r2] = await Promise.all([
+    h.tools.spawn({ task: "任务A", session: "mem" }),
+    h.tools.spawn({ task: "任务B", session: "mem" }),
+  ]);
+
+  const results = [r1, r2];
+  const ok = results.filter((r) => r.isError === undefined);
+  const rejected = results.filter((r) => r.isError === true);
+  assert.equal(ok.length, 1, "两次并发收养同一个 session，只能有一次真正成功");
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0].text, /正在被另一次 spawn 处理/);
+  assert.equal(
+    subcommands(h).filter((c) => c === "send").length,
+    1,
+    "只应该真正 send 一次 —— 不能把两段不相关的任务文本都敲进目标 session",
+  );
+  h.watchers.stopAll();
+});
+
+test("收养的早退路径（目标正忙）之后，预留会被释放，下一次仍能真正送达", async () => {
+  const h = harness({
+    live: [info("busy", { running: true, command: "claude" })],
+    cards: [card("busy", "/w")],
+  });
+  const r1 = await h.tools.spawn({ task: "t1", session: "busy" });
+  assert.equal(r1.isError, true);
+  assert.ok(!subcommands(h).includes("send"));
+
+  // 它后来空下来了。
+  h.live[0].running = false;
+  const r2 = await h.tools.spawn({ task: "t2", session: "busy" });
+  assert.equal(r2.isError, undefined, r2.text);
+  assert.ok(
+    subcommands(h).includes("send"),
+    "如果预留没释放，第二次会被「正在被另一次 spawn 处理」挡住，走不到 send",
+  );
+  h.watchers.stopAll();
 });
 
 // --- 并发 spawn ---

@@ -168,34 +168,44 @@ export function createTools(deps: ToolDeps): Tools {
     return watching;
   }
 
-  /** 指名收养一个已存在的空闲 session。任何校验不过都不发送任何东西。 */
+  /**
+   * 指名收养一个已存在的空闲 session。任何校验不过都不发送任何东西。
+   *
+   * 屏障必须在第一次 `await` 之前**同步**占住：`reserved.has` 检查和
+   * `reserved.add` 中间不能有任何 await 缝隙，否则两个并发收养同一个 session
+   * 的请求会都通过入口检查（这里以前就是这么错的 —— `reserved.add` 挪到了
+   * `await asd.list()`/`await asd.cards()` 之后，两次并发调用都能挤过
+   * `reserved.has` 那道同步检查，各自 await 完再各自 `send`，导致同一个
+   * session 背靠背收到两段不相关的任务文本）。占位之后所有校验失败/成功的
+   * 分支都用同一层 `try/finally` 收尾，不再叠一层嵌套的 try/finally。
+   */
   async function adopt(session: string, task: string, wantWatch: boolean): Promise<ToolResult> {
     if (reserved.has(session)) {
       return err(`"${session}" 正在被另一次 spawn 处理，稍后再试。`);
     }
-    const live = await asd.list();
-    const info = live.find((s) => s.session === session);
-    if (info === undefined) {
-      return err(`asd 里没有叫 "${session}" 的 session。先用 asd_candidates 看看哪些能接活。`);
-    }
-    if (info.running) {
-      return err(`"${session}" 正在干活，不会打断它。等它闲下来，或者另开一个。`);
-    }
-    const agent = agentOfCommand(info.command, presets);
-    if (agent === undefined) {
-      return err(
-        `认不出 "${session}" 里跑的是哪个 agent（前台进程是 ${info.command}）。` +
-          `往裸 shell 里送任务描述会被当命令执行，所以拒绝。`,
-      );
-    }
-    const cards = await asd.cards();
-    const card = cards.find((c) => c.session === session);
-    if (card === undefined) {
-      return err(`拿不到 "${session}" 的 card（工作目录），不会盲发任务。asd card 只对本地 daemon 可用。`);
-    }
-
     reserved.add(session);
     try {
+      const live = await asd.list();
+      const info = live.find((s) => s.session === session);
+      if (info === undefined) {
+        return err(`asd 里没有叫 "${session}" 的 session。先用 asd_candidates 看看哪些能接活。`);
+      }
+      if (info.running) {
+        return err(`"${session}" 正在干活，不会打断它。等它闲下来，或者另开一个。`);
+      }
+      const agent = agentOfCommand(info.command, presets);
+      if (agent === undefined) {
+        return err(
+          `认不出 "${session}" 里跑的是哪个 agent（前台进程是 ${info.command}）。` +
+            `往裸 shell 里送任务描述会被当命令执行，所以拒绝。`,
+        );
+      }
+      const cards = await asd.cards();
+      const card = cards.find((c) => c.session === session);
+      if (card === undefined) {
+        return err(`拿不到 "${session}" 的 card（工作目录），不会盲发任务。asd card 只对本地 daemon 可用。`);
+      }
+
       const known = registry.get(session);
       if (!(await asd.send(session, task))) {
         if (known !== undefined) {
@@ -375,7 +385,9 @@ export function createTools(deps: ToolDeps): Tools {
           title: info.title,
           agent,
           idleMs: info.idle_ms,
-          mine: registry.get(info.session) !== undefined,
+          // "mine" 是"asd_kill 能不能碰它"的判据，不是"台账里有没有它"——
+          // 收养来的 session 也在台账里，但 createdByUs 是 false，仍然不能 kill。
+          mine: registry.get(info.session)?.createdByUs === true,
         });
       }
       rows.sort((a, b) => b.idleMs - a.idleMs);
