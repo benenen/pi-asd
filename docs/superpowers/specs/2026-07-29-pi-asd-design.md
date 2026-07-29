@@ -75,9 +75,29 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
 六个工具，全部带 `asd_` 前缀——pi-room 的工具就叫 `peek` / `steer`，pi-boss 的叫
 `spawn`，带前缀是为了和它们共存时不撞名。
 
-### `asd_spawn(task, name?, cwd?, agent?, watch?)`
+### `asd_spawn(task, name?, cwd?, agent?, watch?, reuse?)`
 
-建一个 asd session 并在里面跑 agent。
+派一个任务给 agent。**先找可复用的空闲 agent，找不到才建新 session。**
+
+- **复用判定**（`reuse` 默认 `true`，置 `false` 强制新建）。候选**只在台账内找**：
+
+  - `agent` 相同、`cwd` 相同；
+  - session 仍在 `asd list` 里，且 `running === false`（agent 停下来等输入了）。
+
+  给了 `name` → 候选只有叫 `<prefix><洗过的 name>` 的那一个。
+  没给 `name` → 所有匹配的候选里取 `idle_ms` 最大的（闲最久的那个）。
+
+  命中就 `asd send <名> --text <task> --enter` 把新任务打进去，重挂 watcher，
+  返回里标明"复用"。没命中才走下面的新建流程。
+
+- **为什么不复用台账外的 session。** `asd list --json` 的 `SessionInfo` **没有 cwd**
+  （只有 `name` / `command` / `title` / `pid` / `idle_ms` / `running` /
+  `created_ms` / `attached_clients`），`command` 是前台进程名且注释标了 display-only。
+  判不出一个陌生 session 在哪个目录、跑的是不是同一种 agent，塞任务进去轻则跑错
+  目录，重则污染用户自己正在用的会话。等 asd 在 `list` 里暴露 workspace 之后可以
+  再放开。
+
+新建时：
 
 - **命名**：`<prefix><name>`，`prefix` 默认 `pi-`（env `PI_ASD_PREFIX` 可改）。
   给了 `name` 就是 `pi-auth-fix`；没给就按台账序号 `pi-agent1` / `pi-agent2`。
@@ -141,7 +161,22 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
 
 ### `asd_kill(session)`
 
-`asd kill <名>`，同时停 watcher、从台账移除。只接受台账里的名字。
+`asd kill <名>`，同时停 watcher、从台账移除。
+
+> **硬不变量：只能 kill pi-asd 自己新建的 session。**
+>
+> 台账每条记录带一个 `createdByUs: boolean`，只有走过 `asd new` 那条路径的才置
+> `true`。`asd_kill` 在打 `asd kill` 之前必须同时满足两条：**(1)** 名字在台账里，
+> **(2)** 该条记录 `createdByUs === true`。任何一条不满足就直接返回 `isError`，
+> **绝不执行 `asd kill`**。
+>
+> 现阶段复用范围限定在台账内，所以每条记录本来都是自己建的、`createdByUs` 恒为
+> `true`——这个守卫此刻是冗余的。它就是要冗余：将来一旦放开台账外复用，被复用的
+> session 会进台账，那一刻这个守卫是用户手建 session 和 `asd kill` 之间唯一的
+> 拦截。守卫要有独立的单测，不许因为"现在恒真"就省掉。
+>
+> 同理，`session_shutdown` 里本来就不杀任何 session，`asd kill --all` 在
+> pi-asd 里**任何路径都不允许出现**。
 
 ## follow watcher
 
@@ -233,6 +268,8 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 - `asd_spawn` 缺 `task`。
 - `asd_steer` / `asd_kill` / `asd_peek` / `asd_follow` 的 `session` 不在台账里 →
   明确说"这不是本 boss spawn 的 agent"，并列出台账里有哪些。
+- `asd_kill` 的目标在台账里但 `createdByUs !== true` → 拒绝，说明"这个 session
+  不是 pi-asd 新建的，不会 kill"。**不执行 `asd kill`。**
 - `asd new` 非零退出 → 透传 asd 自己的 stderr。
 
 **不算错，是状态：**
@@ -255,7 +292,10 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 - **`cli.test.ts`** — 每个命令的参数拼装（尤其 `--cmd` 那串 env 前缀 +
   shellEscape）、`asd list --json` 解析、退出码 0/3/4 的分流、stderr 透传。
 - **`registry.test.ts`** — 命名：前缀、自动编号、撞名追加后缀、洗名（非法字符、
-  连续 `-`）、64 字符截断；对账：`asd list` 里消失的条目被移除。
+  连续 `-`）、64 字符截断；对账：`asd list` 里消失的条目被移除；复用挑选：
+  agent/cwd 都匹配且 idle 才算候选，多个候选取 `idle_ms` 最大，`running` 的不算，
+  给了 `name` 时只认同名那个；**kill 守卫：台账外的名字拒绝、`createdByUs !== true`
+  的记录拒绝，两种情况都断言假 exec 上没有发生过任何 `asd kill` 调用**。
 - **`watcher.test.ts`** — 状态机：follow 返回 → 触发 peek → 触发 notify；退出码 3
   走"已结束"文案；退出码 4 走"超时"文案且不重挂；abort 后不再 notify；同一 session
   不重复挂。
@@ -283,4 +323,7 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 - **不做 pane 高亮的等价物。** asd 没有 session 着色，`asd ui` 侧边栏已经有
   running/idle 高亮。
 - **不持久化台账。** boss 重启后台账为空。
+- **不复用台账外的 session。** 见 `asd_spawn` 一节的理由——`asd list --json` 不给
+  cwd。等 asd 在 `list` 里暴露 workspace 之后可以再放开，届时 `createdByUs` 守卫
+  就从冗余变成必需。
 - **不做远程 spawn。** asd 支持 SSH 远端 daemon，但 pi-asd 只打本地 `asd`。
