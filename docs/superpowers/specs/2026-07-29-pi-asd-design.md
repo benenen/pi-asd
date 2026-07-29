@@ -31,7 +31,7 @@ pi-asd/
 ├── tsconfig.json
 ├── extensions/asd/
 │   ├── index.ts          # 唯一接触 pi 的文件：把 tools.ts 包成 pi 工具 + 挂事件
-│   ├── tools.ts          # 六个工具的实际逻辑，纯依赖注入，不 import pi
+│   ├── tools.ts          # 七个工具的实际逻辑，纯依赖注入，不 import pi
 │   ├── cli.ts            # asd 命令行封装：参数拼装、--json 解析、退出码分流
 │   ├── registry.ts       # 本次 boss spawn 出来的台账 + 命名 + 复用挑选 + kill 守卫
 │   ├── watcher.ts        # 后台 follow 子进程的生命周期 + 结束回调
@@ -50,7 +50,7 @@ pi-asd/
 
 `cli.ts`、`registry.ts`、`watcher.ts`、`prompt.ts`、`tools.ts` **都不 import pi**。
 `index.ts` 只做接线：把 `pi.exec` 适配成注入的 `exec`、把 `pi.sendMessage` 适配成
-注入的 `notify`、把 `tools.ts` 的六个函数包成 `pi.registerTool` 调用。工具逻辑
+注入的 `notify`、把 `tools.ts` 的七个函数包成 `pi.registerTool` 调用。工具逻辑
 本身（尤其 kill 守卫）因此能在 `tools.test.ts` 里用假 `exec` 直接测。
 
 - `cli.ts` 接收一个注入的 `exec(cmd: string, args: string[], opts?) => Promise<{ stdout, stderr, exitCode }>`。
@@ -78,7 +78,7 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
 
 ## 工具面
 
-六个工具，全部带 `asd_` 前缀——pi-room 的工具就叫 `peek` / `steer`，pi-boss 的叫
+七个工具，全部带 `asd_` 前缀——pi-room 的工具就叫 `peek` / `steer`，pi-boss 的叫
 `spawn`，带前缀是为了和它们共存时不撞名。
 
 ### `asd_spawn(task, session?, name?, cwd?, agent?, watch?, reuse?)`
@@ -340,7 +340,7 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
   agent/cwd 都匹配且 idle 才算候选，多个候选取 `idle_ms` 最大，`running` 的不算，
   给了 `name` 时只认同名那个；**kill 守卫：台账外的名字拒绝、`createdByUs !== true`
   的记录拒绝。
-- **`tools.test.ts`** — 六个工具的行为：spawn 命中复用走 `send` 而不是 `new`、
+- **`tools.test.ts`** — 七个工具的行为：spawn 命中复用走 `send` 而不是 `new`、
   未命中才 `new`、`reuse: false` 强制新建、`watch: false` 不挂 watcher；steer
   成功后重挂 watcher；peek/follow 撞上 session 消失时清台账；**kill 守卫的两种
   拒绝路径都要断言假 exec 上没有发生过任何 `asd kill` 调用**。

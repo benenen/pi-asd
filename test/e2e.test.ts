@@ -9,7 +9,17 @@ import { Registry } from "../extensions/asd/registry.ts";
 import { WatcherPool } from "../extensions/asd/watcher.ts";
 import { createTools, type AgentPreset } from "../extensions/asd/tools.ts";
 
-/** asd 装了才跑这一组；CI 上没装就整体跳过。 */
+/**
+ * asd 装了才跑这一组；CI 上没装就整体跳过。
+ *
+ * 这是仓库里唯一一处不经过隔离 env（`ASD_SOCKET` + `XDG_DATA_HOME`）直接裸调
+ * `asd` 的地方——**这是刻意的例外，不是疏漏**。`--version` 是 clap 内置的
+ * 元数据子命令，在连上任何 socket、碰任何 daemon 之前就返回，不读也不建
+ * session、不触碰真实用户的 9 个工作会话。真正会碰 daemon 的任何子命令
+ * （`list`/`new`/`peek`/`send`/`follow`/`kill`/...）都必须走下面的
+ * `realExec()`，把 `ASD_SOCKET` 和 `XDG_DATA_HOME` 都钉死在临时目录里 ——
+ * 别把这处例外当模板抄到别的地方去。
+ */
 async function hasAsd(): Promise<boolean> {
   return await new Promise((resolve) => {
     execFile("asd", ["--version"], (e) => resolve(e === null));
