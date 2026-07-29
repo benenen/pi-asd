@@ -140,3 +140,19 @@ test("退出码 127 也当成 asd 没装", async () => {
   const { exec } = fakeExec([{ code: 127, stderr: "asd: command not found" }]);
   await assert.rejects(() => createAsd(exec).list(), (e: unknown) => e instanceof AsdMissingError);
 });
+
+test("cards 打 asd card list --json 并解析出 cwd 和 docs", async () => {
+  const { exec, calls } = fakeExec([
+    { stdout: '[{"session":"mem","status":"idle","cwd":"/w/mem","docs":["README.md","CLAUDE.md"]}]' },
+  ]);
+  const rows = await createAsd(exec).cards();
+  assert.deepEqual(calls[0].args, ["card", "list", "--json"]);
+  assert.equal(rows[0].session, "mem");
+  assert.equal(rows[0].cwd, "/w/mem");
+  assert.deepEqual(rows[0].docs, ["README.md", "CLAUDE.md"]);
+});
+
+test("cards 拿到不是 JSON 的东西时抛 AsdError 而不是 SyntaxError", async () => {
+  const { exec } = fakeExec([{ stdout: "not json" }]);
+  await assert.rejects(() => createAsd(exec).cards(), (e: unknown) => e instanceof AsdError);
+});

@@ -3,7 +3,13 @@ import assert from "node:assert/strict";
 import { createAsd, type Exec, type ExecResult, type SessionInfo } from "../extensions/asd/cli.ts";
 import { Registry } from "../extensions/asd/registry.ts";
 import { WatcherPool } from "../extensions/asd/watcher.ts";
-import { buildSpawnCommand, createTools, shellEscape, type Tools } from "../extensions/asd/tools.ts";
+import {
+  agentOfCommand,
+  buildSpawnCommand,
+  createTools,
+  shellEscape,
+  type Tools,
+} from "../extensions/asd/tools.ts";
 
 interface Harness {
   tools: Tools;
@@ -31,12 +37,21 @@ function info(session: string, o: Partial<SessionInfo> = {}): SessionInfo {
   };
 }
 
+function card(session: string, cwd: string, docs: string[] = []): {
+  session: string;
+  status: string;
+  cwd: string;
+  docs: string[];
+} {
+  return { session, status: "idle", cwd, docs };
+}
+
 /**
  * 假 exec：按子命令决定回什么。live 数组由测试直接改，改完下一次 asd list 就生效。
  * follow 永远挂住不返回 —— watcher 的行为在 watcher.test.ts 里测过了，这里只关心
  * "有没有挂上"。
  */
-function harness(o: { live?: SessionInfo[] } = {}): Harness {
+function harness(o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[] } = {}): Harness {
   const calls: string[][] = [];
   const live = o.live ?? [];
 
@@ -46,6 +61,8 @@ function harness(o: { live?: SessionInfo[] } = {}): Harness {
     switch (args[0]) {
       case "list":
         return ok(JSON.stringify(live));
+      case "card":
+        return ok(JSON.stringify(o.cards ?? []));
       case "new":
         return ok(`${args[1]}\n`);
       case "peek":
@@ -373,6 +390,154 @@ test("kill 拒绝 createdByUs 为 false 的记录，并且一次 asd kill 都没
   assert.equal(r.isError, true);
   assert.match(r.text, /不是 pi-asd 新建/);
   assert.equal(h.calls.length, 0, "拒绝路径上不该有任何 asd 调用");
+  assert.equal(h.registry.size, 1, "被拒绝的记录不该被摘掉");
+});
+
+test("agentOfCommand 从前台进程认出 agent，认不出裸 shell", () => {
+  const p = { pi: { command: (t: string) => `pi ${t}`, piChild: true } };
+  assert.equal(agentOfCommand("pi", p), "pi");
+  assert.equal(agentOfCommand("/usr/local/bin/pi --resume", p), "pi");
+  assert.equal(agentOfCommand("bash", p), undefined);
+  assert.equal(agentOfCommand("sh -c 'echo hi'", p), undefined);
+  assert.equal(agentOfCommand("", p), undefined);
+});
+
+test("candidates 只留空闲、能认出 agent、且有 card 的", async () => {
+  const h = harness({
+    live: [
+      info("busy", { running: true, command: "claude --dangerously-skip-permissions" }),
+      info("shell", { running: false, command: "bash", idle_ms: 9_000 }),
+      info("nocard", { running: false, command: "claude", idle_ms: 9_000 }),
+      info("good", { running: false, command: "claude --dangerously-skip-permissions", idle_ms: 100 }),
+    ],
+    cards: [card("busy", "/w"), card("shell", "/w"), card("good", "/w/proj", ["README.md"])],
+  });
+  const r = await h.tools.candidates({});
+  assert.match(r.text, /good/);
+  assert.doesNotMatch(r.text, /busy/);
+  assert.doesNotMatch(r.text, /shell/);
+  assert.doesNotMatch(r.text, /nocard/);
+  assert.match(r.text, /\/w\/proj/);
+  assert.match(r.text, /README\.md/);
+});
+
+test("candidates 按闲得最久排在前面", async () => {
+  const h = harness({
+    live: [
+      info("short", { running: false, command: "claude", idle_ms: 1_000 }),
+      info("long", { running: false, command: "claude", idle_ms: 90_000 }),
+    ],
+    cards: [card("short", "/w"), card("long", "/w")],
+  });
+  const r = await h.tools.candidates({});
+  assert.ok(r.text.indexOf("long") < r.text.indexOf("short"), "闲最久的应当排在前面");
+});
+
+test("candidates 的 cwd 过滤是精确匹配", async () => {
+  const h = harness({
+    live: [
+      info("here", { running: false, command: "claude" }),
+      info("there", { running: false, command: "claude" }),
+    ],
+    cards: [card("here", "/w/a"), card("there", "/w/b")],
+  });
+  const r = await h.tools.candidates({ cwd: "/w/a" });
+  assert.match(r.text, /here/);
+  assert.doesNotMatch(r.text, /there/);
+});
+
+test("candidates 标出哪些不是本 boss 建的", async () => {
+  const h = harness({
+    live: [info("mine", { running: false, command: "claude" })],
+    cards: [card("mine", "/w")],
+  });
+  h.registry.add({
+    session: "mine",
+    task: "t",
+    cwd: "/w",
+    agent: "claude",
+    createdAt: 0,
+    createdByUs: true,
+    watching: false,
+  });
+  const own = await h.tools.candidates({});
+  assert.doesNotMatch(own.text, /不能 kill/);
+
+  const h2 = harness({
+    live: [info("theirs", { running: false, command: "claude" })],
+    cards: [card("theirs", "/w")],
+  });
+  const foreign = await h2.tools.candidates({});
+  assert.match(foreign.text, /不能 kill/);
+});
+
+test("candidates 一个都没有时明确说明", async () => {
+  const h = harness();
+  const r = await h.tools.candidates({});
+  assert.match(r.text, /没有/);
+});
+
+test("spawn 指名收养：送任务、以 createdByUs=false 记账、挂 watcher", async () => {
+  const h = harness({
+    live: [info("mem", { running: false, command: "claude --dangerously-skip-permissions" })],
+    cards: [card("mem", "/w/mem", ["README.md"])],
+  });
+  const r = await h.tools.spawn({ task: "查一下这个", session: "mem" });
+  assert.equal(r.isError, undefined, r.text);
+  assert.ok(subcommands(h).includes("send"));
+  assert.ok(!subcommands(h).includes("new"), "收养不该新建 session");
+  const rec = h.registry.get("mem");
+  assert.equal(rec?.createdByUs, false);
+  assert.equal(rec?.agent, "claude");
+  assert.equal(rec?.cwd, "/w/mem");
+  assert.match(r.text, /不会结束它|不是 pi-asd 建的/);
+  assert.equal(h.watchers.isWatching("mem"), true);
+  h.watchers.stopAll();
+});
+
+test("spawn 拒绝收养正在干活的 session，且不发送任何东西", async () => {
+  const h = harness({
+    live: [info("busy", { running: true, command: "claude" })],
+    cards: [card("busy", "/w")],
+  });
+  const r = await h.tools.spawn({ task: "t", session: "busy" });
+  assert.equal(r.isError, true);
+  assert.ok(!subcommands(h).includes("send"));
+  assert.equal(h.registry.size, 0);
+});
+
+test("spawn 拒绝收养裸 shell —— 任务描述会被当命令执行", async () => {
+  const h = harness({
+    live: [info("shell", { running: false, command: "bash" })],
+    cards: [card("shell", "/w")],
+  });
+  const r = await h.tools.spawn({ task: "rm 掉旧日志", session: "shell" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /bash/);
+  assert.ok(!subcommands(h).includes("send"), "拒绝路径上绝不能 send");
+  assert.equal(h.registry.size, 0);
+});
+
+test("spawn 拒绝收养 asd 里不存在的 session", async () => {
+  const h = harness();
+  const r = await h.tools.spawn({ task: "t", session: "ghost" });
+  assert.equal(r.isError, true);
+  assert.ok(!subcommands(h).includes("send"));
+});
+
+test("收养来的 session 永远不能被 kill —— 守卫承重", async () => {
+  const h = harness({
+    live: [info("mem", { running: false, command: "claude" })],
+    cards: [card("mem", "/w/mem")],
+  });
+  await h.tools.spawn({ task: "t", session: "mem", watch: false });
+  assert.equal(h.registry.get("mem")?.createdByUs, false);
+
+  const before = h.calls.length;
+  const r = await h.tools.kill({ session: "mem" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /不是 pi-asd 新建/);
+  assert.equal(h.calls.length, before, "kill 拒绝路径上不该有任何新的 asd 调用");
   assert.equal(h.registry.size, 1, "被拒绝的记录不该被摘掉");
 });
 

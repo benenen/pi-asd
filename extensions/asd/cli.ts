@@ -53,6 +53,21 @@ export interface SessionInfo {
   attached_clients: number;
 }
 
+/**
+ * `asd card list --json` 的一行 —— 一个 session"是干什么的"。
+ *
+ * `asd list` 回答"有哪些"，`asd card` 回答"这一个是为什么存在的"：它的工作
+ * 目录，以及那个目录下的项目文档。挑一个已有 session 交任务时靠它。
+ * **只对本地 daemon 可用**（目录是从 session 自己的进程读的）。
+ */
+export interface CardInfo {
+  session: string;
+  status: string;
+  cwd: string;
+  /** README.md / CLAUDE.md / AGENTS.md / CONTRIBUTING.md 里实际存在的那些。 */
+  docs: string[];
+}
+
 export type FollowOutcome =
   | { kind: "settled"; text: string }
   | { kind: "timeout"; text: string }
@@ -62,6 +77,8 @@ export interface Asd {
   /** `asd new`；返回 asd 实际用的名字（它自己会回显到 stdout）。 */
   create(o: { name: string; cwd: string; cmd: string }): Promise<string>;
   list(): Promise<SessionInfo[]>;
+  /** `asd card list --json`：每个 session 的工作目录和项目文档。 */
+  cards(): Promise<CardInfo[]>;
   /** session 不存在时返回 null。 */
   peek(name: string, scrollback?: number): Promise<string | null>;
   /** session 不存在时返回 false。 */
@@ -126,6 +143,21 @@ export function createAsd(exec: Exec): Asd {
         throw new AsdError(1, `asd list --json 应该给一个数组，实际拿到 ${typeof parsed}`);
       }
       return parsed as SessionInfo[];
+    },
+
+    async cards() {
+      const r = await run(["card", "list", "--json"]);
+      if (r.code !== 0) fail(r, "card list");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(r.stdout);
+      } catch {
+        throw new AsdError(1, `asd card list --json 的输出不是 JSON：${r.stdout.slice(0, 200)}`);
+      }
+      if (!Array.isArray(parsed)) {
+        throw new AsdError(1, `asd card list --json 应该给一个数组，实际拿到 ${typeof parsed}`);
+      }
+      return parsed as CardInfo[];
     },
 
     async peek(name, scrollback) {

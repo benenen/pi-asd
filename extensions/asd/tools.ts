@@ -33,6 +33,21 @@ export function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * 从 `asd list --json` 的 `command`（pty 的前台进程）认出它跑的是哪个 agent 预设。
+ *
+ * 认不出来就返回 undefined。**这是个安全判断，不是便利判断**：认不出多半意味着
+ * 那是个裸 shell，把任务描述 `send` 进去会被当成命令执行。宁可拒绝也不猜。
+ */
+export function agentOfCommand(
+  command: string,
+  presets: Record<string, AgentPreset>,
+): string | undefined {
+  const first = command.trim().split(/\s+/)[0] ?? "";
+  const base = first.split("/").pop() ?? "";
+  return base.length > 0 && Object.hasOwn(presets, base) ? base : undefined;
+}
+
 export function buildSpawnCommand(o: {
   agent: string;
   task: string;
@@ -80,6 +95,11 @@ export interface ToolDeps {
 
 export interface SpawnParams {
   task: string;
+  /**
+   * 指名把任务交给这个**已经存在**的 session（可以不是 pi-asd 建的）。
+   * 给了它就走收养路径，不做自动复用、也不新建。
+   */
+  session?: string;
   name?: string;
   cwd?: string;
   agent?: string;
@@ -90,6 +110,7 @@ export interface SpawnParams {
 export interface Tools {
   spawn(p: SpawnParams): Promise<ToolResult>;
   agents(): Promise<ToolResult>;
+  candidates(p: { cwd?: string }): Promise<ToolResult>;
   peek(p: { session: string; scrollback?: number }): Promise<ToolResult>;
   follow(p: { session: string; mode?: "settle" | "end"; timeout?: string }): Promise<ToolResult>;
   steer(p: { session: string; message: string }): Promise<ToolResult>;
@@ -147,10 +168,78 @@ export function createTools(deps: ToolDeps): Tools {
     return watching;
   }
 
+  /** 指名收养一个已存在的空闲 session。任何校验不过都不发送任何东西。 */
+  async function adopt(session: string, task: string, wantWatch: boolean): Promise<ToolResult> {
+    if (reserved.has(session)) {
+      return err(`"${session}" 正在被另一次 spawn 处理，稍后再试。`);
+    }
+    const live = await asd.list();
+    const info = live.find((s) => s.session === session);
+    if (info === undefined) {
+      return err(`asd 里没有叫 "${session}" 的 session。先用 asd_candidates 看看哪些能接活。`);
+    }
+    if (info.running) {
+      return err(`"${session}" 正在干活，不会打断它。等它闲下来，或者另开一个。`);
+    }
+    const agent = agentOfCommand(info.command, presets);
+    if (agent === undefined) {
+      return err(
+        `认不出 "${session}" 里跑的是哪个 agent（前台进程是 ${info.command}）。` +
+          `往裸 shell 里送任务描述会被当命令执行，所以拒绝。`,
+      );
+    }
+    const cards = await asd.cards();
+    const card = cards.find((c) => c.session === session);
+    if (card === undefined) {
+      return err(`拿不到 "${session}" 的 card（工作目录），不会盲发任务。asd card 只对本地 daemon 可用。`);
+    }
+
+    reserved.add(session);
+    try {
+      const known = registry.get(session);
+      if (!(await asd.send(session, task))) {
+        if (known !== undefined) {
+          registry.remove(session);
+          watchers.stop(session);
+        }
+        return err(`"${session}" 的 session 已经不在了。`);
+      }
+      if (known === undefined) {
+        registry.add({
+          session,
+          task,
+          cwd: card.cwd,
+          agent,
+          createdAt: now(),
+          // 不是我们建的 —— asd_kill 从此永远拒绝它。
+          createdByUs: false,
+          watching: false,
+        });
+      } else {
+        known.task = task;
+      }
+      const watching = rewatch(session, wantWatch);
+      const mine = known?.createdByUs === true;
+      return {
+        text:
+          `任务已送给 "${session}"（${agent}，${card.cwd}）。` +
+          (mine ? "" : `这个 session 不是 pi-asd 建的，asd_kill 不会结束它。`) +
+          (watching ? "watcher 已挂上，它停下来时结果会自动推给你。" : ""),
+        details: { session, agent, cwd: card.cwd, adopted: !mine, watching },
+      };
+    } finally {
+      reserved.delete(session);
+    }
+  }
+
   return {
     async spawn(p) {
       if (typeof p.task !== "string" || p.task.trim().length === 0) {
         return err("task 不能为空 —— 派给 agent 的任务描述必须自包含。");
+      }
+      // 指名收养：走完就返回，不做自动复用、也不新建。
+      if (p.session !== undefined) {
+        return await adopt(p.session, p.task, p.watch !== false);
       }
       const agent = p.agent ?? config.defaultAgent;
       if (!presets[agent]) {
@@ -256,6 +345,63 @@ export function createTools(deps: ToolDeps): Tools {
       return {
         text: (lines.length > 0 ? lines.join("\n") : "没有存活的 agent。") + goneLine,
         details: { count: lines.length, ended: gone.map((g) => g.session) },
+      };
+    },
+
+    async candidates(p) {
+      const [cards, live] = await Promise.all([asd.cards(), asd.list()]);
+      const cardBy = new Map(cards.map((c) => [c.session, c]));
+
+      const rows: {
+        session: string;
+        cwd: string;
+        docs: string[];
+        title: string;
+        agent: string;
+        idleMs: number;
+        mine: boolean;
+      }[] = [];
+      for (const info of live) {
+        if (info.running) continue;
+        const agent = agentOfCommand(info.command, presets);
+        if (agent === undefined) continue;
+        const card = cardBy.get(info.session);
+        if (card === undefined) continue;
+        if (p.cwd !== undefined && card.cwd !== p.cwd) continue;
+        rows.push({
+          session: info.session,
+          cwd: card.cwd,
+          docs: card.docs,
+          title: info.title,
+          agent,
+          idleMs: info.idle_ms,
+          mine: registry.get(info.session) !== undefined,
+        });
+      }
+      rows.sort((a, b) => b.idleMs - a.idleMs);
+
+      if (rows.length === 0) {
+        return {
+          text:
+            p.cwd === undefined
+              ? "没有空闲且能接活的 session。"
+              : `${p.cwd} 下没有空闲且能接活的 session。`,
+          details: { count: 0 },
+        };
+      }
+
+      const lines = rows.map((r) => {
+        const head = `${r.session}（${r.agent}，闲了 ${formatDuration(r.idleMs)}${
+          r.mine ? "" : "，不是本 boss 建的：收养后不能 kill"
+        }）`;
+        const parts = [head, `  目录：${r.cwd}`];
+        if (r.docs.length > 0) parts.push(`  文档：${r.docs.join(" ")}`);
+        if (r.title.length > 0) parts.push(`  正在做：${r.title}`);
+        return parts.join("\n");
+      });
+      return {
+        text: lines.join("\n"),
+        details: { count: rows.length, sessions: rows.map((r) => r.session) },
       };
     },
 

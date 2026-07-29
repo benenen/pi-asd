@@ -40,6 +40,9 @@ function harness(o: { peek?: string | null; pausePeek?: boolean } = {}): Harness
     async list(): Promise<SessionInfo[]> {
       return [];
     },
+    async cards() {
+      return [];
+    },
     async peek(name: string) {
       peekCalls.push(name);
       if (o.pausePeek) {
@@ -260,6 +263,9 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
       throw new Error("用不到");
     },
     async list(): Promise<SessionInfo[]> {
+      return [];
+    },
+    async cards() {
       return [];
     },
     async peek() {

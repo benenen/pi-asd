@@ -50,3 +50,10 @@ test("bossSession 给了就写进提示词，没给就不写", () => {
   assert.match(bossModePrompt({ agents: [], bossSession: "a" }), /你自己跑在 asd session "a"/);
   assert.doesNotMatch(bossModePrompt({ agents: [] }), /你自己跑在 asd session/);
 });
+
+test("定义段告诉 boss 可以先看候选再指名把任务交出去", () => {
+  const p = bossModePrompt({ agents: [] });
+  assert.match(p, /asd_candidates/);
+  assert.match(p, /session:/);
+  assert.match(p, /asd_kill 不会结束它/);
+});

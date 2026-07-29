@@ -41,6 +41,12 @@ export function bossModePrompt(input: PromptInput): string {
     "",
     "asd_spawn 会先找台账里 agent 和 cwd 都对得上、而且已经空闲的 session 复用，",
     "找不到才新建 —— 所以不用担心派活派出一堆重复 session。",
+    "",
+    "也可以把任务交给一个**已经在跑的**空闲 session（包括不是你 spawn 的）：先调",
+    'asd_candidates 看它们各自在哪个目录、有什么项目文档、正在做什么，再用',
+    'asd_spawn(task, session: "<名字>") 指名交给它。绝不要不看就交 —— 那可能是',
+    "用户自己正在用的会话。",
+    "收养来的 session 不是 pi-asd 建的，asd_kill 不会结束它。这是有意的，别绕。",
   ];
   if (input.bossSession !== undefined) {
     definition.push("", `你自己跑在 asd session "${input.bossSession}" 里，不要对它做任何操作。`);
