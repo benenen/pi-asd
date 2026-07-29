@@ -67,7 +67,8 @@ pi-asd/
 | 命令 | 用途 | 契约 |
 |---|---|---|
 | `asd new <name> --cwd <d> --cmd <s>` | 建 session | stdout 是最终 session 名；`--cmd` 走 `sh -c`；daemon 不在会自动拉起 |
-| `asd list --json` | 状态对账 | 数组，元素含 `session` / `status` / `running` / `idle_ms` / `title` / `pid` / `cols` / `rows` |
+| `asd list --json` | 状态对账 | 数组，元素含 `session` / `status` / `running` / `idle_ms` / `title` / `command` / `pid` / `cols` / `rows` |
+| `asd card list --json` | 挑选候选 | 数组，元素含 `session` / `status` / `cwd` / `docs[]`。`cwd` 是从 session 自己的进程读的工作目录；`docs` 是该目录下的项目文档（README/CLAUDE/AGENTS/CONTRIBUTING）。**仅本地 daemon 可用。** |
 | `asd peek <name> [--scrollback N]` | 读一屏 | stdout 是渲染后的屏幕文本 |
 | `asd send <name> --text <t> --enter` | 打字 | `--text` 原样送出，不做转义、不隐式换行 |
 | `asd follow <name> [--forever] [--timeout D]` | 阻塞到停下 | 退出码 0=静默/结束，3=无此 session，4=超时 |
@@ -80,29 +81,39 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
 六个工具，全部带 `asd_` 前缀——pi-room 的工具就叫 `peek` / `steer`，pi-boss 的叫
 `spawn`，带前缀是为了和它们共存时不撞名。
 
-### `asd_spawn(task, name?, cwd?, agent?, watch?, reuse?)`
+### `asd_spawn(task, session?, name?, cwd?, agent?, watch?, reuse?)`
 
-派一个任务给 agent。**先找可复用的空闲 agent，找不到才建新 session。**
+派一个任务给 agent。三条路，按优先级：**指名收养 → 台账内自动复用 → 新建**。
 
-- **复用判定**（`reuse` 默认 `true`，置 `false` 强制新建）。候选**只在台账内找**：
+#### 1. 指名收养（`session` 给了时）
 
-  - `agent` 相同、`cwd` 相同；
-  - session 仍在 `asd list` 里，且 `running === false`（agent 停下来等输入了）。
+把任务交给一个**已经存在的** session，不管它是不是 pi-asd 建的。这条路只在
+boss 明确点名时走，**永远不会自动发生** —— 往用户自己正在用的会话里塞任务是有
+后果的动作，必须是模型看过 `asd_candidates` 的输出之后作出的选择。
 
-  给了 `name` → 候选只有叫 `<prefix><洗过的 name>` 的那一个。
-  没给 `name` → 所有匹配的候选里取 `idle_ms` 最大的（闲最久的那个）。
+收养前逐条校验，任何一条不过就返回 `isError` 且**不发送任何东西**：
 
-  命中就 `asd send <名> --text <task> --enter` 把新任务打进去，重挂 watcher，
-  返回里标明"复用"。没命中才走下面的新建流程。
+- session 在 `asd list` 里存在；
+- `running === false`（它闲着）；
+- `asd list --json` 的 `command` 字段能匹配上某个已知 agent 预设（`pi` /
+  `claude` / `codex`）。**这一条是硬拦截**：`command` 是 pty 的前台进程，如果那
+  是个裸 shell（`bash` / `zsh`），把任务描述 `send` 进去会被当命令执行。宁可拒绝。
 
-- **为什么不复用台账外的 session。** `asd list --json` 的 `SessionInfo` **没有 cwd**
-  （只有 `name` / `command` / `title` / `pid` / `idle_ms` / `running` /
-  `created_ms` / `attached_clients`），`command` 是前台进程名且注释标了 display-only。
-  判不出一个陌生 session 在哪个目录、跑的是不是同一种 agent，塞任务进去轻则跑错
-  目录，重则污染用户自己正在用的会话。等 asd 在 `list` 里暴露 workspace 之后可以
-  再放开。
+通过后 `asd send <名> --text <task> --enter`，并以 **`createdByUs: false`** 记进
+台账，照常挂 watcher。返回里必须写明"收养了一个不是 pi-asd 建的 session，它不会
+被 `asd_kill` 结束"。
 
-新建时：
+#### 2. 台账内自动复用（`session` 没给、`reuse !== false`）
+
+候选只在台账内找：`agent` 相同、`cwd` 相同、session 仍在 `asd list` 里且
+`running === false`。给了 `name` → 只认叫 `<prefix><洗过的 name>` 的那一个；
+没给 → 取 `idle_ms` 最大的（闲最久的）。命中就 `asd send` 打进去、重挂 watcher，
+返回标明"复用"。
+
+**自动复用不碰台账外的 session。** 自动挑中用户的工作会话是不能接受的默认行为，
+外部 session 只能走上面的指名收养。
+
+#### 3. 新建（前两条都没命中）
 
 - **命名**：`<prefix><name>`，`prefix` 默认 `pi-`（env `PI_ASD_PREFIX` 可改）。
   给了 `name` 就是 `pi-auth-fix`；没给就按台账序号 `pi-agent1` / `pi-agent2`。
@@ -135,8 +146,32 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
   session 标题、watcher 是否在跑。
 - 台账为空时明确返回 "没有 spawn 出来的 agent"。
 
-**不碰台账以外的 session。** 用户手建的 `a` / `mem` / `server` 不会出现在这里，也
-不会被 `asd_kill` 碰到。
+**只列台账里的。** 台账外的 session 要看得用 `asd_candidates`。
+
+### `asd_candidates(cwd?)`
+
+列出**所有当前空闲、且看起来能接活**的 session，供 boss 挑一个交给
+`asd_spawn(task, session: "<名字>")`。这是"指名收养"那条路的入口，也是它唯一
+正当的信息来源 —— 让模型在看清一个 session 在哪、在做什么之后再决定要不要占用它。
+
+数据来自两条命令的合并（按 `session` 名 join）：
+
+- `asd card list --json` → `cwd`、`docs[]`
+- `asd list --json` → `running`、`idle_ms`、`title`、`command`
+
+过滤与排序：
+
+- 只留 `running === false` 的；
+- 只留 `command` 能匹配上已知 agent 预设的（裸 shell 不是候选，理由见
+  `asd_spawn` 的收养校验）；
+- 给了 `cwd` 就只留工作目录精确等于它的；
+- 按 `idle_ms` 从大到小排（闲最久的排前面）。
+
+每条返回：session 名、`cwd`、`docs` 列表、`title`（它正在做什么 —— agent 会把
+当前任务写进终端标题）、认出来的 agent 种类、闲了多久，以及**它是不是本 boss
+台账里的**。最后一项决定了收养它之后能不能 `asd_kill`。
+
+一条都没有时明确说明"没有空闲且能接活的 session"，不要返回空列表让模型自己猜。
 
 ### `asd_peek(session, scrollback?)`
 
@@ -175,10 +210,10 @@ session 名合法字符集：`[A-Za-z0-9_-]{1,64}`（asd 的硬约束）。
 > **(2)** 该条记录 `createdByUs === true`。任何一条不满足就直接返回 `isError`，
 > **绝不执行 `asd kill`**。
 >
-> 现阶段复用范围限定在台账内，所以每条记录本来都是自己建的、`createdByUs` 恒为
-> `true`——这个守卫此刻是冗余的。它就是要冗余：将来一旦放开台账外复用，被复用的
-> session 会进台账，那一刻这个守卫是用户手建 session 和 `asd kill` 之间唯一的
-> 拦截。守卫要有独立的单测，不许因为"现在恒真"就省掉。
+> **这个守卫是承重的，不是防御性冗余。** 指名收养（见 `asd_spawn`）会把用户手建的
+> session 以 `createdByUs: false` 记进台账 —— 从那一刻起，台账里同时存在"能杀的"
+> 和"绝不能杀的"两类记录，而 `createdByUs` 是区分它们的唯一依据。一个只检查
+> "在不在台账里"的 kill 会直接杀掉用户正在用的工作会话。守卫要有独立的单测。
 >
 > 同理，`session_shutdown` 里本来就不杀任何 session，`asd kill --all` 在
 > pi-asd 里**任何路径都不允许出现**。
@@ -332,7 +367,7 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 - **不做 pane 高亮的等价物。** asd 没有 session 着色，`asd ui` 侧边栏已经有
   running/idle 高亮。
 - **不持久化台账。** boss 重启后台账为空。
-- **不复用台账外的 session。** 见 `asd_spawn` 一节的理由——`asd list --json` 不给
-  cwd。等 asd 在 `list` 里暴露 workspace 之后可以再放开，届时 `createdByUs` 守卫
-  就从冗余变成必需。
+- **不会自动占用台账外的 session。** 外部 session 只能由 boss 看过
+  `asd_candidates` 后指名收养，绝不自动挑中。收养来的 session 永远不会被
+  `asd_kill` 结束。
 - **不做远程 spawn。** asd 支持 SSH 远端 daemon，但 pi-asd 只打本地 `asd`。
