@@ -34,15 +34,15 @@ test("清单里标出 watcher 挂没挂上", () => {
       { session: "pi-b", task: "t", agent: "claude", watching: false },
     ],
   });
-  assert.match(p, /pi-a.*watcher 已挂/s);
-  assert.match(p, /pi-b.*watcher 未挂/s);
+  assert.match(p, /^- pi-a.*watcher 已挂/m);
+  assert.match(p, /^- pi-b.*watcher 未挂/m);
 });
 
 test("有 agent 时明确禁止 sleep 轮询", () => {
   const p = bossModePrompt({
     agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
   });
-  assert.match(p, /bash sleep/);
+  assert.match(p, /绝对不要.*bash sleep/);
   assert.match(p, /asd_agents/);
 });
 
