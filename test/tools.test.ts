@@ -51,7 +51,9 @@ function card(session: string, cwd: string, docs: string[] = []): {
  * follow 永远挂住不返回 —— watcher 的行为在 watcher.test.ts 里测过了，这里只关心
  * "有没有挂上"。
  */
-function harness(o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[] } = {}): Harness {
+function harness(
+  o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[]; bossSession?: string; newEchoes?: string } = {},
+): Harness {
   const calls: string[][] = [];
   const live = o.live ?? [];
 
@@ -64,7 +66,9 @@ function harness(o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[] } 
       case "card":
         return ok(JSON.stringify(o.cards ?? []));
       case "new":
-        return ok(`${args[1]}\n`);
+        // 一些测试需要模拟 asd 没有原样使用请求的名字（比如它自己也做了
+        // 避重/改写），回显一个跟请求不同的名字。
+        return ok(`${o.newEchoes ?? args[1]}\n`);
       case "peek":
         return ok(`SCREEN:${args[1]}`);
       case "send":
@@ -85,7 +89,13 @@ function harness(o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[] } 
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m", parentSession: "/s.jsonl" },
+    config: {
+      defaultAgent: "pi",
+      defaultCwd: "/w",
+      followTimeout: "30m",
+      parentSession: "/s.jsonl",
+      bossSession: o.bossSession,
+    },
     now: () => 0,
   });
 
@@ -206,7 +216,6 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
 
   const r = await h.tools.spawn({ task: "新任务" });
@@ -214,6 +223,33 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
   assert.deepEqual(subcommands(h), ["list", "send", "follow"]);
   assert.equal(h.registry.get("pi-agent1")?.task, "新任务");
   assert.equal(h.watchers.isWatching("pi-agent1"), true);
+  h.watchers.stopAll();
+});
+
+// C1 回归：收养过的用户 session 记进台账时 createdByUs 是 false —— 一次
+// **没有点名**任何 session 的普通 asd_spawn 绝不能把它当成自己人自动复用。
+// 复现的是审查报告里那个场景：boss 先指名收养了 "mem"，之后再随手 spawn 一个
+// 没点名的任务，如果 pickReusable 只看 agent/cwd/running，"mem" 会被当成
+// 空闲的自己人，任务被 send 进用户正在用的终端。
+test("spawn 不会把收养来的用户 session 自动复用 —— 即使 agent/cwd 都匹配、且空闲", async () => {
+  const h = harness({ live: [info("mem", { running: false, command: "claude", idle_ms: 999_999 })] });
+  h.registry.add({
+    session: "mem",
+    task: "上一轮收养的任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: false,
+  });
+
+  const r = await h.tools.spawn({ task: "新任务，没点名任何 session" });
+  assert.equal(r.isError, undefined, r.text);
+  assert.ok(
+    subcommands(h).includes("new"),
+    "台账里唯一匹配的候选是收养来的，必须走新建，不能走 send",
+  );
+  assert.ok(!subcommands(h).includes("send"), "绝不能把任务 send 进收养来的用户 session");
+  assert.equal(h.registry.get("mem")?.task, "上一轮收养的任务", "收养记录的任务不该被这次 spawn 覆盖");
   h.watchers.stopAll();
 });
 
@@ -226,7 +262,6 @@ test("spawn 遇到还在忙的 agent 不复用，另开一个", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   await h.tools.spawn({ task: "新" });
   assert.ok(subcommands(h).includes("new"));
@@ -243,7 +278,6 @@ test("spawn 的 reuse:false 强制新建", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   await h.tools.spawn({ task: "新", reuse: false });
   assert.ok(subcommands(h).includes("new"));
@@ -285,7 +319,6 @@ test("agents 列出存活的并摘掉已经没了的", async () => {
       agent: "pi",
       createdAt: 0,
       createdByUs: true,
-      watching: false,
     });
   }
   const r = await h.tools.agents();
@@ -293,6 +326,32 @@ test("agents 列出存活的并摘掉已经没了的", async () => {
   assert.match(r.text, /running/);
   assert.match(r.text, /已结束.*pi-b/s);
   assert.deepEqual(h.registry.names(), ["pi-a"]);
+});
+
+// I1 回归：AgentRecord 不再记 watching，agents() 必须读 WatcherPool 的活
+// 状态。watcher 自然收尾（比如跑满超时，规格要求"不重挂"）只会清 WatcherPool
+// 自己的 #running，不会回写台账 —— 旧实现读的是台账里那份从 spawn 时就再
+// 没更新过的快照，会一直说"watcher 已挂"，即使早就没人在等了。
+test("agents 里的 watcher 状态跟着 WatcherPool 的活状态走，不是台账里那份陈旧快照", async () => {
+  const h = harness();
+  const spawned = await h.tools.spawn({ task: "t", name: "a" });
+  assert.equal(spawned.isError, undefined, spawned.text);
+  const session = String(spawned.details?.session);
+  // spawn 完之后把它加进假 asd 的 live 列表 —— 不然接下来 agents() 自己那次
+  // `asd list` 会发现这个刚建的 session"不存在"，直接把它当成已结束摘掉。
+  h.live.push(info(session, { running: false }));
+  assert.equal(h.watchers.isWatching(session), true);
+
+  const before = await h.tools.agents();
+  assert.match(before.text, / watcher\]/, "刚 spawn 完，watcher 确实挂着");
+
+  // 模拟 watcher 自然收尾（例如跑满超时，规格要求"不重挂"）—— 这只会清
+  // WatcherPool 自己的 #running，不经过 tools.ts 的任何函数。
+  h.watchers.stop(session);
+  assert.equal(h.watchers.isWatching(session), false);
+
+  const after = await h.tools.agents();
+  assert.doesNotMatch(after.text, / watcher\]/, "watcher 已经不在跑了，不该再说「watcher 已挂」");
 });
 
 test("steer 送消息并重挂 watcher", async () => {
@@ -304,13 +363,77 @@ test("steer 送消息并重挂 watcher", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   const r = await h.tools.steer({ session: "pi-a", message: "换个思路" });
   assert.equal(r.isError, undefined);
   assert.deepEqual(subcommands(h), ["send", "follow"]);
   assert.equal(h.watchers.isWatching("pi-a"), true);
   h.watchers.stopAll();
+});
+
+// M6：asd_follow 工具自己也会在同一个 session 上跑一个 `asd follow`——如果
+// 不先停掉后台 watcher，两边同时在等同一个 session 的 follow 流，同一次停下
+// 会被通知两遍。这里手动控制"工具自己发起的那次 follow"的解析时机，断言：
+// 阻塞期间后台 watcher 已经被停掉；调用结束后按原来挂着的状态重挂。
+test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状态重挂", async () => {
+  const calls: string[][] = [];
+  let resolveToolFollow: ((r: ExecResult) => void) | undefined;
+  let followCallCount = 0;
+  const exec: Exec = async (_cmd, args) => {
+    calls.push(args);
+    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
+    switch (args[0]) {
+      case "list":
+        // 空列表：spawn 这次要新建，不能让假 asd 已经"认识"一个同名的
+        // "pi-a"，否则 allocateName 会为了避重把新 session 改叫 "pi-a-2"，
+        // 后面所有对 "pi-a" 的断言都会对不上号。
+        return ok(JSON.stringify([]));
+      case "new":
+        return ok(`${args[1]}\n`);
+      case "peek":
+        return ok("SCREEN");
+      case "send":
+        return ok();
+      case "follow":
+        followCallCount += 1;
+        // 第一次 follow 是 spawn 挂上的后台 watcher —— 永远挂住，只用来让
+        // "watcher 曾经挂着"这件事成立。第二次才是这个工具调用自己发起的，
+        // 由测试手动放行，好卡在"已经发起、还没解析"这个窗口期断言。
+        if (followCallCount === 1) return new Promise<ExecResult>(() => {});
+        return new Promise<ExecResult>((resolve) => {
+          resolveToolFollow = resolve;
+        });
+      default:
+        throw new Error(`没准备好的子命令：${args.join(" ")}`);
+    }
+  };
+
+  const asd = createAsd(exec);
+  const registry = new Registry("pi-");
+  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const tools = createTools({
+    asd,
+    registry,
+    watchers,
+    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m" },
+    now: () => 0,
+  });
+
+  await tools.spawn({ task: "t", name: "a" });
+  assert.equal(watchers.isWatching("pi-a"), true);
+
+  const p = tools.follow({ session: "pi-a" });
+  // JS 对 async 函数的语义：调用它会同步跑到第一个真正挂起的 await 为止 ——
+  // follow() 里 watchers.stop() 在任何 await 之前，所以这里不需要等微任务，
+  // 断言已经能成立。
+  assert.equal(resolveToolFollow !== undefined, true, "工具自己的第二次 follow 应该已经发起");
+  assert.equal(watchers.isWatching("pi-a"), false, "工具自己的 follow 在跑的时候，后台 watcher 必须先停掉");
+
+  resolveToolFollow!({ stdout: "", stderr: "", code: 0 });
+  const r = await p;
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(watchers.isWatching("pi-a"), true, "follow 工具调用结束后，应该按原来挂着的状态重挂");
+  watchers.stopAll();
 });
 
 test("steer / peek / follow 对台账外的名字直接拒绝，不碰 asd", async () => {
@@ -334,7 +457,6 @@ test("peek 返回屏幕内容", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   const r = await h.tools.peek({ session: "pi-a" });
   assert.equal(r.text, "SCREEN:pi-a");
@@ -349,7 +471,6 @@ test("kill 放行台账里自己建的", async () => {
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   const r = await h.tools.kill({ session: "pi-a" });
   assert.equal(r.isError, undefined);
@@ -366,7 +487,6 @@ test("kill 拒绝台账外的名字，并且一次 asd kill 都没发生", async
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   const r = await h.tools.kill({ session: "mem" });
   assert.equal(r.isError, true);
@@ -384,7 +504,6 @@ test("kill 拒绝 createdByUs 为 false 的记录，并且一次 asd kill 都没
     agent: "pi",
     createdAt: 0,
     createdByUs: false,
-    watching: false,
   });
   const r = await h.tools.kill({ session: "pi-borrowed" });
   assert.equal(r.isError, true);
@@ -458,7 +577,6 @@ test("candidates 标出哪些不是本 boss 建的", async () => {
     agent: "claude",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
   const own = await h.tools.candidates({});
   assert.doesNotMatch(own.text, /不能 kill/);
@@ -484,7 +602,6 @@ test("candidates 里已经收养过的 session（在台账里但 createdByUs=fal
     agent: "claude",
     createdAt: 0,
     createdByUs: false,
-    watching: false,
   });
   const r = await h.tools.candidates({});
   assert.match(r.text, /不能 kill/, "mine 的判据必须是 createdByUs，不是「在不在台账里」");
@@ -542,6 +659,22 @@ test("spawn 拒绝收养 asd 里不存在的 session", async () => {
   const r = await h.tools.spawn({ task: "t", session: "ghost" });
   assert.equal(r.isError, true);
   assert.ok(!subcommands(h).includes("send"));
+});
+
+// M5：代码层面兜底，不能收养 boss 自己所在的 session。提示词里也这么说，但
+// 那只是"建议"——config.bossSession 是 index.ts 从 $ASD_SESSION 读出来注入
+// 的，tools.ts 自己不读 process.env（保持依赖注入边界）。
+test("spawn 拒绝收养 boss 自己所在的 session，且完全不碰 asd", async () => {
+  const h = harness({
+    bossSession: "boss-self",
+    live: [info("boss-self", { running: false, command: "claude" })],
+    cards: [card("boss-self", "/w")],
+  });
+  const r = await h.tools.spawn({ task: "t", session: "boss-self" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /自己|不能收养自己/);
+  assert.deepEqual(h.calls, [], "拒绝路径上不该有任何 asd 调用");
+  assert.equal(h.registry.size, 0);
 });
 
 test("收养来的 session 永远不能被 kill —— 守卫承重", async () => {
@@ -624,7 +757,6 @@ test("并发 spawn 抢同一个空闲 agent：只有一个复用，另一个新�
     agent: "pi",
     createdAt: 0,
     createdByUs: true,
-    watching: false,
   });
 
   const [r1, r2] = await Promise.all([
@@ -655,6 +787,21 @@ test("并发 spawn 都显式传同一个 name：拿到两个不同的 session �
   const sessions = [r1, r2].map((r) => r.details?.session);
   assert.equal(new Set(sessions).size, 2, "两次 spawn 必须拿到两个不同的 session 名");
   assert.ok(sessions.includes("pi-x"));
+  h.watchers.stopAll();
+});
+
+// M7：新建路径上 `reserved` 必须同时占住 `allocateName` 算出的候选名字，
+// 以及 `asd new` 实际回显的 session 名 —— 如果两者不一致（asd 自己也做了
+// 避重/改写），只占前者会在两者之间露出一条缝隙，让屏障守错键。这里直接
+// 断言：请求名字和回显名字不同时，registry 落账用的是回显值，且这次 spawn
+// 完成后两个名字都不再占着 reserved（不会永久卡住）。
+test("spawn 新建时请求的名字和 asd 回显的名字不一致，registry 记的是回显值", async () => {
+  const h = harness({ newEchoes: "pi-echoed-different" });
+  const r = await h.tools.spawn({ task: "t", name: "requested" });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(r.details?.session, "pi-echoed-different");
+  assert.deepEqual(h.registry.names(), ["pi-echoed-different"]);
+  assert.equal(h.registry.get("pi-requested"), undefined);
   h.watchers.stopAll();
 });
 

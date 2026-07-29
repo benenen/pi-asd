@@ -1,5 +1,5 @@
 /**
- * 六个工具的实际逻辑。
+ * 七个工具的实际逻辑。
  *
  * 这里不 import pi —— 依赖全靠注入，所以整层能用假 exec 测，尤其是 kill 守卫
  * 那两条拒绝路径（必须证明"一次 asd kill 都没发生"）。
@@ -75,6 +75,13 @@ export interface ToolConfig {
   followTimeout: string;
   /** boss 自己的 session 文件，spawn pi 子 agent 时传下去。 */
   parentSession?: string;
+  /**
+   * boss 自己所在的 asd session 名（`$ASD_SESSION`）。`tools.ts` 不读
+   * `process.env` —— 这是唯一入口，由 `index.ts` 读了环境变量再注入进来。
+   * `adopt()` 靠它挡住"收养 boss 自己"这个连提示词都说了"不要"、但没有代码
+   * 兜底的动作。
+   */
+  bossSession?: string;
   /**
    * 预设表；缺省用模块级 `PRESETS`。
    *
@@ -163,9 +170,7 @@ export function createTools(deps: ToolDeps): Tools {
 
   function rewatch(session: string, want: boolean): boolean {
     watchers.stop(session);
-    const watching = want ? watchers.watch(session) : false;
-    registry.setWatching(session, watching);
-    return watching;
+    return want ? watchers.watch(session) : false;
   }
 
   /**
@@ -180,6 +185,12 @@ export function createTools(deps: ToolDeps): Tools {
    * 分支都用同一层 `try/finally` 收尾，不再叠一层嵌套的 try/finally。
    */
   async function adopt(session: string, task: string, wantWatch: boolean): Promise<ToolResult> {
+    // 代码层面兜底：绝不收养 boss 自己所在的 session。提示词里也这么说，但
+    // 那只是"建议"；万一模型没看、看漏了、或者干脆决定赌一把，这里必须硬挡
+    // 住 —— 收养自己会让 boss 把任务描述当输入敲进自己正在跑的终端。
+    if (config.bossSession !== undefined && session === config.bossSession) {
+      return err(`"${session}" 是你自己所在的 session，不能收养自己。`);
+    }
     if (reserved.has(session)) {
       return err(`"${session}" 正在被另一次 spawn 处理，稍后再试。`);
     }
@@ -223,7 +234,6 @@ export function createTools(deps: ToolDeps): Tools {
           createdAt: now(),
           // 不是我们建的 —— asd_kill 从此永远拒绝它。
           createdByUs: false,
-          watching: false,
         });
       } else {
         known.task = task;
@@ -263,7 +273,21 @@ export function createTools(deps: ToolDeps): Tools {
 
       // 本次 spawn 预留的名字/session —— 无论成功、失败、还是复用转新建的
       // 中途改道，收尾时都必须放行，否则一次失败就永久占住一个名字。
-      let held: string | undefined;
+      //
+      // 用一个 Set 而不是单个变量：新建路径上 `allocateName` 算出的 `name`
+      // 和 `asd new` 实际回显的 `session` 可能不是同一个字符串（asd 自己也
+      // 可能做避重/改写），这道屏障挡的是"接下来会落进 registry 的那个
+      // key"——只占 `name` 不占回显的 `session`，会在两者之间露出一条缝隙，
+      // 让并发的另一个 spawn 在这条缝隙里摸到同一个 session。
+      const heldNames = new Set<string>();
+      const hold = (n: string): void => {
+        heldNames.add(n);
+        reserved.add(n);
+      };
+      const release = (n: string): void => {
+        heldNames.delete(n);
+        reserved.delete(n);
+      };
       try {
         if (p.reuse !== false) {
           // 并发的另一个 spawn 可能已经在这份快照上预订了某个空闲 agent ——
@@ -281,8 +305,7 @@ export function createTools(deps: ToolDeps): Tools {
             available,
           );
           if (target !== undefined) {
-            held = target.session;
-            reserved.add(held);
+            hold(target.session);
             if (await asd.send(target.session, p.task)) {
               target.task = p.task;
               const watching = rewatch(target.session, wantWatch);
@@ -296,8 +319,7 @@ export function createTools(deps: ToolDeps): Tools {
             // send 说 session 没了 —— 清掉它、放行预留，继续往下走新建。
             registry.remove(target.session);
             watchers.stop(target.session);
-            reserved.delete(held);
-            held = undefined;
+            release(target.session);
           }
         }
 
@@ -305,8 +327,7 @@ export function createTools(deps: ToolDeps): Tools {
         // allocateName 避开它，不然两边会算出同一个名字、第二次 asd new 被拒。
         const taken = new Set([...liveMap.keys(), ...reserved]);
         const name = registry.allocateName(p.name, taken);
-        held = name;
-        reserved.add(held);
+        hold(name);
         const cmd = buildSpawnCommand({
           agent,
           task: p.task,
@@ -314,6 +335,7 @@ export function createTools(deps: ToolDeps): Tools {
           presets,
         });
         const session = await asd.create({ name, cwd, cmd });
+        if (session !== name) hold(session);
         registry.add({
           session,
           task: p.task,
@@ -321,7 +343,6 @@ export function createTools(deps: ToolDeps): Tools {
           agent,
           createdAt: now(),
           createdByUs: true,
-          watching: false,
         });
         const watching = rewatch(session, wantWatch);
         return {
@@ -331,7 +352,7 @@ export function createTools(deps: ToolDeps): Tools {
           details: { session, agent, cwd, command: cmd, reused: false, watching },
         };
       } finally {
-        if (held !== undefined) reserved.delete(held);
+        for (const n of heldNames) reserved.delete(n);
       }
     },
 
@@ -346,7 +367,10 @@ export function createTools(deps: ToolDeps): Tools {
       const lines = registry.list().map((r) => {
         const info = liveMap.get(r.session)!;
         const state = info.running ? "running" : `idle ${formatDuration(info.idle_ms)}`;
-        const w = r.watching ? " watcher" : "";
+        // 台账里不记 watching —— WatcherPool 才是唯一真相，读它，不读一份会
+        // 漂移的影子状态（watcher 自然超时收尾不会回写台账，之前就是这么
+        // 撒谎的：早就没人在等了，这里还在说"watcher 已挂"）。
+        const w = watchers.isWatching(r.session) ? " watcher" : "";
         return `${r.session} [${state}${w}] (${r.agent}, ${r.cwd}): ${preview(r.task)}`;
       });
       const goneLine =
@@ -428,23 +452,37 @@ export function createTools(deps: ToolDeps): Tools {
     async follow(p) {
       const bad = requireKnown(p.session);
       if (bad) return bad;
-      const outcome = await asd.follow(p.session, {
-        forever: p.mode === "end",
-        timeout: p.timeout ?? config.followTimeout,
-      });
-      if (outcome.kind === "gone") return dropGone(p.session);
+      // 这个工具自己也会在 p.session 上跑一个 `asd follow`，跟后台 watcher
+      // 抢同一个 session 的 follow 流 —— 不停掉的话两边都在等，同一次停下会
+      // 被通知两遍（一遍是这次工具调用的返回值，一遍是 watcher 的 notify）。
+      // 记住原来挂没挂着，等这次阻塞的 follow 完事再按原状态重挂。
+      const wasWatching = watchers.isWatching(p.session);
+      watchers.stop(p.session);
+      let stillAlive = true;
+      try {
+        const outcome = await asd.follow(p.session, {
+          forever: p.mode === "end",
+          timeout: p.timeout ?? config.followTimeout,
+        });
+        if (outcome.kind === "gone") {
+          stillAlive = false;
+          return dropGone(p.session);
+        }
 
-      const screen = await asd.peek(p.session);
-      const head =
-        outcome.kind === "timeout"
-          ? `"${p.session}" 还在忙（follow 超时）。`
-          : `"${p.session}" 已停下。`;
-      return {
-        text:
-          `${head}\n--- 过程输出 ---\n${outcome.text}\n` +
-          `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,
-        details: { session: p.session, outcome: outcome.kind },
-      };
+        const screen = await asd.peek(p.session);
+        const head =
+          outcome.kind === "timeout"
+            ? `"${p.session}" 还在忙（follow 超时）。`
+            : `"${p.session}" 已停下。`;
+        return {
+          text:
+            `${head}\n--- 过程输出 ---\n${outcome.text}\n` +
+            `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,
+          details: { session: p.session, outcome: outcome.kind },
+        };
+      } finally {
+        if (wasWatching && stillAlive) rewatch(p.session, true);
+      }
     },
 
     async steer(p) {

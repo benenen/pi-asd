@@ -20,12 +20,12 @@ export interface AgentRecord {
   /**
    * 这个 session 是不是 pi-asd 自己 `asd new` 出来的。
    *
-   * kill 守卫唯一的依据。现阶段复用范围限定在台账内，所以它恒为 true —— 这个
-   * 冗余是故意的：将来放开台账外复用时，它是用户手建 session 和 `asd kill`
-   * 之间唯一的拦截。
+   * kill 守卫唯一的依据，`pickReusable` 的自动复用池也靠它把关。**不是**"在
+   * 台账里"的同义词：`tools.ts` 的 `adopt()` 会把指名收养来的用户 session 也
+   * 记进台账，但以 `createdByUs: false` 记账 —— 台账内因此混着两种记录，这个
+   * 字段才是用户手建 session 和"pi-asd 能不能动它"之间唯一的拦截。
    */
   createdByUs: boolean;
-  watching: boolean;
 }
 
 export interface ReuseQuery {
@@ -107,11 +107,6 @@ export class Registry {
     return rec;
   }
 
-  setWatching(session: string, watching: boolean): void {
-    const rec = this.#records.get(session);
-    if (rec) rec.watching = watching;
-  }
-
   /** 摘掉 asd 里已经不在的条目，把它们返回给调用方去收尾。 */
   reconcile(live: ReadonlySet<string>): AgentRecord[] {
     const gone: AgentRecord[] = [];
@@ -124,11 +119,26 @@ export class Registry {
     return gone;
   }
 
-  /** 挑一个能直接派活的空闲 agent；挑不到返回 undefined。 */
+  /**
+   * 挑一个能直接派活的空闲 agent；挑不到返回 undefined。
+   *
+   * 硬不变量："自动复用只在台账内；台账外的 session 只能由主 agent 看过
+   * `asd_candidates` 后指名收养，绝不自动挑中。" —— `createdByUs === true` 这
+   * 一条必须在这里守住：`adopt()` 会把指名收养来的用户 session 也记进台账
+   * （`createdByUs: false`），如果这里只看"在不在台账里"，那么收养一次之后，
+   * 后续任何一次**没点名**的 `asd_spawn` 都可能把它当成自己人自动复用 ——
+   * 用户正在用的会话就这样被静默塞进了下一个任务。
+   */
   pickReusable(q: ReuseQuery, live: ReadonlyMap<string, SessionInfo>): AgentRecord | undefined {
     const fits = (r: AgentRecord): boolean => {
       const info = live.get(r.session);
-      return info !== undefined && !info.running && r.agent === q.agent && r.cwd === q.cwd;
+      return (
+        info !== undefined &&
+        !info.running &&
+        r.agent === q.agent &&
+        r.cwd === q.cwd &&
+        r.createdByUs === true
+      );
     };
 
     if (q.name !== undefined) {

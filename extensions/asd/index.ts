@@ -22,6 +22,12 @@ function toolResult(r: ToolResult) {
   return {
     content: [{ type: "text" as const, text: r.text }],
     details: r.details ?? {},
+    // 这个 isError 是惰性的，而且是故意的：pi 核心不读自定义工具返回对象里
+    // 的 isError（`ToolResultMessage.isError` 只由 execute() 是否抛异常
+    // 决定，见 dist 里的 agent-session 那一层），它顶多影响调用方自己怎么
+    // 读 details。**不要**把这里改成 `throw`——kill 守卫的两条拒绝路径
+    // （台账外的名字、`createdByUs !== true`）都是"正常的业务分支"，改成异常
+    // 会把它们变成错误路径，还会让上面几个 tools.* 调用点全部要包 try/catch。
     ...(r.isError === true ? { isError: true } : {}),
   };
 }
@@ -65,6 +71,10 @@ export default function (pi: ExtensionAPI): void {
   });
 
   let parentSession: string | undefined;
+  // ASD_SESSION 是 boss 自己所在的 asd session 名，进程启动时就定了，不会像
+  // parentSession 那样随 session_start 变化 —— 一次性读出来注入即可。
+  // `tools.ts` 不读 process.env，这是它拿到这个值的唯一路径。
+  const bossSession = process.env.ASD_SESSION;
   const tools = createTools({
     asd,
     registry,
@@ -74,6 +84,7 @@ export default function (pi: ExtensionAPI): void {
       defaultAgent: process.env.PI_ASD_AGENT ?? DEFAULT_AGENT,
       defaultCwd: process.cwd(),
       followTimeout: process.env.PI_ASD_FOLLOW_TIMEOUT ?? DEFAULT_FOLLOW_TIMEOUT,
+      bossSession,
       get parentSession() {
         return parentSession;
       },
@@ -88,12 +99,16 @@ export default function (pi: ExtensionAPI): void {
     systemPrompt:
       event.systemPrompt +
       bossModePrompt({
-        bossSession: process.env.ASD_SESSION,
+        bossSession,
         agents: registry.list().map((r) => ({
           session: r.session,
           task: r.task,
           agent: r.agent,
-          watching: r.watching,
+          // 台账不记 watching —— WatcherPool 才是唯一真相（同一条理由见
+          // tools.ts 的 agents()）。提示词里"watcher 已挂/未挂"这句必须跟着
+          // 真实状态走，不然 watcher 超时收尾之后提示词还在说"已挂"，boss
+          // 会照着这句假话继续什么都不做。
+          watching: watchers.isWatching(r.session),
         })),
       }),
   }));
@@ -101,14 +116,41 @@ export default function (pi: ExtensionAPI): void {
   // 只掐 watcher，绝不杀 session —— 子 agent 照跑，用户可以 asd attach 接管。
   pi.on("session_shutdown", async (_event, ctx) => {
     watchers.stopAll();
-    const alive = registry.names();
-    registry.reconcile(new Set());
-    if (alive.length > 0 && ctx.hasUI) {
-      ctx.ui.notify(
-        `pi-asd：${alive.length} 个 agent session 仍在运行（${alive.join(" / ")}）。` +
-          `用 asd attach <名字> 接管，或 asd kill <名字> 结束。`,
-        "info",
-      );
+    // 台账是内存快照，可能已经跟 asd 的实际状态脱节（agent 早退出了、或者
+    // 反过来台账里的记录其实还活着）—— 退出前跟 `asd list` 对账一遍，只报告
+    // 真正还存活的，不能拍脑袋说台账里每一条都"仍在运行"。
+    let remaining = registry.list();
+    try {
+      const live = await asd.list();
+      registry.reconcile(new Set(live.map((s) => s.session)));
+      remaining = registry.list();
+    } catch {
+      // asd 都联系不上了，没什么好对账的 —— 清空台账，不再对用户做任何
+      // "还在运行"这类无法验证的断言。
+      registry.reconcile(new Set());
+      remaining = [];
+    }
+    if (remaining.length > 0 && ctx.hasUI) {
+      const ours = remaining.filter((r) => r.createdByUs);
+      const adopted = remaining.filter((r) => !r.createdByUs);
+      const names = remaining.map((r) => r.session).join(" / ");
+      const parts = [`pi-asd：${remaining.length} 个 agent session 仍在运行（${names}）。`];
+      if (ours.length > 0) {
+        parts.push(
+          `用 asd attach <名字> 接管，或 asd kill <名字> 结束（限：${ours
+            .map((r) => r.session)
+            .join(" / ")}）。`,
+        );
+      }
+      if (adopted.length > 0) {
+        // 收养来的是用户自己的 session —— 不建议 kill，pi-asd 自己的
+        // asd_kill 也永远会拒绝它们（createdByUs !== true）。
+        parts.push(
+          `${adopted.map((r) => r.session).join(" / ")} 是收养来的用户会话，` +
+            `用 asd attach 接管就好，不建议 kill。`,
+        );
+      }
+      ctx.ui.notify(parts.join(""), "info");
     }
   });
 
