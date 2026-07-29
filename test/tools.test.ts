@@ -80,6 +80,70 @@ function subcommands(h: Harness): string[] {
   return h.calls.map((c) => c[0]);
 }
 
+/**
+ * 制造"两个并发 spawn 共享同一份 asd list 快照"的假 exec。
+ *
+ * pi 扩展是并发工具执行模型：同一条助手消息里的多个 `asd_spawn` 会并发跑，
+ * 各自 `await asd.list()` 拿到的很可能是同一份快照。前 `barrierCount` 次
+ * `list` 调用会互相卡住，直到凑够 `barrierCount` 个才一起放行——这样能稳定
+ * 复现"两边在同一份快照上做决策"的临界区交叠，不用赌具体的微任务调度顺序。
+ * 凑够之后的 list 调用（比如某个测试里失败重试时追加的一次顺序调用）照常
+ * 立即返回，不再等人。
+ */
+function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): Harness {
+  const calls: string[][] = [];
+  const live = o.live ?? [];
+  const barrierCount = o.barrierCount ?? 2;
+  let listCalls = 0;
+  let waiting: Array<() => void> = [];
+
+  const exec: Exec = async (_cmd, args) => {
+    calls.push(args);
+    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
+    switch (args[0]) {
+      case "list": {
+        listCalls += 1;
+        if (listCalls <= barrierCount) {
+          await new Promise<void>((resolve) => {
+            waiting.push(resolve);
+            if (waiting.length >= barrierCount) {
+              const batch = waiting;
+              waiting = [];
+              for (const r of batch) r();
+            }
+          });
+        }
+        return ok(JSON.stringify(live));
+      }
+      case "new":
+        return ok(`${args[1]}\n`);
+      case "peek":
+        return ok(`SCREEN:${args[1]}`);
+      case "send":
+        return ok();
+      case "kill":
+        return ok();
+      case "follow":
+        return new Promise<ExecResult>(() => {});
+      default:
+        throw new Error(`没准备好的子命令：${args.join(" ")}`);
+    }
+  };
+
+  const asd = createAsd(exec);
+  const registry = new Registry("pi-");
+  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const tools = createTools({
+    asd,
+    registry,
+    watchers,
+    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m", parentSession: "/s.jsonl" },
+    now: () => 0,
+  });
+
+  return { tools, registry, watchers, calls, live };
+}
+
 test("shellEscape 用单引号包住并转义内部单引号", () => {
   assert.equal(shellEscape("go"), "'go'");
   assert.equal(shellEscape("it's"), "'it'\\''s'");
@@ -310,4 +374,103 @@ test("kill 拒绝 createdByUs 为 false 的记录，并且一次 asd kill 都没
   assert.match(r.text, /不是 pi-asd 新建/);
   assert.equal(h.calls.length, 0, "拒绝路径上不该有任何 asd 调用");
   assert.equal(h.registry.size, 1, "被拒绝的记录不该被摘掉");
+});
+
+// --- 并发 spawn ---
+//
+// pi 的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn` 是并发跑的，
+// boss mode 的提示词又鼓励"拆成独立子任务立刻 spawn"，所以并发 spawn 是主
+// 路径而不是边角情况。下面三个测试必须用 `Promise.all` 真并发触发，顺序
+// await 两次测不出 `await asd.list()` 之后、`asd.send`/`asd.create` 之前
+// 那段 await 间隙里的竞态。
+
+test("并发 spawn 抢同一个空闲 agent：只有一个复用，另一个新建，落在两个不同的 session 上", async () => {
+  const h = raceHarness({ live: [info("pi-agent1", { running: false, idle_ms: 9_000 })] });
+  h.registry.add({
+    session: "pi-agent1",
+    task: "旧",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+    watching: false,
+  });
+
+  const [r1, r2] = await Promise.all([
+    h.tools.spawn({ task: "任务A" }),
+    h.tools.spawn({ task: "任务B" }),
+  ]);
+
+  const subs = subcommands(h);
+  assert.equal(subs.filter((c) => c === "send").length, 1, "应该恰好一次复用（send）");
+  assert.equal(subs.filter((c) => c === "new").length, 1, "应该恰好一次新建（new）");
+  const sessions = [r1, r2].map((r) => r.details?.session);
+  assert.equal(new Set(sessions).size, 2, "两次 spawn 不能落在同一个 session 上");
+  h.watchers.stopAll();
+});
+
+test("并发 spawn 都显式传同一个 name：拿到两个不同的 session 名，不会对同一个名字发两次 asd new", async () => {
+  const h = raceHarness();
+
+  const [r1, r2] = await Promise.all([
+    h.tools.spawn({ task: "任务A", name: "x" }),
+    h.tools.spawn({ task: "任务B", name: "x" }),
+  ]);
+
+  const newCalls = h.calls.filter((c) => c[0] === "new");
+  assert.equal(newCalls.length, 2, "台账里没有可复用的，两次都该走新建");
+  const newNames = newCalls.map((c) => c[1]);
+  assert.equal(new Set(newNames).size, 2, "不能对同一个名字发两次 asd new");
+  const sessions = [r1, r2].map((r) => r.details?.session);
+  assert.equal(new Set(sessions).size, 2, "两次 spawn 必须拿到两个不同的 session 名");
+  assert.ok(sessions.includes("pi-x"));
+  h.watchers.stopAll();
+});
+
+test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名字", async () => {
+  const calls: string[][] = [];
+  let newAttempts = 0;
+  const exec: Exec = async (_cmd, args) => {
+    calls.push(args);
+    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
+    switch (args[0]) {
+      case "list":
+        return ok(JSON.stringify([]));
+      case "new":
+        newAttempts += 1;
+        // 第一次 asd new 故意失败，逼 spawn() 抛异常。
+        return newAttempts === 1 ? { stdout: "", stderr: "boom", code: 1 } : ok(`${args[1]}\n`);
+      case "peek":
+        return ok(`SCREEN:${args[1]}`);
+      case "send":
+        return ok();
+      case "kill":
+        return ok();
+      case "follow":
+        return new Promise<ExecResult>(() => {});
+      default:
+        throw new Error(`没准备好的子命令：${args.join(" ")}`);
+    }
+  };
+
+  const asd = createAsd(exec);
+  const registry = new Registry("pi-");
+  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const tools = createTools({
+    asd,
+    registry,
+    watchers,
+    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m", parentSession: "/s.jsonl" },
+    now: () => 0,
+  });
+
+  await assert.rejects(() => tools.spawn({ task: "t1", name: "x" }));
+  const r2 = await tools.spawn({ task: "t2", name: "x" });
+  assert.equal(r2.isError, undefined);
+  assert.equal(
+    r2.details?.session,
+    "pi-x",
+    "第一次失败必须放行预留，第二次才能仍然拿到同一个名字（证明 finally 生效）",
+  );
+  watchers.stopAll();
 });

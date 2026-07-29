@@ -99,6 +99,18 @@ function preview(task: string): string {
 export function createTools(deps: ToolDeps): Tools {
   const { asd, registry, watchers, config, now } = deps;
 
+  /**
+   * 并发 spawn 之间的临界区屏障：正在处理中、还没落盘到 registry 的 session
+   * 名字（复用目标的名字，或者刚 allocateName 出来还没 asd create 完的新名字）。
+   *
+   * pi 扩展的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn` 是并发跑
+   * 的，会在同一份 `await asd.list()` 快照上各自决策 —— 不设这道屏障，两个
+   * 并发 spawn 可能抢中同一个空闲 agent（都 send 进去，后者覆盖前者的任务），
+   * 或者撞同一个新名字（第二个 `asd new` 被拒）。这个集合只活在这一个
+   * `createTools` 实例的闭包里，不是模块级全局，避免多个实例互相干扰。
+   */
+  const reserved = new Set<string>();
+
   /** 台账里没有就拒绝 —— peek / follow / steer 共用。 */
   function requireKnown(session: string): ToolResult | undefined {
     if (registry.get(session) !== undefined) return undefined;
@@ -138,51 +150,73 @@ export function createTools(deps: ToolDeps): Tools {
       const live = await asd.list();
       const liveMap = new Map(live.map((s) => [s.session, s]));
 
-      if (p.reuse !== false) {
-        const target = registry.pickReusable(
-          {
-            name: p.name === undefined ? undefined : registry.candidateName(p.name),
-            agent,
-            cwd,
-          },
-          liveMap,
-        );
-        if (target !== undefined) {
-          if (await asd.send(target.session, p.task)) {
-            target.task = p.task;
-            const watching = rewatch(target.session, wantWatch);
-            return {
-              text:
-                `复用空闲 agent "${target.session}"（${agent}，${cwd}），任务已送入。` +
-                (watching ? "watcher 已重挂，它停下来时结果会自动推给你。" : ""),
-              details: { session: target.session, agent, cwd, reused: true, watching },
-            };
-          }
-          // send 说 session 没了 —— 清掉它，继续往下走新建。
-          registry.remove(target.session);
-          watchers.stop(target.session);
-        }
-      }
+      // 本次 spawn 预留的名字/session —— 无论成功、失败、还是复用转新建的
+      // 中途改道，收尾时都必须放行，否则一次失败就永久占住一个名字。
+      let held: string | undefined;
+      try {
+        if (p.reuse !== false) {
+          // 并发的另一个 spawn 可能已经在这份快照上预订了某个空闲 agent ——
+          // 从候选池里摘掉，避免两边挑中同一个 session（registry.pickReusable
+          // 对不在 map 里的条目本来就会跳过，不需要改它的签名）。
+          const available = new Map(liveMap);
+          for (const s of reserved) available.delete(s);
 
-      const name = registry.allocateName(p.name, new Set(liveMap.keys()));
-      const cmd = buildSpawnCommand({ agent, task: p.task, parentSession: config.parentSession });
-      const session = await asd.create({ name, cwd, cmd });
-      registry.add({
-        session,
-        task: p.task,
-        cwd,
-        agent,
-        createdAt: now(),
-        createdByUs: true,
-        watching: false,
-      });
-      const watching = rewatch(session, wantWatch);
-      return {
-        text:
-          `已 spawn agent "${session}"（${agent}，${cwd}）。` +
-          (watching ? "watcher 已挂上，它停下来时结果会自动推给你。" : ""),
-        details: { session, agent, cwd, command: cmd, reused: false, watching },
-      };
+          const target = registry.pickReusable(
+            {
+              name: p.name === undefined ? undefined : registry.candidateName(p.name),
+              agent,
+              cwd,
+            },
+            available,
+          );
+          if (target !== undefined) {
+            held = target.session;
+            reserved.add(held);
+            if (await asd.send(target.session, p.task)) {
+              target.task = p.task;
+              const watching = rewatch(target.session, wantWatch);
+              return {
+                text:
+                  `复用空闲 agent "${target.session}"（${agent}，${cwd}），任务已送入。` +
+                  (watching ? "watcher 已重挂，它停下来时结果会自动推给你。" : ""),
+                details: { session: target.session, agent, cwd, reused: true, watching },
+              };
+            }
+            // send 说 session 没了 —— 清掉它、放行预留，继续往下走新建。
+            registry.remove(target.session);
+            watchers.stop(target.session);
+            reserved.delete(held);
+            held = undefined;
+          }
+        }
+
+        // 并发的另一个 spawn 可能已经预留了一个候选名字 —— 并进 taken，逼
+        // allocateName 避开它，不然两边会算出同一个名字、第二次 asd new 被拒。
+        const taken = new Set([...liveMap.keys(), ...reserved]);
+        const name = registry.allocateName(p.name, taken);
+        held = name;
+        reserved.add(held);
+        const cmd = buildSpawnCommand({ agent, task: p.task, parentSession: config.parentSession });
+        const session = await asd.create({ name, cwd, cmd });
+        registry.add({
+          session,
+          task: p.task,
+          cwd,
+          agent,
+          createdAt: now(),
+          createdByUs: true,
+          watching: false,
+        });
+        const watching = rewatch(session, wantWatch);
+        return {
+          text:
+            `已 spawn agent "${session}"（${agent}，${cwd}）。` +
+            (watching ? "watcher 已挂上，它停下来时结果会自动推给你。" : ""),
+          details: { session, agent, cwd, command: cmd, reused: false, watching },
+        };
+      } finally {
+        if (held !== undefined) reserved.delete(held);
+      }
     },
 
     async agents() {
