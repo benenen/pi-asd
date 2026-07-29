@@ -20,6 +20,8 @@ export interface PromptInput {
    * `index.ts`，是因为 `index.ts` 是唯一 import pi 的文件、没有单测夹具。
    */
   enabled: boolean;
+  /** 这一轮 `asd_spawn` 不显式传 `agent` 时用哪个（由 `/asd:boss-start <agent>` 定）。 */
+  defaultAgent: string;
   agents: PromptAgent[];
   /** boss 自己所在的 asd session（`ASD_SESSION`），可能没有。 */
   bossSession?: string;
@@ -50,6 +52,7 @@ export function bossModePrompt(input: PromptInput): string {
     "",
     "asd_spawn 会先找台账里 agent 和 cwd 都对得上、而且已经空闲的 session 复用，",
     "找不到才新建 —— 所以不用担心派活派出一堆重复 session。",
+    `这一轮 spawn 默认用 ${input.defaultAgent}；要换就在 asd_spawn 里显式传 agent。`,
     "",
     "也可以把任务交给一个**已经在跑的**空闲 session（包括不是你 spawn 的）：先调",
     'asd_candidates 看它们各自在哪个目录、有什么项目文档、正在做什么，再用',

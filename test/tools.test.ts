@@ -7,6 +7,7 @@ import {
   agentOfCommand,
   buildSpawnCommand,
   createTools,
+  resolveAgentArg,
   shellEscape,
   type Tools,
 } from "../extensions/asd/tools.ts";
@@ -851,4 +852,31 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
     "第一次失败必须放行预留，第二次才能仍然拿到同一个名字（证明 finally 生效）",
   );
   watchers.stopAll();
+});
+
+test("resolveAgentArg 空参数回到基线，不沿用上一次", () => {
+  const p = { pi: { command: (t: string) => `pi ${t}`, piChild: true } };
+  assert.deepEqual(resolveAgentArg("", "pi", p), { ok: true, agent: "pi" });
+  assert.deepEqual(resolveAgentArg("   ", "pi", p), { ok: true, agent: "pi" });
+});
+
+test("resolveAgentArg 认得出预设表里的名字，并去掉首尾空白", () => {
+  const p = {
+    pi: { command: (t: string) => `pi ${t}`, piChild: true },
+    claude: { command: (t: string) => `claude ${t}`, piChild: false },
+  };
+  assert.deepEqual(resolveAgentArg("claude", "pi", p), { ok: true, agent: "claude" });
+  assert.deepEqual(resolveAgentArg("  claude  ", "pi", p), { ok: true, agent: "claude" });
+});
+
+test("resolveAgentArg 拒绝不认识的名字并列出可选项", () => {
+  const p = {
+    pi: { command: (t: string) => `pi ${t}`, piChild: true },
+    claude: { command: (t: string) => `claude ${t}`, piChild: false },
+  };
+  const r = resolveAgentArg("gemini", "pi", p);
+  assert.equal(r.ok, false);
+  assert.match(r.ok === false ? r.message : "", /gemini/);
+  assert.match(r.ok === false ? r.message : "", /pi/);
+  assert.match(r.ok === false ? r.message : "", /claude/);
 });

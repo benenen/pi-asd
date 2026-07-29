@@ -11,7 +11,7 @@ import { Type } from "typebox";
 import { createAsd, type Exec } from "./cli.ts";
 import { bossModePrompt } from "./prompt.ts";
 import { Registry } from "./registry.ts";
-import { createTools, PRESETS, type ToolResult } from "./tools.ts";
+import { createTools, PRESETS, resolveAgentArg, type ToolResult } from "./tools.ts";
 import { WatcherPool } from "./watcher.ts";
 
 const DEFAULT_PREFIX = "pi-";
@@ -80,13 +80,20 @@ export default function (pi: ExtensionAPI): void {
    * 进程内状态，不持久化（和台账一致），重启后回到关闭。
    */
   let bossMode = false;
+
+  /** 不给参数时回到的基线 agent。 */
+  const baselineAgent = process.env.PI_ASD_AGENT ?? DEFAULT_AGENT;
+  /** 这一轮用哪个 agent，由 `/asd:boss-start <agent>` 定。 */
+  let bossAgent = baselineAgent;
   const tools = createTools({
     asd,
     registry,
     watchers,
     now: () => Date.now(),
     config: {
-      defaultAgent: process.env.PI_ASD_AGENT ?? DEFAULT_AGENT,
+      get defaultAgent() {
+        return bossAgent;
+      },
       defaultCwd: process.cwd(),
       followTimeout: process.env.PI_ASD_FOLLOW_TIMEOUT ?? DEFAULT_FOLLOW_TIMEOUT,
       bossSession,
@@ -105,6 +112,7 @@ export default function (pi: ExtensionAPI): void {
       event.systemPrompt +
       bossModePrompt({
         enabled: bossMode,
+        defaultAgent: bossAgent,
         bossSession,
         agents: registry.list().map((r) => ({
           session: r.session,
@@ -278,14 +286,29 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("asd:boss-start", {
-    description: "打开 boss mode：把任务拆开派给跑在独立 asd session 里的子 agent",
-    handler: async (_args, ctx) => {
-      if (bossMode) {
-        ctx.ui.notify("boss mode 已经是开着的。", "info");
+    description: "打开 boss mode（可带 agent 名：pi / claude / codex）",
+    getArgumentCompletions: (prefix: string) => {
+      const items = Object.keys(PRESETS)
+        .filter((n) => n.startsWith(prefix))
+        .map((n) => ({ value: n, label: n }));
+      return items.length > 0 ? items : null;
+    },
+    handler: async (args, ctx) => {
+      const resolved = resolveAgentArg(args ?? "", baselineAgent, PRESETS);
+      if (!resolved.ok) {
+        // 参数不对就什么都不改 —— 半开状态比不开更糟。
+        ctx.ui.notify(resolved.message, "error");
         return;
       }
+      const was = bossMode;
+      bossAgent = resolved.agent;
       bossMode = true;
-      ctx.ui.notify("boss mode 已打开。下一轮起会注入拆任务和监控的提示词。", "info");
+      ctx.ui.notify(
+        was
+          ? `boss mode 已经开着；默认 agent 设为 ${bossAgent}。`
+          : `boss mode 已打开，默认 agent ${bossAgent}。下一轮起会注入拆任务和监控的提示词。`,
+        "info",
+      );
     },
   });
 

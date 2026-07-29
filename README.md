@@ -20,8 +20,13 @@ agent 一停，watcher 自己读一屏，把结果推给主 agent。
 
 | 命令 | 作用 |
 |---|---|
-| `/asd:boss-start` | 打开 —— 从下一轮起注入拆任务和监控的提示词 |
+| `/asd:boss-start [agent]` | 打开 —— 从下一轮起注入拆任务和监控的提示词 |
 | `/asd:boss-stop` | 关闭 —— 不再注入提示词 |
+
+`/asd:boss-start` 可以带一个 agent 名（`pi` / `claude` / `codex`，有参数补全），
+定这一轮 `asd_spawn` 不显式传 `agent` 时用哪个。**不给参数就回到基线**
+（`PI_ASD_AGENT`，默认 `pi`），不会沿用上一次的选择。名字不认识时什么都不改，
+也不会打开 boss mode。
 
 关闭状态下系统提示词一个字都不加。开关是进程内状态，不持久化，重启后回到关闭。
 

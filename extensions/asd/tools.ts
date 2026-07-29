@@ -48,6 +48,30 @@ export function agentOfCommand(
   return base.length > 0 && Object.hasOwn(presets, base) ? base : undefined;
 }
 
+export type AgentArg = { ok: true; agent: string } | { ok: false; message: string };
+
+/**
+ * 解析 `/asd:boss-start <agent>` 的参数。
+ *
+ * 空参数回到 `fallback`（环境变量或内置默认），**不沿用上一次的选择** —— 开关
+ * 命令不该带隐藏状态，"不给参数"必须永远是同一个可预测的结果。
+ */
+export function resolveAgentArg(
+  raw: string,
+  fallback: string,
+  presets: Record<string, AgentPreset>,
+): AgentArg {
+  const name = raw.trim();
+  if (name.length === 0) return { ok: true, agent: fallback };
+  if (!Object.hasOwn(presets, name)) {
+    return {
+      ok: false,
+      message: `不认识的 agent "${name}"。可选：${Object.keys(presets).join(" / ")}`,
+    };
+  }
+  return { ok: true, agent: name };
+}
+
 export function buildSpawnCommand(o: {
   agent: string;
   task: string;
