@@ -37,8 +37,11 @@ export function buildSpawnCommand(o: {
   agent: string;
   task: string;
   parentSession?: string;
+  /** 预设表；缺省用模块级 `PRESETS`。测试（尤其 e2e）可以传自己的一份，不碰全局状态。 */
+  presets?: Record<string, AgentPreset>;
 }): string {
-  const preset = PRESETS[o.agent];
+  const presets = o.presets ?? PRESETS;
+  const preset = presets[o.agent];
   if (!preset) throw new Error(`不认识的 agent：${o.agent}`);
   const parts: string[] = [];
   if (preset.piChild) {
@@ -57,6 +60,14 @@ export interface ToolConfig {
   followTimeout: string;
   /** boss 自己的 session 文件，spawn pi 子 agent 时传下去。 */
   parentSession?: string;
+  /**
+   * 预设表；缺省用模块级 `PRESETS`。
+   *
+   * 只给测试用（尤其 e2e 需要一个不用真起 claude/pi 的假 agent 预设）——
+   * 直接改模块级 `PRESETS` 会污染所有共享它的测试/调用方，这个字段让调用方
+   * 传一份自己的表，不碰全局状态。
+   */
+  presets?: Record<string, AgentPreset>;
 }
 
 export interface ToolDeps {
@@ -98,6 +109,7 @@ function preview(task: string): string {
 
 export function createTools(deps: ToolDeps): Tools {
   const { asd, registry, watchers, config, now } = deps;
+  const presets = config.presets ?? PRESETS;
 
   /**
    * 并发 spawn 之间的临界区屏障：正在处理中、还没落盘到 registry 的 session
@@ -141,8 +153,8 @@ export function createTools(deps: ToolDeps): Tools {
         return err("task 不能为空 —— 派给 agent 的任务描述必须自包含。");
       }
       const agent = p.agent ?? config.defaultAgent;
-      if (!PRESETS[agent]) {
-        return err(`不认识的 agent "${agent}"。可选：${Object.keys(PRESETS).join(" / ")}`);
+      if (!presets[agent]) {
+        return err(`不认识的 agent "${agent}"。可选：${Object.keys(presets).join(" / ")}`);
       }
       const cwd = p.cwd ?? config.defaultCwd;
       const wantWatch = p.watch !== false;
@@ -196,7 +208,12 @@ export function createTools(deps: ToolDeps): Tools {
         const name = registry.allocateName(p.name, taken);
         held = name;
         reserved.add(held);
-        const cmd = buildSpawnCommand({ agent, task: p.task, parentSession: config.parentSession });
+        const cmd = buildSpawnCommand({
+          agent,
+          task: p.task,
+          parentSession: config.parentSession,
+          presets,
+        });
         const session = await asd.create({ name, cwd, cmd });
         registry.add({
           session,
