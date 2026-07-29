@@ -105,6 +105,36 @@ function fail(r: ExecResult, what: string): never {
   throw new AsdError(r.code, `asd ${what} 失败（退出码 ${r.code}）：${detail}`);
 }
 
+/**
+ * 从 `asd follow --json` 的 JSONL stdout 里只挑出 `event:"output"` 的 `text`
+ * 拼起来 —— 那是"滚出屏幕、不会再变"的过程输出，也是规格要的东西。
+ *
+ * 不用 `--raw`，所以 `screen`（每次暂停时的整屏快照，一次重绘一条而不是一帧
+ * 一条）、`status`（running 翻转）、`exit`/`timeout` 都会混在同一个流里，但
+ * 它们只用来判定状态，不该整坨灌回调用方 —— 不然一个会重绘的 TUI 随便一跑
+ * 就是几十上百 KB 塞进 LLM 上下文，而其中能读的文字只有其中一小部分。
+ *
+ * 容错两件事：最后一行可能被截断（进程被杀/超时打断时 stdout 没收全），以及
+ * 混进来的非 JSON 杂行 —— 两种情况都跳过这一行，不抛。
+ */
+export function parseFollowOutput(stdout: string): string {
+  let out = "";
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (typeof obj !== "object" || obj === null) continue;
+    const { event, text } = obj as { event?: unknown; text?: unknown };
+    if (event === "output" && typeof text === "string") out += text;
+  }
+  return out;
+}
+
 export function createAsd(exec: Exec): Asd {
   async function run(
     args: string[],
@@ -177,14 +207,14 @@ export function createAsd(exec: Exec): Asd {
     },
 
     async follow(name, { forever, timeout, signal }) {
-      const args = ["follow", name];
+      const args = ["follow", name, "--json"];
       if (forever) args.push("--forever");
       args.push("--timeout", timeout);
       const r = await run(args, { signal });
       if (r.code === NO_SESSION) return { kind: "gone" };
-      if (r.code === TIMEOUT) return { kind: "timeout", text: r.stdout };
+      if (r.code === TIMEOUT) return { kind: "timeout", text: parseFollowOutput(r.stdout) };
       if (r.code !== 0) fail(r, "follow");
-      return { kind: "settled", text: r.stdout };
+      return { kind: "settled", text: parseFollowOutput(r.stdout) };
     },
 
     async kill(name) {

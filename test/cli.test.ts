@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AsdError, AsdMissingError, createAsd, type Exec, type ExecResult } from "../extensions/asd/cli.ts";
+import {
+  AsdError,
+  AsdMissingError,
+  createAsd,
+  parseFollowOutput,
+  type Exec,
+  type ExecResult,
+} from "../extensions/asd/cli.ts";
 
 interface Call {
   cmd: string;
@@ -96,21 +103,34 @@ test("send 遇到退出码 3 返回 false", async () => {
   assert.equal(await createAsd(exec).send("pi-a", "hi"), false);
 });
 
-test("follow 退出码 0 是 settled，带回过程输出", async () => {
-  const { exec, calls } = fakeExec([{ stdout: "LINE-1\nLINE-2\n" }]);
+/** 一行 `asd follow --json` 事件。 */
+function ev(o: Record<string, unknown>): string {
+  return JSON.stringify(o);
+}
+
+test("follow 带 --json，退出码 0 是 settled，只把 output 事件的 text 拼进过程输出", async () => {
+  const stdout = [
+    ev({ event: "status", time_ms: 1, running: true, idle_ms: 0 }),
+    ev({ event: "output", time_ms: 2, text: "LINE-1\n" }),
+    ev({ event: "output", time_ms: 3, text: "LINE-2\n" }),
+    ev({ event: "screen", time_ms: 4, text: "整屏重绘的内容，不该出现在过程输出里" }),
+    ev({ event: "status", time_ms: 5, running: false, idle_ms: 2000 }),
+  ].join("\n");
+  const { exec, calls } = fakeExec([{ stdout }]);
   const out = await createAsd(exec).follow("pi-a", { timeout: "30m" });
   assert.deepEqual(out, { kind: "settled", text: "LINE-1\nLINE-2\n" });
-  assert.deepEqual(calls[0].args, ["follow", "pi-a", "--timeout", "30m"]);
+  assert.deepEqual(calls[0].args, ["follow", "pi-a", "--json", "--timeout", "30m"]);
 });
 
-test("follow 的 forever 加 --forever", async () => {
+test("follow 的 forever 加 --forever，且仍然带 --json", async () => {
   const { exec, calls } = fakeExec([{ stdout: "" }]);
   await createAsd(exec).follow("pi-a", { timeout: "5m", forever: true });
-  assert.deepEqual(calls[0].args, ["follow", "pi-a", "--forever", "--timeout", "5m"]);
+  assert.deepEqual(calls[0].args, ["follow", "pi-a", "--json", "--forever", "--timeout", "5m"]);
 });
 
-test("follow 退出码 4 是 timeout，不是错误", async () => {
-  const { exec } = fakeExec([{ code: 4, stdout: "PARTIAL" }]);
+test("follow 退出码 4 是 timeout，不是错误，text 一样只取 output 事件", async () => {
+  const stdout = [ev({ event: "output", time_ms: 1, text: "PARTIAL" })].join("\n");
+  const { exec } = fakeExec([{ code: 4, stdout }]);
   assert.deepEqual(await createAsd(exec).follow("pi-a", { timeout: "1s" }), {
     kind: "timeout",
     text: "PARTIAL",
@@ -120,6 +140,37 @@ test("follow 退出码 4 是 timeout，不是错误", async () => {
 test("follow 退出码 3 是 gone", async () => {
   const { exec } = fakeExec([{ code: 3 }]);
   assert.deepEqual(await createAsd(exec).follow("pi-a", { timeout: "1s" }), { kind: "gone" });
+});
+
+// --- I2 回归：asd_follow 不该把逐字节 pty 流（screen/status/exit 等控制
+// 事件）灌进 LLM 上下文，只要 output 事件的文本。---
+
+test("parseFollowOutput 只挑出 output 事件的 text，按顺序拼起来", () => {
+  const stdout = [
+    ev({ event: "status", time_ms: 1, running: true, idle_ms: 0 }),
+    ev({ event: "output", time_ms: 2, text: "a" }),
+    ev({ event: "screen", time_ms: 3, text: "整屏，不该进来" }),
+    ev({ event: "output", time_ms: 4, text: "b" }),
+    ev({ event: "status", time_ms: 5, running: false, idle_ms: 2000 }),
+    ev({ event: "exit", time_ms: 6 }),
+  ].join("\n");
+  assert.equal(parseFollowOutput(stdout), "ab");
+});
+
+test("parseFollowOutput 容忍不完整的最后一行和混进来的非 JSON 杂行，不抛异常", () => {
+  const stdout =
+    [
+      ev({ event: "output", time_ms: 1, text: "good-1\n" }),
+      "不是 JSON 的杂行，比如 daemon 自己往 stderr 混进 stdout 的东西",
+      ev({ event: "output", time_ms: 2, text: "good-2\n" }),
+    ].join("\n") + '\n{"event":"output","time_ms":3,"text":"trunc'; // 被截断的最后一行，没收全
+  assert.doesNotThrow(() => parseFollowOutput(stdout));
+  assert.equal(parseFollowOutput(stdout), "good-1\ngood-2\n");
+});
+
+test("parseFollowOutput 空输入给空字符串", () => {
+  assert.equal(parseFollowOutput(""), "");
+  assert.equal(parseFollowOutput("\n\n"), "");
 });
 
 test("kill 打 asd kill，退出码 3 说明本来就没了", async () => {
