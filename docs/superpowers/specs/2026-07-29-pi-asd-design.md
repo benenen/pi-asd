@@ -261,9 +261,32 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 
 台账记 watcher 状态，同一个 session 不重复 follow。
 
+## boss mode 开关
+
+**boss mode 默认关闭，必须手动开启。** 两个命令：
+
+| 命令 | 作用 |
+|---|---|
+| `/asd:boss-start` | 打开 —— 从下一轮开始注入 boss mode 提示词 |
+| `/asd:boss-stop` | 关闭 —— 不再注入提示词 |
+
+关闭状态下 `bossModePrompt()` 返回空串，系统提示词一个字都不加。开关是进程内状态，
+不持久化（和台账一致），重启后回到关闭。重复开/关是幂等的，命令会说明当前状态。
+
+**`/asd:boss-stop` 不杀任何 agent、也不停 watcher。** 它只停止注入提示词。已经派出去
+的 agent 照跑，它们停下时结果照样推给主 agent —— 关掉 boss mode 不该让你对已经在跑的
+活失去知觉。要结束 agent 就显式 `asd_kill`（且只对 pi-asd 自己建的有效）。
+
+**六个工具在关闭状态下仍然注册、仍然可调用。** 关的是提示词而不是能力：没有 boss mode
+也可能想用 `asd_candidates` 看看有哪些空闲会话。
+
+开关判断放在 `prompt.ts` 里（`bossModePrompt({ enabled, ... })`，`enabled === false`
+时返回 `""`），不放在 `index.ts` —— `index.ts` 是全项目唯一没有单测夹具的文件，把这条
+逻辑放进纯模块才测得到。
+
 ## boss mode 提示词
 
-`before_agent_start` 事件里往 system prompt 追加，两段。
+`before_agent_start` 事件里往 system prompt 追加，两段（仅在开关打开时）。
 
 **第一段（恒定）**——沿用 pi-boss 那几条硬约束：
 
