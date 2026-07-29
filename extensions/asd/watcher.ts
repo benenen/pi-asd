@@ -28,10 +28,23 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
+/**
+ * "刚挂上就报已停下"的止损窗口：一个新建/刚重挂的 session，`asd follow` 可能
+ * 在它连第一帧都还没吐出来的时候就因为"安静了 2 秒"而 settle —— 冷启动的
+ * agent（尤其是并发 spawn 一堆时）很容易撑不过这 2 秒。这个窗口内如果
+ * settle 时屏幕仍是空的，判定为"还没真的开始"而不是"已经做完"，重挂一次
+ * 而不是通知。时间和次数都设了上限，避免一个屏幕永远空白的 session 被无限
+ * 重挂。
+ */
+const EARLY_GRACE_MS = 20_000;
+const EARLY_MAX_RETRIES = 10;
+
 export class WatcherPool {
   readonly #deps: WatcherDeps;
   readonly #running = new Map<string, AbortController>();
   readonly #inflight = new Set<Promise<void>>();
+  /** session → 这一轮"冷启动止损"的挂载时间和已经重挂过几次。 */
+  readonly #early = new Map<string, { mountedAt: number; attempts: number }>();
 
   constructor(deps: WatcherDeps) {
     this.#deps = deps;
@@ -42,6 +55,12 @@ export class WatcherPool {
     if (this.#running.has(session)) return false;
     const ctrl = new AbortController();
     this.#running.set(session, ctrl);
+    // 只在这个 session 没有正在进行的"冷启动止损"时开一轮新的 —— 内部重挂
+    // （见 #run 里的 early-empty 分支）复用同一轮，好让"距挂载多久"是从最初
+    // 那次 watch() 算起，而不是每重挂一次就清零。
+    if (!this.#early.has(session)) {
+      this.#early.set(session, { mountedAt: this.#deps.now(), attempts: 0 });
+    }
     const task = this.#run(session, ctrl, this.#deps.now());
     this.#inflight.add(task);
     void task.finally(() => this.#inflight.delete(task));
@@ -53,6 +72,10 @@ export class WatcherPool {
   }
 
   stop(session: string): void {
+    // 外部主动 stop（steer/kill/dropGone/session_shutdown）意味着这一轮
+    // 监视彻底结束，下次 watch() 应该当成全新的一轮冷启动止损来算，不能继承
+    // 上一轮的挂载时间/次数。
+    this.#early.delete(session);
     const ctrl = this.#running.get(session);
     if (!ctrl) return;
     ctrl.abort();
@@ -62,6 +85,7 @@ export class WatcherPool {
   stopAll(): void {
     for (const ctrl of this.#running.values()) ctrl.abort();
     this.#running.clear();
+    this.#early.clear();
   }
 
   /** 等所有在跑的 watcher 回调走完 —— 测试用，让断言不和 fire-and-forget 抢跑。 */
@@ -82,11 +106,13 @@ export class WatcherPool {
       if (ctrl.signal.aborted) return;
 
       if (outcome.kind === "gone") {
+        this.#early.delete(session);
         this.#finish(session, ctrl);
         this.#notify(`[pi-asd] agent "${session}" 的 session 已结束。`);
         return;
       }
       if (outcome.kind === "timeout") {
+        this.#early.delete(session);
         this.#finish(session, ctrl);
         this.#notify(
           `[pi-asd] agent "${session}" 的 watcher 等了 ${this.#deps.timeout} 还没等到它停下，它仍在跑。` +
@@ -102,14 +128,39 @@ export class WatcherPool {
       // "没在挂"，给外层制造出重复挂 / 误删下一代 watcher 记录的机会）。
       const screen = await this.#deps.asd.peek(session);
       if (ctrl.signal.aborted) return;
+
+      // 冷启动止损：屏幕真的是空的（不是 null —— null 是"session 已经不在
+      // 了"，那是完全不同的情况，必须照常通知，见下面的默认分支），而且这个
+      // session 还在"刚挂上没多久"的宽限期里、重挂次数也没到上限 —— 这更像
+      // "agent 还没来得及吐出第一帧"，不是"真的做完了"。摘掉这一代、悄悄
+      // 重挂一代新的，不通知；`isWatching()` 全程保持 true（#finish 和
+      // watch() 之间没有任何 await，外部观察不到"没在挂"的空档）。
+      const early = this.#early.get(session);
+      const screenIsEmpty = screen !== null && screen.trim().length === 0;
+      if (
+        screenIsEmpty &&
+        early !== undefined &&
+        this.#deps.now() - early.mountedAt < EARLY_GRACE_MS &&
+        early.attempts < EARLY_MAX_RETRIES
+      ) {
+        early.attempts += 1;
+        this.#finish(session, ctrl);
+        this.watch(session);
+        return;
+      }
+
       this.#finish(session, ctrl);
-      const took = formatDuration(this.#deps.now() - startedAt);
+      // "历时"从这一轮冷启动止损最初挂载的时刻算起（如果有过重挂），而不是
+      // 从这次侥幸成功的重挂算起 —— 不然 boss 看到的耗时会比实际短一大截。
+      const took = formatDuration(this.#deps.now() - (early?.mountedAt ?? startedAt));
+      this.#early.delete(session);
       this.#notify(
         `[pi-asd] agent "${session}" 已停下（历时 ${took}）。\n` +
           `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,
       );
     } catch (e) {
       if (ctrl.signal.aborted) return;
+      this.#early.delete(session);
       this.#finish(session, ctrl);
       this.#notify(
         `[pi-asd] agent "${session}" 的 watcher 出错：${e instanceof Error ? e.message : String(e)}`,
