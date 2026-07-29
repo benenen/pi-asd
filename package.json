@@ -1,0 +1,38 @@
+{
+  "name": "pi-asd",
+  "version": "0.1.0",
+  "description": "把任务派给跑在独立 asd session 里的子 agent —— pi 的 boss mode，跑在 asd 上",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benenen/pi-asd"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
