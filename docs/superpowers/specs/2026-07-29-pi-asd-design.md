@@ -267,7 +267,7 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 
 | 命令 | 作用 |
 |---|---|
-| `/asd:boss-start` | 打开 —— 从下一轮开始注入 boss mode 提示词 |
+| `/asd:boss-start [agent]` | 打开 —— 从下一轮开始注入 boss mode 提示词；可带 `pi` / `claude` / `codex` 定这一轮的默认 agent（有参数补全）。**不给参数回到基线 `PI_ASD_AGENT`（默认 `pi`），不沿用上一次**；名字不认识时什么都不改、也不打开 |
 | `/asd:boss-stop` | 关闭 —— 不再注入提示词 |
 
 关闭状态下 `bossModePrompt()` 返回空串，系统提示词一个字都不加。开关是进程内状态，
