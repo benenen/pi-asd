@@ -71,6 +71,12 @@ function harness(
     async send() {
       return true;
     },
+    async sendText() {
+      return true;
+    },
+    async key() {
+      return true;
+    },
     async follow(name: string) {
       followCalls.push(name);
       if (o.instantFollow !== undefined) return o.instantFollow;
@@ -444,6 +450,12 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
       return "SCREEN";
     },
     async send() {
+      return true;
+    },
+    async sendText() {
+      return true;
+    },
+    async key() {
       return true;
     },
     async follow(): Promise<FollowOutcome> {

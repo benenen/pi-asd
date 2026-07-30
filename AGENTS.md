@@ -156,7 +156,44 @@ agent 的 TUI 输入框普遍按"一大坨字节一次到达"判定粘贴，那�
 `deliveries()`（只数带 `--text` 的那条），拿 `subcommands().filter(c => c === "send")`
 数会翻倍。单测构造 `createAsd` 时传 `{ enterDelayMs: 0 }`，别真睡 300ms。
 
-### 6. watcher 的冷启动止损要真的等时间
+### 6. 投递必须校验 —— `send` 返回 true 不代表对方收到了
+
+`asd send` 退出码 0 的语义**只是"asd 把字节排进了这个 session 的队列"**。asd 0.1.9
+的 daemon（`crates/asd-daemon/src/conn.rs` 的 `Frame::SendInput`）拿到帧之后是
+`let _ = handle.tx.send(...)` —— 连排队结果都丢弃 —— 紧接着无条件回 `Ack`；真正写
+pty 在之后异步发生，失败只 `debug!` 一行。
+
+所以**任何往 session 里投任务的地方都要走 `deliver()`**，它做三步：
+`sendText` → peek 校验文本真的出现在屏幕上 → `key("Enter")`。
+
+两个不能改的细节：
+
+- **校验必须卡在"文本已送、回车未送"那个窗口里。** 回车会清空输入框，按下去之后
+  屏幕上有没有这段文本就再也分不出"没送到"和"送到了并且已提交"。
+- **校验不过就绝不按回车。** 此刻输入框里可能是别的东西（比如一个模态对话框），
+  那一下回车会去确认它 —— claude 的信任对话框默认项是 "2. No, exit"。
+
+投递失败要如实报「任务未投递成功：<原因>」并且**不记台账** —— 记了就等于宣称
+"已派出"，正是这次要修掉的病。
+
+### 7. 启动期的模态 UI 要按 preset 过掉
+
+有些 agent 首次在一个目录里启动会弹模态 UI，盖在输入框上层。claude 在**未信任的
+目录**里会弹工作目录信任确认，而 pi-asd 给每个新 session 建的正是全新空目录 ——
+所以它每次必然撞上。
+
+`AgentPreset` 因此有两个字段：
+
+- `deliver: "argv" | "send"` —— 任务是拼进启动命令，还是裸启动之后打进去
+- `startupDialogs` —— 认出来 + 过掉它要按的键
+
+claude 走 `deliver: "send"`（argv 里的 prompt 在对话框后面永远轮不到执行）；
+pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见下）。
+
+没有可用的 CLI 开关：`--dangerously-skip-permissions` 管的是权限不是信任，唯一能
+跳过信任确认的是 `-p`/非 TTY 的非交互模式，而子 agent 必须活着接受后续 steer。
+
+### 8. watcher 的冷启动止损要真的等时间
 
 `asd follow` 对一个已经安静了的 session 是**立即返回**的，重挂一次只要几十毫秒。所以
 `EARLY_GRACE_MS`（20 秒宽限期）如果不配上 `EARLY_RETRY_DELAY_MS` 的真实 sleep，10 次重挂

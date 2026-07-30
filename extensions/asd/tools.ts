@@ -45,16 +45,90 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/**
+ * 任务文本有没有真的出现在 agent 屏幕上。
+ *
+ * 归一化之后再比。要去掉的不只是空白：TUI 把输入框画成带边框的盒子，长文本在
+ * 盒子里折行时**每一行两端都会插进边框字符**，原样 `includes` 几乎必然假阴性。
+ * 这里的假阴性代价很实在 —— 会把一次成功的投递误报成"未投递成功"。
+ *
+ * 只取前 `SIGNATURE_CHARS` 个字符做特征：长任务在输入框里会被截断显示，拿整段
+ * 去比同样是假阴性。
+ */
+const SIGNATURE_CHARS = 24;
+
+/** 空白 + 制表符绘图区（U+2500–U+257F，各家 TUI 的边框）+ 几个常见装饰符。 */
+const NOISE = /[\s─-╿│█│┃┆┊|>❯»·]+/g;
+
+export function screenHasText(screen: string, text: string): boolean {
+  const strip = (s: string): string => s.replace(NOISE, "");
+  const needle = strip(text).slice(0, SIGNATURE_CHARS);
+  return needle.length > 0 && strip(screen).includes(needle);
+}
+
+export type Delivery = { ok: true } | { ok: false; reason: string };
+
+/**
+ * agent 启动期可能挡在最前面的 UI（信任确认、首次引导之类）。
+ *
+ * 这类 UI 是**模态**的：它盖在输入框上层，任务文本会送到它后面，回车被它吃掉 ——
+ * 而它的默认选项还可能是"退出"，于是 session 直接消失。所以必须先认出来、过掉，
+ * 再投任务。
+ */
+export interface StartupDialog {
+  /** 人话名字，进报错文案。 */
+  what: string;
+  /** 屏幕上出现它就认为撞上了。 */
+  match: RegExp;
+  /** 过掉它要送的具名按键，按顺序。 */
+  keys: string[];
+}
+
+/** 新建 session 时任务怎么进到 agent 里。 */
+export type Deliver =
+  /** 拼进启动命令当 argv。省事，但 agent 必须真的消费那个 positional prompt。 */
+  | "argv"
+  /** 先裸启动 agent，等它就绪、过掉启动期 UI，再把任务打进去。 */
+  | "send";
+
 export interface AgentPreset {
-  /** `escapedTask` 已经过 shellEscape，直接拼进去。 */
+  /** `escapedTask` 已经过 shellEscape，直接拼进去。`deliver: "argv"` 用。 */
   command(escapedTask: string): string;
+  /** 不带任务、只把 agent 起起来的命令。`deliver: "send"` 时必须有。 */
+  bare?: string;
   /** 是否注入 PI_SPAWNED / PI_PARENT_SESSION —— 只有 pi 子 agent 认这些。 */
   piChild: boolean;
+  /** 缺省 `"argv"`。 */
+  deliver?: Deliver;
+  /** 启动期可能挡路的模态 UI，按顺序检查。 */
+  startupDialogs?: StartupDialog[];
 }
 
 export const PRESETS: Record<string, AgentPreset> = {
   pi: { command: (t) => `pi ${t}`, piChild: true },
-  claude: { command: (t) => `claude --dangerously-skip-permissions ${t}`, piChild: false },
+  claude: {
+    command: (t) => `claude --dangerously-skip-permissions ${t}`,
+    bare: "claude --dangerously-skip-permissions",
+    piChild: false,
+    // claude 在**没被信任过的目录**里会先弹信任确认，而 pi-asd 给每个新 session
+    // 建的正是一个全新空目录 —— 所以它每次必然撞上。撞上时 argv 里的 prompt 永远
+    // 轮不到执行，任务静默丢失；后续 steer 的文本还会打进那个编号菜单，可能选中
+    // "2. No, exit" 把 session 直接关掉。
+    //
+    // 没有可用的 CLI 开关：`--dangerously-skip-permissions` 管的是权限不是信任；
+    // 唯一能跳过信任确认的是 `-p`/非 TTY 的非交互模式，而子 agent 必须活着接受
+    // 后续 steer，用不了。（另一条路是预先往 ~/.claude.json 写
+    // `hasTrustDialogAccepted`，但那是 claude 自己在写的文件，并发改它有风险，
+    // 而且格式随版本变 —— 没走。）
+    deliver: "send",
+    startupDialogs: [
+      {
+        what: "工作目录信任确认",
+        match: /trust (this|the) folder|Do you trust the files/i,
+        keys: ["Enter"],
+      },
+    ],
+  },
   codex: { command: (t) => `codex ${t}`, piChild: false },
 };
 
@@ -215,7 +289,19 @@ export interface ToolDeps {
   /** 建目录（含父目录）。`asd new --cwd` 对不存在的目录会直接失败。 */
   mkdirp: (dir: string) => Promise<void>;
   now: () => number;
+  /**
+   * 等待。测试注入成 no-op —— 投递校验和启动等待都要真的让时间过去，
+   * 不注入的话单测会真睡好几秒。
+   */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/** 送出文本之后、peek 校验之前等多久，给 TUI 一点渲染时间。 */
+export const ECHO_WAIT_MS = 400;
+/** 裸启动之后最多等 agent 就绪多久。 */
+export const STARTUP_TIMEOUT_MS = 90_000;
+/** 启动期轮询间隔。 */
+export const STARTUP_POLL_MS = 700;
 
 export interface SpawnParams {
   task: string;
@@ -268,6 +354,90 @@ export function createTools(deps: ToolDeps): Tools {
    * `createTools` 实例的闭包里，不是模块级全局，避免多个实例互相干扰。
    */
   const reserved = new Set<string>();
+
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+  /**
+   * 把一段文本投进 session，**并校验它真的进去了**。
+   *
+   * 为什么不能直接用 `asd.send`：那个方法返回 true 只代表 asd 把字节排进了队列
+   * （daemon 是 `let _ = tx.send(...)` 之后无条件 Ack，见 cli.ts `sendText` 的
+   * 注释），既不代表 agent 收到、更不代表它开始干活。pi-asd 以前拿它当"已送达"，
+   * 于是任务丢了也照报"已派出 xxx"，然后你干等一个永远不来的结果。
+   *
+   * 校验必须卡在"文本已送、回车未送"这个窗口里 —— 回车会清空输入框，按下去之后
+   * 屏幕上有没有这段文本就再也分不出"没送到"和"送到了并且已提交"。
+   *
+   * 校验不过就**不按回车**：此刻输入框里是别的东西（比如一个模态对话框），
+   * 那一下回车会去提交/确认那个别的东西。同 cli.ts 里"正文没进去就别按回车"。
+   */
+  async function deliver(session: string, text: string): Promise<Delivery> {
+    if (!(await asd.sendText(session, text))) {
+      return { ok: false, reason: `"${session}" 的 session 已经不在了` };
+    }
+    await sleep(ECHO_WAIT_MS);
+
+    const screen = await asd.peek(session);
+    if (screen === null) return { ok: false, reason: `"${session}" 的 session 已经不在了` };
+    if (!screenHasText(screen, text)) {
+      return {
+        ok: false,
+        reason:
+          `任务文本没有出现在 "${session}" 的屏幕上 —— 它没被 agent 的输入框收下。` +
+          `没有按回车（此刻输入框里可能是别的东西，回车会误触它）。` +
+          `用 asd_peek("${session}") 看看它卡在什么界面上。`,
+      };
+    }
+
+    if (!(await asd.key(session, "Enter"))) {
+      return { ok: false, reason: `"${session}" 在按回车之前消失了；任务未提交` };
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 裸启动之后等 agent 就绪，顺手过掉启动期的模态 UI。
+   *
+   * 就绪的判据只能是"屏幕上有东西了" —— 各家 TUI 没有统一的 ready 信号，而按
+   * 渲染文案认每个 agent 的具体界面是条会随上游改版静默失效的路，不走。
+   */
+  async function prepare(session: string, preset: AgentPreset): Promise<Delivery> {
+    const deadline = now() + STARTUP_TIMEOUT_MS;
+    const dismissed = new Set<string>();
+    let sawAnything = false;
+
+    while (now() < deadline) {
+      const screen = await asd.peek(session);
+      if (screen === null) return { ok: false, reason: `"${session}" 启动过程中就消失了` };
+
+      const dialog = (preset.startupDialogs ?? []).find((d) => d.match.test(screen));
+      if (dialog !== undefined) {
+        if (dismissed.has(dialog.what)) {
+          return {
+            ok: false,
+            reason: `"${session}" 停在「${dialog.what}」上，送了 ${dialog.keys.join("+")} 也没过去`,
+          };
+        }
+        for (const k of dialog.keys) {
+          if (!(await asd.key(session, k))) {
+            return { ok: false, reason: `"${session}" 在过「${dialog.what}」时消失了` };
+          }
+        }
+        dismissed.add(dialog.what);
+        await sleep(STARTUP_POLL_MS);
+        continue;
+      }
+
+      // 屏幕上有内容、且没有已知对话框挡着 —— 认为可以收输入了。
+      if (screen.trim().length > 0) {
+        if (sawAnything) return { ok: true };
+        // 多看一轮：第一帧可能正好是对话框还没画出来的空档。
+        sawAnything = true;
+      }
+      await sleep(STARTUP_POLL_MS);
+    }
+    return { ok: false, reason: `"${session}" 在 ${STARTUP_TIMEOUT_MS / 1000}s 内没有就绪` };
+  }
 
   /** 台账里没有就拒绝 —— peek / follow / steer 共用。 */
   function requireKnown(session: string): ToolResult | undefined {
@@ -354,12 +524,14 @@ export function createTools(deps: ToolDeps): Tools {
       }
 
       const known = registry.get(session);
-      if (!(await asd.send(session, task))) {
+      const sent = await deliver(session, task);
+      if (!sent.ok) {
+        // 投递失败时不要留下"已派出"的假象：台账里那条要清掉、watcher 要停。
         if (known !== undefined) {
           registry.remove(session);
           watchers.stop(session);
         }
-        return err(`"${session}" 的 session 已经不在了。`);
+        return err(`任务未投递成功：${sent.reason}`);
       }
       if (known === undefined) {
         registry.add({
@@ -451,7 +623,8 @@ export function createTools(deps: ToolDeps): Tools {
           );
           if (target !== undefined) {
             hold(target.session);
-            if (await asd.send(target.session, p.task)) {
+            const sent = await deliver(target.session, p.task);
+            if (sent.ok) {
               target.task = p.task;
               const watching = rewatch(target.session, wantWatch);
               return {
@@ -461,7 +634,8 @@ export function createTools(deps: ToolDeps): Tools {
                 details: { session: target.session, agent, cwd: target.cwd, reused: true, watching },
               };
             }
-            // send 说 session 没了 —— 清掉它、放行预留，继续往下走新建。
+            // 没投进去 —— 清掉它、放行预留，继续往下走新建。这条路径上"改道新建"
+            // 是安全的：任务一个字都没提交进去，不会出现两处都在跑同一个任务。
             registry.remove(target.session);
             watchers.stop(target.session);
             release(target.session);
@@ -477,14 +651,35 @@ export function createTools(deps: ToolDeps): Tools {
         // 所以必须先建出来。显式给的路径不替他建 —— 打错了应当大声失败。
         const cwd = explicitCwd ?? path.join(config.workspaceBase, name);
         if (explicitCwd === undefined) await mkdirp(cwd);
-        const cmd = buildSpawnCommand({
-          agent,
-          task: p.task,
-          parentSession: config.parentSession,
-          presets,
-        });
+        // 任务怎么进 agent，由 preset 决定：
+        //  - argv（缺省）：拼进启动命令，agent 一起来就带着任务
+        //  - send：先裸启动，等就绪、过掉启动期模态 UI，再把任务打进去
+        //    （claude 走这条 —— 它在未信任目录里会先弹信任确认，挡在输入框前面，
+        //     argv 里的 prompt 永远轮不到执行）
+        const preset = presets[agent]!;
+        const viaSend = preset.deliver === "send" && preset.bare !== undefined;
+        const cmd = viaSend
+          ? preset.bare!
+          : buildSpawnCommand({
+              agent,
+              task: p.task,
+              parentSession: config.parentSession,
+              presets,
+            });
         const session = await asd.create({ name, cwd, cmd });
         if (session !== name) hold(session);
+
+        if (viaSend) {
+          const ready = await prepare(session, preset);
+          if (!ready.ok) {
+            // 起没起来都不留台账记录 —— 留下就等于宣称"已派出"。session 本身
+            // 不动：可能还活着，用户可以 asd attach 进去看它卡在哪。
+            return err(`任务未投递成功：${ready.reason}`);
+          }
+          const sent = await deliver(session, p.task);
+          if (!sent.ok) return err(`任务未投递成功：${sent.reason}`);
+        }
+
         registry.add({
           session,
           task: p.task,
@@ -639,7 +834,12 @@ export function createTools(deps: ToolDeps): Tools {
     async steer(p) {
       const bad = requireKnown(p.session);
       if (bad) return bad;
-      if (!(await asd.send(p.session, p.message))) return dropGone(p.session);
+      const sent = await deliver(p.session, p.message);
+      if (!sent.ok) {
+        // session 真没了才清台账；只是没投进去的话记录要留着，那个 agent 还活着。
+        if (/已经不在了|消失了/.test(sent.reason)) return dropGone(p.session);
+        return err(`消息未投递成功：${sent.reason}`);
+      }
       const watching = rewatch(p.session, true);
       return {
         text: `已把消息送给 "${p.session}"。${watching ? "watcher 已重挂。" : ""}`,

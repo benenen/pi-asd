@@ -163,11 +163,11 @@ test("回车那一步遇到退出码 3 也返回 false", async () => {
   assert.equal(calls.length, 2);
 });
 
-test("回车那一步的非语义错误照常抛出，并且报清是回车这步", async () => {
+test("回车那一步的非语义错误照常抛出，并且报清是哪个按键", async () => {
   const { exec } = fakeExec([{}, { code: 1, stderr: "boom" }]);
   await assert.rejects(
     () => createAsd(exec, { enterDelayMs: 0 }).send("pi-a", "hi"),
-    (e: unknown) => e instanceof AsdError && /回车/.test((e as Error).message),
+    (e: unknown) => e instanceof AsdError && /按键 Enter/.test((e as Error).message),
   );
 });
 

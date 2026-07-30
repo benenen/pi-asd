@@ -9,6 +9,7 @@ import {
   buildSpawnCommand,
   createTools,
   looksIdle,
+  screenHasText,
   parseBossDefault,
   REUSE_MIN_IDLE_MS,
   resolveAgentArg,
@@ -74,11 +75,21 @@ function harness(
      * 门槛本身有它自己的一组测试，见文件末尾"静默门槛"那一节。
      */
     reuseMinIdleMs?: number;
+    /** 假屏幕永不回显送进去的文本 —— 模拟"文本被别的 UI 吃了"。 */
+    swallowText?: boolean;
+    /** 前几次 peek 回这些内容（模拟启动期界面），用完之后回正常屏幕。 */
+    startupScreens?: string[];
+    /** 屏幕永远停在信任对话框上 —— 模拟"送了键也过不去"。 */
+    stuckOnDialog?: boolean;
   } = {},
 ): Harness {
   const calls: string[][] = [];
   const live = o.live ?? [];
 
+  /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
+  const typed = new Map<string, string>();
+  /** peek 调用次数，给 startupScreens 排队用。 */
+  let peeks = 0;
   const exec: Exec = async (_cmd, args) => {
     calls.push(args);
     const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
@@ -91,9 +102,18 @@ function harness(
         // 一些测试需要模拟 asd 没有原样使用请求的名字（比如它自己也做了
         // 避重/改写），回显一个跟请求不同的名字。
         return ok(`${o.newEchoes ?? args[1]}\n`);
-      case "peek":
-        return ok(`SCREEN:${args[1]}`);
+      case "peek": {
+        if (o.stuckOnDialog) return ok("❯ 1. Yes, I trust this folder\n  2. No, exit");
+        const startup = o.startupScreens ?? [];
+        if (peeks < startup.length) return ok(startup[peeks++]!);
+        peeks += 1;
+        // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
+        // 否则每一次 deliver() 都会判成"没投进去"。
+        const echoed = o.swallowText ? "" : (typed.get(args[1]!) ?? "");
+        return ok(`SCREEN:${args[1]}\n${echoed}`);
+      }
       case "send":
+        if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
       case "kill":
         return ok();
@@ -125,6 +145,8 @@ function harness(
       mkdirs.push(d);
     },
     now: () => 0,
+    // deliver()/prepare() 会真的等（回显 400ms、启动轮询 700ms）——单测不能真睡
+    sleep: async () => {},
   });
 
   return { tools, registry, watchers, calls, live, mkdirs };
@@ -168,6 +190,8 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
   let listCalls = 0;
   let waiting: Array<() => void> = [];
 
+  /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
+  const typed = new Map<string, string>();
   const exec: Exec = async (_cmd, args) => {
     calls.push(args);
     const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
@@ -189,8 +213,11 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
       case "new":
         return ok(`${args[1]}\n`);
       case "peek":
-        return ok(`SCREEN:${args[1]}`);
+        // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
+        // 否则每一次 deliver() 都会判成"没投进去"。
+        return ok(`SCREEN:${args[1]}\n${typed.get(args[1]!) ?? ""}`);
       case "send":
+        if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
       case "kill":
         return ok();
@@ -221,6 +248,8 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
       mkdirs.push(d);
     },
     now: () => 0,
+    // deliver()/prepare() 会真的等（回显 400ms、启动轮询 700ms）——单测不能真睡
+    sleep: async () => {},
   });
 
   return { tools, registry, watchers, calls, live, mkdirs };
@@ -275,7 +304,13 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
 
   const r = await h.tools.spawn({ task: "新任务" });
   assert.match(r.text, /复用/);
-  assert.deepEqual(subcommands(h), ["list", "send", "send", "follow"], "一次送达是两条 send：正文 + Enter");
+  // deliver()：正文 → peek 校验 → 回车。中间那次 peek 就是投递校验，
+  // 它是这次改动的重点，所以显式断言在序列里。
+  assert.deepEqual(
+    subcommands(h),
+    ["list", "send", "peek", "send", "follow"],
+    "一次送达 = 正文 send + 校验 peek + 回车 send",
+  );
   assert.equal(deliveries(h).length, 1);
   assert.equal(h.registry.get("pi-agent1")?.task, "新任务");
   assert.equal(h.watchers.isWatching("pi-agent1"), true);
@@ -478,7 +513,11 @@ test("steer 送消息并重挂 watcher", async () => {
   });
   const r = await h.tools.steer({ session: "pi-a", message: "换个思路" });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(subcommands(h), ["send", "send", "follow"], "一次送达是两条 send：正文 + Enter");
+  assert.deepEqual(
+    subcommands(h),
+    ["send", "peek", "send", "follow"],
+    "一次送达 = 正文 send + 校验 peek + 回车 send",
+  );
   assert.equal(deliveries(h).length, 1);
   assert.equal(h.watchers.isWatching("pi-a"), true);
   h.watchers.stopAll();
@@ -492,6 +531,8 @@ test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状�
   const calls: string[][] = [];
   let resolveToolFollow: ((r: ExecResult) => void) | undefined;
   let followCallCount = 0;
+  /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
+  const typed = new Map<string, string>();
   const exec: Exec = async (_cmd, args) => {
     calls.push(args);
     const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
@@ -574,7 +615,8 @@ test("peek 返回屏幕内容", async () => {
     createdByUs: true,
   });
   const r = await h.tools.peek({ session: "pi-a" });
-  assert.equal(r.text, "SCREEN:pi-a");
+  // 假屏幕形如 `SCREEN:<name>\n<最近送进去的文本>`（见 harness 的 peek 分支）
+  assert.match(r.text, /^SCREEN:pi-a/);
 });
 
 test("kill 放行台账里自己建的", async () => {
@@ -950,6 +992,8 @@ test("spawn 新建时请求的名字和 asd 回显的名字不一致，registry 
 test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名字", async () => {
   const calls: string[][] = [];
   let newAttempts = 0;
+  /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
+  const typed = new Map<string, string>();
   const exec: Exec = async (_cmd, args) => {
     calls.push(args);
     const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
@@ -961,8 +1005,11 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
         // 第一次 asd new 故意失败，逼 spawn() 抛异常。
         return newAttempts === 1 ? { stdout: "", stderr: "boom", code: 1 } : ok(`${args[1]}\n`);
       case "peek":
-        return ok(`SCREEN:${args[1]}`);
+        // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
+        // 否则每一次 deliver() 都会判成"没投进去"。
+        return ok(`SCREEN:${args[1]}\n${typed.get(args[1]!) ?? ""}`);
       case "send":
+        if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
       case "kill":
         return ok();
@@ -1211,4 +1258,141 @@ test("running=true 的目标仍然报「正在干活」，两种情况文案分�
   assert.equal(r.isError, true);
   assert.match(r.text, /正在干活/);
   assert.doesNotMatch(r.text, /才安静了/);
+});
+
+// --- 投递校验 + 启动期对话框 ---
+//
+// 两条都是在修同一个病：**发射后不管**。
+// `asd send` 返回 true 只代表 asd 把字节排进了 session 的队列（daemon 是
+// `let _ = tx.send(...)` 之后无条件 Ack），既不代表 agent 收到、更不代表它开始
+// 干活。pi-asd 以前拿它当"已送达"，于是任务丢了也照报「已派出 xxx」。
+
+test("screenHasText 归一化空白再比 —— TUI 会折行/缩进", () => {
+  assert.equal(screenHasText("│ 查一下今天的\n│ 新闻，写三条", "查一下今天的新闻，写三条"), true);
+  assert.equal(screenHasText("  查 一 下 今 天 的 新 闻 ，写三条  ", "查一下今天的新闻，写三条"), true);
+  assert.equal(screenHasText("完全不相干的屏幕内容", "查一下今天的新闻"), false);
+});
+
+/**
+ * 长任务只按开头一段做特征：拿整段去比，输入框一旦折行/截断就必然假阴性，
+ * 而假阴性会把一次成功的投递误报成"未投递成功"。代价是特征那段必须完整出现 ——
+ * 屏幕上连开头都看不全时仍然判为没投进去，这是有意的保守。
+ */
+test("screenHasText 只按开头一段做特征，长任务不要求整段都在屏幕上", () => {
+  const long = "查一下今天的新闻，然后" + "补".repeat(500);
+  const head = "查一下今天的新闻，然后" + "补".repeat(20); // 覆盖得住特征长度
+
+  assert.equal(screenHasText(`│ ${head} …`, long), true, "开头够长就算命中，不要求整段 500 字都在");
+  assert.equal(screenHasText("│ 查一下今天 …", long), false, "只露出几个字不算 —— 宁可保守");
+});
+
+test("screenHasText 空文本不算命中 —— 免得空串到处 includes 成真", () => {
+  assert.equal(screenHasText("随便什么", ""), false);
+  assert.equal(screenHasText("随便什么", "   "), false);
+});
+
+/**
+ * 核心回归：文本没进到 agent 屏幕上时必须**如实报错**，而且**绝不能按回车** ——
+ * 此刻输入框里可能是别的东西（比如一个模态对话框），那一下回车会去确认它。
+ */
+test("回归：文本没出现在屏幕上 → 报错、不记台账、不按回车", async () => {
+  const h = harness({
+    live: [info("mem", { command: "claude", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    // 屏幕永远回显不出送进去的文本 —— 模拟"文本被别的 UI 吃了"
+    swallowText: true,
+  });
+  const r = await h.tools.spawn({ task: "查一下新闻", session: "mem" });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /任务未投递成功/);
+  assert.match(r.text, /没有出现在/);
+  assert.equal(h.registry.size, 0, "没投进去就不能记台账 —— 记了就等于宣称已派出");
+  assert.equal(enterKeys(h).length, 0, "校验没过就绝不能按回车");
+});
+
+test("回归：投递成功时照常记台账、挂 watcher", async () => {
+  const h = harness({
+    live: [info("mem", { command: "claude", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+  });
+  const r = await h.tools.spawn({ task: "查一下新闻", session: "mem" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(h.registry.get("mem")?.createdByUs, false);
+  assert.equal(enterKeys(h).length, 1, "校验过了才按回车");
+  h.watchers.stopAll();
+});
+
+test("steer 没投进去时报错，但**不清台账** —— agent 还活着", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })], swallowText: true });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  const r = await h.tools.steer({ session: "pi-a", message: "换个思路" });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /消息未投递成功/);
+  assert.ok(h.registry.get("pi-a") !== undefined, "只是没投进去，agent 还在，台账不能清");
+  h.watchers.stopAll();
+});
+
+test("claude 预设走 send 投递：裸启动，任务不拼进启动命令", async () => {
+  const h = harness();
+  const r = await h.tools.spawn({ task: "查一下新闻", agent: "claude" });
+  assert.equal(r.isError, undefined, r.text);
+
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  const cmdIdx = newCall.indexOf("--cmd");
+  const cmd = newCall[cmdIdx + 1]!;
+  assert.equal(cmd, "claude --dangerously-skip-permissions", "裸启动，不带任务");
+  assert.ok(!cmd.includes("查一下新闻"), "任务绝不能拼进 argv —— 信任对话框会让它永远轮不到执行");
+  assert.equal(deliveries(h).length, 1, "任务通过 send 投进去");
+  h.watchers.stopAll();
+});
+
+test("pi / codex 仍走 argv —— 没有验证过的替代方案就不改它们", async () => {
+  for (const agent of ["pi", "codex"]) {
+    const h = harness();
+    await h.tools.spawn({ task: "查一下新闻", agent });
+    const newCall = h.calls.find((c) => c[0] === "new")!;
+    const cmd = newCall[newCall.indexOf("--cmd") + 1]!;
+    assert.ok(cmd.includes("查一下新闻"), `${agent} 应当把任务拼进 argv`);
+    assert.equal(deliveries(h).length, 0, `${agent} 不该走 send`);
+    h.watchers.stopAll();
+  }
+});
+
+/**
+ * claude 在未信任目录里会先弹信任确认。它是模态的：盖在输入框上层，任务文本会
+ * 送到它后面、回车被它吃掉，而默认选项还可能是"退出" —— session 直接消失。
+ */
+test("撞上启动期对话框时先按预设的键过掉，再投任务", async () => {
+  const h = harness({ startupScreens: ["❯ 1. Yes, I trust this folder\n  2. No, exit"] });
+  const r = await h.tools.spawn({ task: "查一下新闻", agent: "claude" });
+  assert.equal(r.isError, undefined, r.text);
+
+  // 过对话框的那次 Enter 必须发生在任务文本之前
+  const iDialogEnter = h.calls.findIndex((c) => c[0] === "send" && c.includes("--key"));
+  const iText = h.calls.findIndex((c) => c[0] === "send" && c.includes("--text"));
+  assert.ok(iDialogEnter >= 0, "应当送过一次 Enter 去过对话框");
+  assert.ok(iDialogEnter < iText, "过对话框必须在投任务之前，否则任务会打进对话框里");
+  h.watchers.stopAll();
+});
+
+test("对话框过不掉时如实报错，不记台账", async () => {
+  // 屏幕一直停在对话框上 —— 送了键也没过去
+  const h = harness({ stuckOnDialog: true });
+  const r = await h.tools.spawn({ task: "查一下新闻", agent: "claude" });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /任务未投递成功/);
+  assert.match(r.text, /工作目录信任确认/, "要说清卡在哪个界面上");
+  assert.equal(h.registry.size, 0);
+  assert.equal(deliveries(h).length, 0, "没过对话框就绝不能投任务");
 });

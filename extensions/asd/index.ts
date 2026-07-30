@@ -174,6 +174,8 @@ export default function (pi: ExtensionAPI): void {
     mkdirp: async (dir) => {
       await mkdir(dir, { recursive: true });
     },
+    // 生产环境用真的定时器：投递校验要等 TUI 渲染，启动等待要轮询。
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   });
 
   pi.on("session_start", async (_event, ctx) => {

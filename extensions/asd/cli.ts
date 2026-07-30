@@ -81,8 +81,29 @@ export interface Asd {
   cards(): Promise<CardInfo[]>;
   /** session 不存在时返回 null。 */
   peek(name: string, scrollback?: number): Promise<string | null>;
-  /** session 不存在时返回 false。 */
+  /**
+   * 送一段文本**并回车**。session 不存在时返回 false。
+   *
+   * 返回 true 只代表 asd 收下了，**不代表 agent 收到、更不代表它开始干活** ——
+   * 见 `sendText` 上的说明。要确认投递成功必须自己 peek 校验。
+   */
   send(name: string, text: string): Promise<boolean>;
+  /**
+   * 只送文本，不回车。session 不存在时返回 false。
+   *
+   * **返回 true 的语义仅仅是"asd 把字节排进了这个 session 的队列"。** 实测
+   * asd 0.1.9 的 daemon（`crates/asd-daemon/src/conn.rs` 的 `Frame::SendInput`）
+   * 拿到帧之后是 `let _ = handle.tx.send(...)` —— 连排队结果都丢弃 —— 紧接着
+   * 无条件回 `Ack`；真正写 pty 在之后异步发生，失败只 `debug!` 一行。所以
+   * 退出码 0 完全不能证明对方收到了。
+   *
+   * 拆出这个方法是为了在"文本已送、回车未送"那个窗口里做投递校验：回车会把
+   * 输入框清空，一旦按下去，屏幕上有没有这段文本就再也分不出"没送到"和
+   * "送到了并且已提交"。
+   */
+  sendText(name: string, text: string): Promise<boolean>;
+  /** 送一个具名按键（Enter / Escape / Tab / C-c …）。session 不存在时返回 false。 */
+  key(name: string, key: string): Promise<boolean>;
   follow(
     name: string,
     o: { forever?: boolean; timeout: string; signal?: AbortSignal },
@@ -183,7 +204,8 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
     return r;
   }
 
-  return {
+  // 具名绑定：`send` 要复用 `sendText` / `key`，对象字面量里没有可引用的名字。
+  const asd: Asd = {
     async create({ name, cwd, cmd }) {
       const r = await run(["new", name, "--cwd", cwd, "--cmd", cmd]);
       if (r.code !== 0) fail(r, "new");
@@ -231,25 +253,35 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
       return r.stdout;
     },
 
+    async sendText(name, text) {
+      const r = await run(["send", name, "--text", text]);
+      if (r.code === NO_SESSION) return false;
+      if (r.code !== 0) fail(r, "send");
+      return true;
+    },
+
+    async key(name, k) {
+      const r = await run(["send", name, "--key", k]);
+      if (r.code === NO_SESSION) return false;
+      if (r.code !== 0) fail(r, `send（按键 ${k}）`);
+      return true;
+    },
+
     /**
      * 送一段文本并回车。**分两次发**，理由见 `ENTER_DELAY_MS`。
      *
      * 文本那一次失败就直接返回/抛出，不会去按那个 Enter —— 正文没进去的话，
      * 一个孤零零的回车只会在目标 session 里凭空提交一次它当时输入框里的东西。
+     *
+     * **要投递校验就别用这个**，用 `sendText` + 自己 peek + `key("Enter")`：
+     * 回车一旦按下去输入框就被清空，之后再也分不出"没送到"和"送到了已提交"。
      */
     async send(name, text) {
-      const r = await run(["send", name, "--text", text]);
-      if (r.code === NO_SESSION) return false;
-      if (r.code !== 0) fail(r, "send");
-
+      if (!(await asd.sendText(name, text))) return false;
       if (enterDelayMs > 0) await sleep(enterDelayMs);
-
-      const e = await run(["send", name, "--key", "Enter"]);
       // 这个窗口期里 session 没了：正文已经进去了但没提交，如实报告"没送到"，
       // 别谎称成功 —— 调用方会据此清台账、停 watcher。
-      if (e.code === NO_SESSION) return false;
-      if (e.code !== 0) fail(e, "send（回车）");
-      return true;
+      return await asd.key(name, "Enter");
     },
 
     async follow(name, { forever, timeout, signal }) {
@@ -270,4 +302,5 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
       return true;
     },
   };
+  return asd;
 }
