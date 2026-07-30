@@ -120,7 +120,16 @@ boss 明确点名时走，**永远不会自动发生** —— 往用户自己正
   名字先洗一遍（非 `[A-Za-z0-9_-]` 的字符换成 `-`，压缩连续 `-`，截断到 64），
   再和 `asd list` 对一遍，撞上就追加 `-2` / `-3`，直到不撞。
 - **命令**：`asd new <名> --cwd <cwd> --cmd "<env 前缀> <agent 命令>"`。
-  `cwd` 默认 `process.cwd()`。
+- **工作区**：不显式给 `cwd` 时，新 agent 拿到 `<PI_ASD_WORKSPACE>/<session 名>/`，
+  基坐目录默认 `<pi agent 目录>/asd-workspaces`。**绝不用主 agent 的当前目录** ——
+  多个 agent 挤在同一个工作树上会互相踩，git 尤其危险（共用一个 index 和 HEAD，
+  一个 agent `checkout` 会掀掉另一个正在编辑的文件）。
+  目录不存在就先建出来：`asd new --cwd <不存在的目录>` 会直接失败且不创建 session。
+  **显式给的 `cwd` 原样用、且不替他创建** —— 打错的路径应该让 `asd new` 大声失败，
+  而不是悄悄造出一个空目录。
+  相应地，不给 `cwd` 的复用查询**不约束目录**（每个 agent 的目录按自己的 session 名算，
+  强求相等会让复用永远不命中）；这只放宽"挑我们自己的哪个 agent"，
+  `createdByUs === true` 那道闸门不受影响。
 - **agent 预设表**（`agent` 参数选，env `PI_ASD_AGENT` 改默认，默认 `pi`）：
 
   | key | 命令 |
