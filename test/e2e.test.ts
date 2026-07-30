@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createAsd, type Exec } from "../extensions/asd/cli.ts";
@@ -80,9 +80,12 @@ test("e2e：spawn → agents → peek → steer → kill 走一遍真 asd", { ti
     watchers,
     config: {
       defaultAgent: "sh-probe",
-      defaultCwd: root,
+      workspaceBase: root,
       followTimeout: "5s",
       presets: SH_PROBE_PRESETS,
+    },
+    mkdirp: async (dir) => {
+      await mkdir(dir, { recursive: true });
     },
     now: () => Date.now(),
   });

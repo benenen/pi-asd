@@ -32,7 +32,15 @@ export interface ReuseQuery {
   /** 已经过 `candidateName` 处理的完整 session 名；给了就只认这一个。 */
   name?: string;
   agent: string;
-  cwd: string;
+  /**
+   * 要求工作目录精确等于它。**不给就是不约束目录**。
+   *
+   * 不约束是给"没显式指定 cwd 的 spawn"用的：那种 spawn 给每个新 agent 分
+   * `<base>/<session 名>` 这样一个独立目录，两次算出来的目录必然不同，如果还要求
+   * 目录相等，复用就永远不会命中。放宽的只是"挑我们自己的哪个 agent"，
+   * `createdByUs === true` 那道闸门不受影响。
+   */
+  cwd?: string;
 }
 
 export type KillDecision =
@@ -132,13 +140,10 @@ export class Registry {
   pickReusable(q: ReuseQuery, live: ReadonlyMap<string, SessionInfo>): AgentRecord | undefined {
     const fits = (r: AgentRecord): boolean => {
       const info = live.get(r.session);
-      return (
-        info !== undefined &&
-        !info.running &&
-        r.agent === q.agent &&
-        r.cwd === q.cwd &&
-        r.createdByUs === true
-      );
+      if (info === undefined || info.running) return false;
+      if (r.createdByUs !== true) return false;
+      if (r.agent !== q.agent) return false;
+      return q.cwd === undefined || r.cwd === q.cwd;
     };
 
     if (q.name !== undefined) {

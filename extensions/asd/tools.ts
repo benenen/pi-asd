@@ -5,6 +5,7 @@
  * 那两条拒绝路径（必须证明"一次 asd kill 都没发生"）。
  */
 
+import path from "node:path";
 import type { Asd } from "./cli.ts";
 import type { Registry } from "./registry.ts";
 import { formatDuration, type WatcherPool } from "./watcher.ts";
@@ -72,6 +73,16 @@ export function resolveAgentArg(
   return { ok: true, agent: name };
 }
 
+/**
+ * 解析 `PI_ASD_WORKSPACE`：新 agent 的工作区基坐目录。
+ *
+ * 空串按"没设置"处理，理由同 `parseBossDefault`。
+ */
+export function resolveWorkspaceBase(raw: string | undefined, fallback: string): string {
+  const v = (raw ?? "").trim();
+  return v.length > 0 ? v : fallback;
+}
+
 export interface BossDefault {
   enabled: boolean;
   /** 设了值但认不出来时带出原值，供调用方提醒 —— 静默忽略配置是个坑。 */
@@ -135,7 +146,12 @@ export function buildSpawnCommand(o: {
 
 export interface ToolConfig {
   defaultAgent: string;
-  defaultCwd: string;
+  /**
+   * 新 agent 的工作区基坐目录。不显式给 `cwd` 的 spawn 会拿到
+   * `<workspaceBase>/<session 名>` —— 每个 agent 一个独立目录，免得多个 agent
+   * 挤在同一个工作树上互相踩（尤其 git：共用一个 index 和 HEAD）。
+   */
+  workspaceBase: string;
   followTimeout: string;
   /** boss 自己的 session 文件，spawn pi 子 agent 时传下去。 */
   parentSession?: string;
@@ -161,6 +177,8 @@ export interface ToolDeps {
   registry: Registry;
   watchers: WatcherPool;
   config: ToolConfig;
+  /** 建目录（含父目录）。`asd new --cwd` 对不存在的目录会直接失败。 */
+  mkdirp: (dir: string) => Promise<void>;
   now: () => number;
 }
 
@@ -200,7 +218,7 @@ function preview(task: string): string {
 }
 
 export function createTools(deps: ToolDeps): Tools {
-  const { asd, registry, watchers, config, now } = deps;
+  const { asd, registry, watchers, config, mkdirp, now } = deps;
   const presets = config.presets ?? PRESETS;
 
   /**
@@ -329,7 +347,9 @@ export function createTools(deps: ToolDeps): Tools {
       if (!presets[agent]) {
         return err(`不认识的 agent "${agent}"。可选：${Object.keys(presets).join(" / ")}`);
       }
-      const cwd = p.cwd ?? config.defaultCwd;
+      const explicitCwd = typeof p.cwd === "string" && p.cwd.trim().length > 0
+        ? p.cwd
+        : undefined;
       const wantWatch = p.watch !== false;
 
       const live = await asd.list();
@@ -364,7 +384,7 @@ export function createTools(deps: ToolDeps): Tools {
             {
               name: p.name === undefined ? undefined : registry.candidateName(p.name),
               agent,
-              cwd,
+              cwd: explicitCwd,
             },
             available,
           );
@@ -375,9 +395,9 @@ export function createTools(deps: ToolDeps): Tools {
               const watching = rewatch(target.session, wantWatch);
               return {
                 text:
-                  `复用空闲 agent "${target.session}"（${agent}，${cwd}），任务已送入。` +
+                  `复用空闲 agent "${target.session}"（${agent}，${target.cwd}），任务已送入。` +
                   (watching ? "watcher 已重挂，它停下来时结果会自动推给你。" : ""),
-                details: { session: target.session, agent, cwd, reused: true, watching },
+                details: { session: target.session, agent, cwd: target.cwd, reused: true, watching },
               };
             }
             // send 说 session 没了 —— 清掉它、放行预留，继续往下走新建。
@@ -392,6 +412,10 @@ export function createTools(deps: ToolDeps): Tools {
         const taken = new Set([...liveMap.keys(), ...reserved]);
         const name = registry.allocateName(p.name, taken);
         hold(name);
+        // 没显式给 cwd 就给它一个自己的工作区。asd new 对不存在的目录直接失败，
+        // 所以必须先建出来。显式给的路径不替他建 —— 打错了应当大声失败。
+        const cwd = explicitCwd ?? path.join(config.workspaceBase, name);
+        if (explicitCwd === undefined) await mkdirp(cwd);
         const cmd = buildSpawnCommand({
           agent,
           task: p.task,

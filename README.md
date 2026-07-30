@@ -98,6 +98,26 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 | `PI_ASD_AGENT` | `pi` | 默认 agent（`pi` / `claude` / `codex`） |
 | `PI_ASD_FOLLOW_TIMEOUT` | `30m` | watcher 等待上限 |
 | `PI_ASD_BOSS` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
+| `PI_ASD_WORKSPACE` | `~/.pi/agent/asd-workspaces` | 新 agent 的工作区基坐目录 |
+
+### agent 在哪里开工
+
+不显式给 `cwd` 的话，每个新 agent 拿到 **`<PI_ASD_WORKSPACE>/<session 名>/`** 这样一个
+自己的目录（不存在会自动建）。默认基坐目录是 `~/.pi/agent/asd-workspaces`。
+
+**它不会在主 agent 的当前目录里开工。** 多个 agent 挤在同一个工作树上会互相踩，git 尤其
+危险——共用一个 index 和 HEAD，一个 agent `checkout` 会掀掉另一个正在编辑的文件。
+
+要让 agent 在某个具体仓库里干活，就显式传 `cwd`：
+
+```
+asd_spawn(task: "修 auth 的 bug", cwd: "/path/to/repo")
+```
+
+显式给的路径**不会**被自动创建——打错了会让 `asd new` 直接失败，而不是悄悄造出一个空目录。
+
+新 agent 拿到的是空目录，所以要它干仓库里的活，得在 `task` 里写清楚从哪 clone，或者直接
+用 `cwd` 指过去。
 
 ## 生命周期
 

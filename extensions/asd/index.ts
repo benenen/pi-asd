@@ -5,7 +5,9 @@
  * 注入的 notify，再把 tools.ts 的七个函数包成 pi 工具。逻辑全在别处，这里只接线。
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createAsd, type Exec } from "./cli.ts";
@@ -17,6 +19,7 @@ import {
   parseBossDefault,
   PRESETS,
   resolveAgentArg,
+  resolveWorkspaceBase,
   type ToolResult,
 } from "./tools.ts";
 import { WatcherPool } from "./watcher.ts";
@@ -102,12 +105,18 @@ export default function (pi: ExtensionAPI): void {
       get defaultAgent() {
         return bossAgent;
       },
-      defaultCwd: process.cwd(),
+      workspaceBase: resolveWorkspaceBase(
+        process.env.PI_ASD_WORKSPACE,
+        path.join(getAgentDir(), "asd-workspaces"),
+      ),
       followTimeout: process.env.PI_ASD_FOLLOW_TIMEOUT ?? DEFAULT_FOLLOW_TIMEOUT,
       bossSession,
       get parentSession() {
         return parentSession;
       },
+    },
+    mkdirp: async (dir) => {
+      await mkdir(dir, { recursive: true });
     },
   });
 

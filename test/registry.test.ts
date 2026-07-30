@@ -182,6 +182,31 @@ test("pickReusable 跳过 createdByUs 为 false 的记录（给了 name 精确�
   );
 });
 
+test("pickReusable 的 cwd 不给就不约束目录，只看 agent", () => {
+  const r = new Registry("pi-");
+  r.add(rec({ session: "pi-a", agent: "pi", cwd: "/w/one" }));
+  r.add(rec({ session: "pi-b", agent: "claude", cwd: "/w/two" }));
+  const live = liveMap(info("pi-a", { idle_ms: 5 }), info("pi-b", { idle_ms: 9 }));
+
+  // 不给 cwd：agent 匹配就行，取最闲的
+  assert.equal(r.pickReusable({ agent: "pi" }, live)?.session, "pi-a");
+  assert.equal(r.pickReusable({ agent: "claude" }, live)?.session, "pi-b");
+  // 给了 cwd：仍然精确匹配
+  assert.equal(r.pickReusable({ agent: "pi", cwd: "/w/one" }, live)?.session, "pi-a");
+  assert.equal(r.pickReusable({ agent: "pi", cwd: "/w/nope" }, live), undefined);
+});
+
+test("pickReusable 不给 cwd 时仍然只认自己建的、仍然跳过 running", () => {
+  const r = new Registry("pi-");
+  r.add(rec({ session: "pi-adopted", agent: "pi", cwd: "/w", createdByUs: false }));
+  r.add(rec({ session: "pi-busy", agent: "pi", cwd: "/w" }));
+  const live = liveMap(
+    info("pi-adopted", { idle_ms: 9000 }),
+    info("pi-busy", { running: true }),
+  );
+  assert.equal(r.pickReusable({ agent: "pi" }, live), undefined);
+});
+
 test("canKill 放行台账里自己新建的", () => {
   const r = new Registry("pi-");
   r.add(rec({ session: "pi-a", createdByUs: true }));

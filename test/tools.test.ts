@@ -10,6 +10,7 @@ import {
   createTools,
   parseBossDefault,
   resolveAgentArg,
+  resolveWorkspaceBase,
   shellEscape,
   type Tools,
 } from "../extensions/asd/tools.ts";
@@ -21,6 +22,8 @@ interface Harness {
   calls: string[][];
   /** asd list 会吐出来的 session。 */
   live: SessionInfo[];
+  /** mkdirp 被调用过的目录，按调用顺序。 */
+  mkdirs: string[];
 }
 
 function info(session: string, o: Partial<SessionInfo> = {}): SessionInfo {
@@ -88,21 +91,25 @@ function harness(
   const asd = createAsd(exec);
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const mkdirs: string[] = [];
   const tools = createTools({
     asd,
     registry,
     watchers,
     config: {
       defaultAgent: "pi",
-      defaultCwd: "/w",
+      workspaceBase: "/base",
       followTimeout: "30m",
       parentSession: "/s.jsonl",
       bossSession: o.bossSession,
     },
+    mkdirp: async (d) => {
+      mkdirs.push(d);
+    },
     now: () => 0,
   });
 
-  return { tools, registry, watchers, calls, live };
+  return { tools, registry, watchers, calls, live, mkdirs };
 }
 
 /** 这次跑过的 asd 子命令名。 */
@@ -163,15 +170,19 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
   const asd = createAsd(exec);
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const mkdirs: string[] = [];
   const tools = createTools({
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m", parentSession: "/s.jsonl" },
+    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m", parentSession: "/s.jsonl" },
+    mkdirp: async (d) => {
+      mkdirs.push(d);
+    },
     now: () => 0,
   });
 
-  return { tools, registry, watchers, calls, live };
+  return { tools, registry, watchers, calls, live, mkdirs };
 }
 
 test("shellEscape 用单引号包住并转义内部单引号", () => {
@@ -293,6 +304,62 @@ test("spawn 的 watch:false 不挂 watcher", async () => {
   await h.tools.spawn({ task: "t", watch: false });
   assert.deepEqual(subcommands(h), ["list", "new"]);
   assert.equal(h.watchers.isWatching("pi-agent1"), false);
+});
+
+test("resolveWorkspaceBase 未设置 / 空串 / 纯空白都回落到默认", () => {
+  assert.equal(resolveWorkspaceBase(undefined, "/fallback"), "/fallback");
+  assert.equal(resolveWorkspaceBase("", "/fallback"), "/fallback");
+  assert.equal(resolveWorkspaceBase("   ", "/fallback"), "/fallback");
+});
+
+test("resolveWorkspaceBase 给了就用给的，去掉首尾空白", () => {
+  assert.equal(resolveWorkspaceBase("/w/agents", "/fallback"), "/w/agents");
+  assert.equal(resolveWorkspaceBase("  /w/agents  ", "/fallback"), "/w/agents");
+});
+
+test("spawn 不给 cwd 时在 <base>/<session 名> 里开工，并且先建目录", async () => {
+  const h = harness();
+  const r = await h.tools.spawn({ task: "t", name: "one", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.deepEqual(h.mkdirs, ["/base/pi-one"]);
+  const newCall = h.calls.find((c) => c[0] === "new");
+  assert.ok(newCall, "应当调用了 asd new");
+  assert.equal(newCall[newCall.indexOf("--cwd") + 1], "/base/pi-one");
+  assert.equal(h.registry.get("pi-one")?.cwd, "/base/pi-one");
+});
+
+test("spawn 给了 cwd 就原样用，而且不替他建目录", async () => {
+  const h = harness();
+  await h.tools.spawn({ task: "t", name: "one", cwd: "/explicit", watch: false });
+  assert.deepEqual(h.mkdirs, [], "显式给的路径打错了应当让 asd new 大声失败，不要悄悄建出来");
+  const newCall = h.calls.find((c) => c[0] === "new");
+  assert.equal(newCall![newCall!.indexOf("--cwd") + 1], "/explicit");
+});
+
+test("两次都不给 cwd 时，第二次能复用第一次的 agent（目录不同也照样复用）", async () => {
+  const h = harness();
+  await h.tools.spawn({ task: "第一个", name: "one", watch: false });
+  // 让它变成 asd 里存在且空闲的
+  h.live.push(info("pi-one", { running: false, idle_ms: 5000 }));
+
+  const second = await h.tools.spawn({ task: "第二个", watch: false });
+  assert.match(second.text, /复用/);
+  assert.equal(h.calls.filter((c) => c[0] === "new").length, 1, "第二次不该再 new");
+  assert.equal(h.registry.get("pi-one")?.task, "第二个");
+});
+
+test("给了 cwd 时复用仍然要求目录精确相等", async () => {
+  const h = harness({ live: [info("pi-one", { running: false, idle_ms: 5000 })] });
+  h.registry.add({
+    session: "pi-one",
+    task: "旧",
+    cwd: "/base/pi-one",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  await h.tools.spawn({ task: "新", cwd: "/somewhere/else", watch: false });
+  assert.ok(h.calls.some((c) => c[0] === "new"), "目录不同就该新建而不是复用");
 });
 
 test("spawn 拒绝空 task 和不认识的 agent，且完全不碰 asd", async () => {
@@ -418,7 +485,8 @@ test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状�
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m" },
+    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m" },
+    mkdirp: async () => {},
     now: () => 0,
   });
 
@@ -841,7 +909,8 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", defaultCwd: "/w", followTimeout: "30m", parentSession: "/s.jsonl" },
+    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m", parentSession: "/s.jsonl" },
+    mkdirp: async () => {},
     now: () => 0,
   });
 
