@@ -25,6 +25,16 @@ export interface AsdConfig {
    * 对应环境变量 `PI_ASD_IDLE_KILL`
    */
   idleKillAfter?: string;
+  /**
+   * 从 pi 自己的环境里透传给子 agent 的变量名。缺省见 index.ts 的
+   * `DEFAULT_ENV_PASSTHROUGH`（代理 + IS_SANDBOX 那一组）。
+   *
+   * 子 agent 是 asd daemon fork 的，继承的是 daemon 的环境，不是 pi 的 —— 所以
+   * 需要的变量必须点名透传。
+   */
+  envPassthrough?: string[];
+  /** 直接指定透传给子 agent 的环境变量（覆盖同名的 envPassthrough 结果）。 */
+  spawnEnv?: Record<string, string>;
 }
 
 export class ConfigError extends Error {
@@ -110,6 +120,36 @@ function readOptionalString(
   return v;
 }
 
+function readStringArray(v: unknown, key: string, problems: string[]): string[] | undefined {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v) || v.some((x) => typeof x !== "string")) {
+    problems.push(`${key} 必须是字符串数组`);
+    return undefined;
+  }
+  return v as string[];
+}
+
+function readStringMap(
+  v: unknown,
+  key: string,
+  problems: string[],
+): Record<string, string> | undefined {
+  if (v === undefined) return undefined;
+  if (v === null || typeof v !== "object" || Array.isArray(v)) {
+    problems.push(`${key} 必须是「名字 → 值」的对象`);
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val !== "string") {
+      problems.push(`${key}.${k} 必须是字符串`);
+      continue;
+    }
+    out[k] = val;
+  }
+  return out;
+}
+
 export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdConfig {
   const merged: Record<string, unknown> = {};
   const problems: string[] = [];
@@ -134,6 +174,8 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
   const prefix = readOptionalString(merged.prefix, "prefix", problems);
   const followTimeout = readOptionalString(merged.followTimeout, "followTimeout", problems);
   const idleKillAfter = readOptionalString(merged.idleKillAfter, "idleKillAfter", problems);
+  const envPassthrough = readStringArray(merged.envPassthrough, "envPassthrough", problems);
+  const spawnEnv = readStringMap(merged.spawnEnv, "spawnEnv", problems);
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -143,6 +185,8 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
     prefix,
     followTimeout,
     idleKillAfter,
+    envPassthrough,
+    spawnEnv,
   };
 }
 

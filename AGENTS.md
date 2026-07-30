@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，158 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，215 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -193,7 +193,28 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 没有可用的 CLI 开关：`--dangerously-skip-permissions` 管的是权限不是信任，唯一能
 跳过信任确认的是 `-p`/非 TTY 的非交互模式，而子 agent 必须活着接受后续 steer。
 
-### 8. watcher 的冷启动止损要真的等时间
+### 8. 子 agent 的环境要点名透传，别指望继承
+
+子 agent 是 asd **daemon** fork 出来的，继承的是 daemon 的环境 —— 那个 daemon 可能
+是几天前从另一个 shell 起来的，跟 pi 的环境毫无关系。
+
+`ToolConfig.spawnEnv` 由 `index.ts` 从自己的 `process.env` 按名单挑好注入
+（`tools.ts` 不读 process.env，这条不变量还在），`withEnv()` 把它拼在启动命令前面。
+
+**两条投递路径都要带**：`buildSpawnCommand`（argv）和裸启动（`deliver: "send"`）。
+裸启动那条绕开了 `buildSpawnCommand`，最容易漏 —— 而走它的正是 claude，也正是最
+需要 `IS_SANDBOX` 的那个。
+
+踩过的坑：以 root 运行时 `claude --dangerously-skip-permissions` 没有 `IS_SANDBOX=1`
+会拒绝启动并**立即退出**，表现为 spawn 出来的 session 一秒消失；缺代理变量则是
+起得来但 API 403。
+
+**验证这类问题时，探针本身的环境是最大的陷阱。** 我第一版 e2e 用
+`{...process.env}` 起 daemon，而我的 shell 里恰好有那些变量 —— 于是"验证通过"
+是假阳性，测的其实是别名版命令。**要验证环境相关的行为，必须显式把环境剥干净**，
+不能靠继承。
+
+### 9. watcher 的冷启动止损要真的等时间
 
 `asd follow` 对一个已经安静了的 session 是**立即返回**的，重挂一次只要几十毫秒。所以
 `EARLY_GRACE_MS`（20 秒宽限期）如果不配上 `EARLY_RETRY_DELAY_MS` 的真实 sleep，10 次重挂

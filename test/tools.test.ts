@@ -14,6 +14,7 @@ import {
   REUSE_MIN_IDLE_MS,
   resolveAgentArg,
   shellEscape,
+  withEnv,
   type Tools,
 } from "../extensions/asd/tools.ts";
 import { resolveWorkspaceBase } from "../extensions/asd/config.ts";
@@ -81,6 +82,8 @@ function harness(
     startupScreens?: string[];
     /** 屏幕永远停在信任对话框上 —— 模拟"送了键也过不去"。 */
     stuckOnDialog?: boolean;
+    /** 透传给子 agent 的环境变量。 */
+    spawnEnv?: Record<string, string>;
   } = {},
 ): Harness {
   const calls: string[][] = [];
@@ -140,6 +143,7 @@ function harness(
       parentSession: "/s.jsonl",
       bossSession: o.bossSession,
       reuseMinIdleMs: o.reuseMinIdleMs ?? 0,
+      spawnEnv: o.spawnEnv,
     },
     mkdirp: async (d) => {
       mkdirs.push(d);
@@ -1395,4 +1399,63 @@ test("对话框过不掉时如实报错，不记台账", async () => {
   assert.match(r.text, /工作目录信任确认/, "要说清卡在哪个界面上");
   assert.equal(h.registry.size, 0);
   assert.equal(deliveries(h).length, 0, "没过对话框就绝不能投任务");
+});
+
+// --- 环境透传 ---
+//
+// 子 agent 是 asd **daemon** fork 出来的，继承的是 daemon 的环境 —— 那个 daemon
+// 可能是几天前从另一个 shell 起来的，跟 pi 的环境毫无关系。
+//
+// 踩到的实例：本机以 root 运行时，`claude --dangerously-skip-permissions` 在没有
+// IS_SANDBOX=1 的情况下直接拒绝启动（"cannot be used with root/sudo privileges"）
+// 并立即退出 —— 表现就是 spawn 出来的 session 一秒就消失。用户交互 shell 里有这个
+// 变量（clp 别名设的），daemon 里没有。
+
+test("withEnv 把变量拼在命令前面，值走 shellEscape", () => {
+  assert.equal(withEnv({ A: "1" }, "claude"), "A='1' claude");
+  assert.equal(withEnv({ A: "1", B: "x y" }, "cmd"), "A='1' B='x y' cmd");
+  assert.equal(withEnv({ P: "http://h:1?a=b&c=d" }, "cmd"), "P='http://h:1?a=b&c=d' cmd");
+  // 带单引号的值不能把命令拼断
+  assert.equal(withEnv({ A: "it's" }, "cmd"), "A='it'\\''s' cmd");
+});
+
+test("withEnv 没有变量时原样返回，空值不拼进去", () => {
+  assert.equal(withEnv(undefined, "claude"), "claude");
+  assert.equal(withEnv({}, "claude"), "claude");
+  // 空串是"没设置"，拼 `X=''` 进去反而会把子进程里本来有的值覆盖成空
+  assert.equal(withEnv({ A: "" }, "claude"), "claude");
+});
+
+test("argv 路径把 spawnEnv 拼进启动命令，且在 PI_SPAWNED 之前", async () => {
+  const h = harness({ spawnEnv: { IS_SANDBOX: "1" } });
+  await h.tools.spawn({ task: "t", agent: "pi" });
+  const cmd = h.calls.find((c) => c[0] === "new")![
+    h.calls.find((c) => c[0] === "new")!.indexOf("--cmd") + 1
+  ]!;
+  assert.match(cmd, /^IS_SANDBOX='1' PI_SPAWNED=1 /, `实际：${cmd}`);
+  h.watchers.stopAll();
+});
+
+/**
+ * 回归：裸启动这条路绕开了 buildSpawnCommand，最容易漏掉 env —— 而 claude 恰恰
+ * 走这条，也恰恰是最需要 IS_SANDBOX 的那个。
+ */
+test("回归：send 投递路径（裸启动）同样带上 spawnEnv", async () => {
+  const h = harness({ spawnEnv: { IS_SANDBOX: "1", HTTPS_PROXY: "http://p:1" } });
+  const r = await h.tools.spawn({ task: "t", agent: "claude" });
+  assert.equal(r.isError, undefined, r.text);
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  const cmd = newCall[newCall.indexOf("--cmd") + 1]!;
+  assert.match(cmd, /IS_SANDBOX='1'/);
+  assert.match(cmd, /HTTPS_PROXY='http:\/\/p:1'/);
+  assert.match(cmd, /claude --dangerously-skip-permissions$/, "env 在前，裸命令在后");
+  h.watchers.stopAll();
+});
+
+test("没配 spawnEnv 时命令不变 —— 不给不相干的项目凭空加前缀", async () => {
+  const h = harness();
+  await h.tools.spawn({ task: "t", agent: "claude" });
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  assert.equal(newCall[newCall.indexOf("--cmd") + 1], "claude --dangerously-skip-permissions");
+  h.watchers.stopAll();
 });

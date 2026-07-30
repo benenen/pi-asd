@@ -73,6 +73,29 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 代表它开始干活。以前拿它当"已送达"，任务丢了也照报「已派出 xxx」，然后你干等一个
 永远不来的结果。
 
+### 子 agent 的环境变量
+
+**子 agent 是 asd daemon fork 出来的，继承的是 daemon 的环境，不是 pi 的。** 那个
+daemon 可能是几天前、从另一个 shell 起来的，你 shell 里的代理设置、`IS_SANDBOX`
+之类它一概没有。
+
+所以 pi-asd 会把一组变量从自己的进程环境里**点名透传**给每个新 agent（拼在启动
+命令前面）。默认这一组：
+
+```
+HTTPS_PROXY  HTTP_PROXY  NO_PROXY  https_proxy  http_proxy  no_proxy
+IS_SANDBOX   DISABLE_AUTOUPDATER
+```
+
+只透传当前进程里**确实有值**的那些，不会凭空造变量。用 `envPassthrough` 换掉这张
+表，或用 `spawnEnv` 直接给值。
+
+> 这一组是踩出来的。以 root 运行时，`claude --dangerously-skip-permissions` 在没有
+> `IS_SANDBOX=1` 的情况下会直接拒绝启动（"cannot be used with root/sudo
+> privileges"）并**立即退出** —— 表现就是 spawn 出来的 session 一秒就消失。缺代理
+> 变量则是起得来但 API 403。这些变量在交互 shell 里通常由别名（如 `clp`）设好，
+> daemon 里没有。
+
 ### 启动期的模态 UI
 
 **claude 在没被信任过的目录里会先弹工作目录信任确认**，而每个新 session 拿到的
@@ -155,7 +178,11 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
   // follow 超时（对应 PI_ASD_FOLLOW_TIMEOUT）
   "followTimeout": "30m",
   // 空闲多久之后自动回收 agent，"off" 关掉（对应 PI_ASD_IDLE_KILL）
-  "idleKillAfter": "2m"
+  "idleKillAfter": "2m",
+  // 从 pi 自己的环境里透传给子 agent 的变量名（不写就用内置那一组）
+  "envPassthrough": ["HTTPS_PROXY", "NO_PROXY", "IS_SANDBOX"],
+  // 直接指定透传的值，覆盖 envPassthrough 里的同名项
+  "spawnEnv": { "IS_SANDBOX": "1" }
 }
 ```
 
@@ -171,6 +198,8 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 | `PI_ASD_BOSS` | `bossMode.autoStart` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
 | `PI_ASD_WORKSPACE` | `workspaceBase` | `~/.pi/agent/asd-workspaces` | 新 agent 的工作区基坐目录 |
 | `PI_ASD_IDLE_KILL` | `idleKillAfter` | `2m` | agent 空闲这么久后自动回收。写法 `30s` / `2m` / `1h`；`off` / `0` 关掉 |
+| （无） | `envPassthrough` | 见上文 | 从 pi 环境透传给子 agent 的变量名 |
+| （无） | `spawnEnv` | （空） | 直接指定透传的值，覆盖 `envPassthrough` 同名项 |
 
 ### agent 在哪里开工
 

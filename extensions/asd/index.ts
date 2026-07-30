@@ -31,6 +31,43 @@ const DEFAULT_FOLLOW_TIMEOUT = "30m";
 /** agent 空闲这么久之后自动回收。`PI_ASD_IDLE_KILL=off` 可以关掉。 */
 const DEFAULT_IDLE_KILL = "2m";
 
+/**
+ * 默认从 pi 自己的环境里透传给子 agent 的变量名。
+ *
+ * 子 agent 是 asd **daemon** fork 出来的，继承的是 daemon 的环境 —— 那个 daemon
+ * 可能是几天前从另一个 shell 起来的，跟 pi 的环境毫无关系。所以子 agent 需要的
+ * 变量必须点名带过去。
+ *
+ * 这一组是踩出来的：本机以 root 运行时，`claude --dangerously-skip-permissions`
+ * 在没有 `IS_SANDBOX=1` 的情况下会直接拒绝启动（"cannot be used with root/sudo
+ * privileges"）并**立即退出** —— 表现就是 spawn 出来的 session 一秒就消失；
+ * 而缺代理变量则是起得来但 API 403。用户交互 shell 里这些都有（`clp` 之类的
+ * 别名设的），daemon 里没有。
+ *
+ * 只透传**当前进程里确实有值**的那些，不会凭空造变量。用 asd.json 的
+ * `envPassthrough` 换掉这张表，或用 `spawnEnv` 直接指定值。
+ */
+const DEFAULT_ENV_PASSTHROUGH = [
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "NO_PROXY",
+  "https_proxy",
+  "http_proxy",
+  "no_proxy",
+  "IS_SANDBOX",
+  "DISABLE_AUTOUPDATER",
+];
+
+/** 按名单从 env 里挑出有值的变量。 */
+function pickEnv(names: string[], env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const n of names) {
+    const v = env[n];
+    if (typeof v === "string" && v.length > 0) out[n] = v;
+  }
+  return out;
+}
+
 function toolResult(r: ToolResult) {
   return {
     content: [{ type: "text" as const, text: r.text }],
@@ -82,6 +119,13 @@ export default function (pi: ExtensionAPI): void {
     process.env.PI_ASD_WORKSPACE ?? staticConfig.workspaceBase,
     path.join(agentDir, "asd-workspaces"),
   );
+
+  // 透传给子 agent 的环境：先按名单从自己的 process.env 里挑，再让配置里显式给的
+  // spawnEnv 覆盖同名项。
+  const spawnEnv = {
+    ...pickEnv(staticConfig.envPassthrough ?? DEFAULT_ENV_PASSTHROUGH, process.env),
+    ...(staticConfig.spawnEnv ?? {}),
+  };
 
   const registry = new Registry(prefix);
 
@@ -170,6 +214,7 @@ export default function (pi: ExtensionAPI): void {
       get parentSession() {
         return parentSession;
       },
+      spawnEnv,
     },
     mkdirp: async (dir) => {
       await mkdir(dir, { recursive: true });

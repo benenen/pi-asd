@@ -227,12 +227,32 @@ export function bossStartMessage(o: { wasOn: boolean; from: string; to: string }
   return `boss mode 已经开着；默认 agent 从 ${o.from} 改成 ${o.to}。`;
 }
 
+/**
+ * 把环境变量前缀拼到命令前面（`asd new --cmd` 是交给 `sh -c` 跑的，所以
+ * `K=V cmd` 这种写法有效）。
+ *
+ * **为什么必须显式带上，而不是指望继承。** 子 agent 是 asd **daemon** fork 出来的，
+ * 继承的是 daemon 的环境 —— 那个 daemon 可能是几天前、从另一个 shell 里起来的，
+ * 跟 pi 自己的环境毫无关系。实测踩到过：本机以 root 运行，`claude` 在没有
+ * `IS_SANDBOX=1` 时会直接拒绝 `--dangerously-skip-permissions`（"cannot be used
+ * with root/sudo privileges"）并**立即退出** —— 表现就是 spawn 出来的 session
+ * 一秒就消失；而缺 `HTTPS_PROXY` 则是起得来但 API 403。两个变量在用户的交互
+ * shell 里有（`clp` 别名设的），在 daemon 里没有。
+ */
+export function withEnv(env: Record<string, string> | undefined, cmd: string): string {
+  const pairs = Object.entries(env ?? {}).filter(([, v]) => v.length > 0);
+  if (pairs.length === 0) return cmd;
+  return `${pairs.map(([k, v]) => `${k}=${shellEscape(v)}`).join(" ")} ${cmd}`;
+}
+
 export function buildSpawnCommand(o: {
   agent: string;
   task: string;
   parentSession?: string;
   /** 预设表；缺省用模块级 `PRESETS`。测试（尤其 e2e）可以传自己的一份，不碰全局状态。 */
   presets?: Record<string, AgentPreset>;
+  /** 透传给子 agent 的环境变量，见 `withEnv`。 */
+  env?: Record<string, string>;
 }): string {
   const presets = o.presets ?? PRESETS;
   const preset = presets[o.agent];
@@ -245,7 +265,7 @@ export function buildSpawnCommand(o: {
     }
   }
   parts.push(preset.command(shellEscape(o.task)));
-  return parts.join(" ");
+  return withEnv(o.env, parts.join(" "));
 }
 
 export interface ToolConfig {
@@ -279,6 +299,14 @@ export interface ToolConfig {
    * 主要给测试用 —— 单测不想为了跨过 15 秒这道门槛去编造巨大的 idle_ms。
    */
   reuseMinIdleMs?: number;
+  /**
+   * 透传给每个新 agent 的环境变量。**由 index.ts 从它自己的 process.env 里挑好
+   * 注入进来** —— `tools.ts` 不读 process.env。
+   *
+   * 必须显式带：子 agent 是 asd daemon fork 的，继承的是 daemon 的环境，不是 pi 的。
+   * 详见 `withEnv`。
+   */
+  spawnEnv?: Record<string, string>;
 }
 
 export interface ToolDeps {
@@ -659,12 +687,14 @@ export function createTools(deps: ToolDeps): Tools {
         const preset = presets[agent]!;
         const viaSend = preset.deliver === "send" && preset.bare !== undefined;
         const cmd = viaSend
-          ? preset.bare!
+          ? // 裸启动这条路也必须带上 env —— 它绕开了 buildSpawnCommand
+            withEnv(config.spawnEnv, preset.bare!)
           : buildSpawnCommand({
               agent,
               task: p.task,
               parentSession: config.parentSession,
               presets,
+              env: config.spawnEnv,
             });
         const session = await asd.create({ name, cwd, cmd });
         if (session !== name) hold(session);
