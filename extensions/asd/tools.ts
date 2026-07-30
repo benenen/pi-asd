@@ -72,6 +72,46 @@ export function resolveAgentArg(
   return { ok: true, agent: name };
 }
 
+export interface BossDefault {
+  enabled: boolean;
+  /** 设了值但认不出来时带出原值，供调用方提醒 —— 静默忽略配置是个坑。 */
+  unrecognized?: string;
+}
+
+const BOSS_TRUE = new Set(["1", "true", "on", "yes"]);
+const BOSS_FALSE = new Set(["0", "false", "off", "no"]);
+
+/**
+ * 解析 `PI_ASD_BOSS`：boss mode 装好之后是否默认开启。
+ *
+ * 注意空串必须当成"没设置"。`env.X ?? default` 只挡 undefined/null，挡不住
+ * `PI_ASD_BOSS=`（.env 里的空行、`docker -e VAR=`、未展开的 shell 变量）——那种
+ * 空值一路穿过去会变成意外开启。
+ */
+export function parseBossDefault(raw: string | undefined): BossDefault {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (v.length === 0) return { enabled: false };
+  if (BOSS_TRUE.has(v)) return { enabled: true };
+  if (BOSS_FALSE.has(v)) return { enabled: false };
+  return { enabled: false, unrecognized: raw ?? "" };
+}
+
+/**
+ * `/asd:boss-start` 执行后的提示。
+ *
+ * 三种情况必须分开说：把"本来就开着"说成"设为 X"会让用户以为操作没生效、或者
+ * 以为改了什么其实没改的东西。
+ */
+export function bossStartMessage(o: { wasOn: boolean; from: string; to: string }): string {
+  if (!o.wasOn) {
+    return `boss mode 已打开，默认 agent ${o.to}。下一轮起会注入拆任务和监控的提示词。`;
+  }
+  if (o.from === o.to) {
+    return `boss mode 已经开着，默认 agent 仍是 ${o.to}。`;
+  }
+  return `boss mode 已经开着；默认 agent 从 ${o.from} 改成 ${o.to}。`;
+}
+
 export function buildSpawnCommand(o: {
   agent: string;
   task: string;

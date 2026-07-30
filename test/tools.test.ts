@@ -5,8 +5,10 @@ import { Registry } from "../extensions/asd/registry.ts";
 import { WatcherPool } from "../extensions/asd/watcher.ts";
 import {
   agentOfCommand,
+  bossStartMessage,
   buildSpawnCommand,
   createTools,
+  parseBossDefault,
   resolveAgentArg,
   shellEscape,
   type Tools,
@@ -879,4 +881,47 @@ test("resolveAgentArg 拒绝不认识的名字并列出可选项", () => {
   assert.match(r.ok === false ? r.message : "", /gemini/);
   assert.match(r.ok === false ? r.message : "", /pi/);
   assert.match(r.ok === false ? r.message : "", /claude/);
+});
+
+test("parseBossDefault 未设置 / 空串 / 纯空白都是关闭", () => {
+  assert.deepEqual(parseBossDefault(undefined), { enabled: false });
+  assert.deepEqual(parseBossDefault(""), { enabled: false });
+  assert.deepEqual(parseBossDefault("   "), { enabled: false });
+});
+
+test("parseBossDefault 认这四个真值，且忽略大小写和首尾空白", () => {
+  for (const v of ["1", "true", "on", "yes", "TRUE", "On", " yes "]) {
+    assert.equal(parseBossDefault(v).enabled, true, `${v} 应当是开启`);
+  }
+});
+
+test("parseBossDefault 认这些假值", () => {
+  for (const v of ["0", "false", "off", "no", "FALSE"]) {
+    assert.deepEqual(parseBossDefault(v), { enabled: false }, `${v} 应当是关闭`);
+  }
+});
+
+test("parseBossDefault 对认不出的值关闭，但把原值带出来供提醒", () => {
+  const r = parseBossDefault("enable");
+  assert.equal(r.enabled, false);
+  assert.equal(r.unrecognized, "enable");
+});
+
+test("bossStartMessage 三种情况分得清", () => {
+  // 原本关着 —— 这是"打开了"
+  const opened = bossStartMessage({ wasOn: false, from: "pi", to: "pi" });
+  assert.match(opened, /已打开/);
+  assert.match(opened, /pi/);
+
+  // 原本就开着、agent 没变 —— 不能说"设为"，那暗示发生了改变
+  const noop = bossStartMessage({ wasOn: true, from: "pi", to: "pi" });
+  assert.match(noop, /已经开着/);
+  assert.match(noop, /仍是 pi/);
+  assert.doesNotMatch(noop, /设为/);
+
+  // 原本就开着、agent 换了 —— 要把前后都说清楚
+  const switched = bossStartMessage({ wasOn: true, from: "claude", to: "pi" });
+  assert.match(switched, /已经开着/);
+  assert.match(switched, /claude/);
+  assert.match(switched, /pi/);
 });

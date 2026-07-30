@@ -30,6 +30,10 @@ agent 一停，watcher 自己读一屏，把结果推给主 agent。
 
 关闭状态下系统提示词一个字都不加。开关是进程内状态，不持久化，重启后回到关闭。
 
+默认关闭。想让它装好就开，设 `PI_ASD_BOSS=1`（值认不出来时会提醒一次并保持关闭，
+不会静默忽略）。开关本身是进程内状态，不持久化——`/asd:boss-stop` 关掉之后，
+下次启动会回到 `PI_ASD_BOSS` 决定的初始值。
+
 `/asd:boss-stop` **不杀任何 agent、也不停 watcher**，只停止注入提示词。已经派出去的
 agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不该让你对在跑的活失去知觉。
 要结束 agent 就显式用 `asd_kill`（且只对本扩展自己建的有效）。
@@ -93,6 +97,7 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 | `PI_ASD_PREFIX` | `pi-` | spawn 出来的 session 名前缀 |
 | `PI_ASD_AGENT` | `pi` | 默认 agent（`pi` / `claude` / `codex`） |
 | `PI_ASD_FOLLOW_TIMEOUT` | `30m` | watcher 等待上限 |
+| `PI_ASD_BOSS` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
 
 ## 生命周期
 

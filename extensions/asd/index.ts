@@ -11,7 +11,14 @@ import { Type } from "typebox";
 import { createAsd, type Exec } from "./cli.ts";
 import { bossModePrompt } from "./prompt.ts";
 import { Registry } from "./registry.ts";
-import { createTools, PRESETS, resolveAgentArg, type ToolResult } from "./tools.ts";
+import {
+  bossStartMessage,
+  createTools,
+  parseBossDefault,
+  PRESETS,
+  resolveAgentArg,
+  type ToolResult,
+} from "./tools.ts";
 import { WatcherPool } from "./watcher.ts";
 
 const DEFAULT_PREFIX = "pi-";
@@ -75,11 +82,12 @@ export default function (pi: ExtensionAPI): void {
   // parentSession 那样随 session_start 变化 —— 一次性读出来注入即可。
   // `tools.ts` 不读 process.env，这是它拿到这个值的唯一路径。
   const bossSession = process.env.ASD_SESSION;
+  const bossDefault = parseBossDefault(process.env.PI_ASD_BOSS);
   /**
-   * boss mode 开关，默认关闭 —— 只有 `/asd:boss-start` 才打开。
-   * 进程内状态，不持久化（和台账一致），重启后回到关闭。
+   * boss mode 开关。默认关闭，`PI_ASD_BOSS=1` 可以让它装好就开。
+   * 进程内状态，不持久化（和台账一致）。
    */
-  let bossMode = false;
+  let bossMode = bossDefault.enabled;
 
   /** 不给参数时回到的基线 agent。 */
   const baselineAgent = process.env.PI_ASD_AGENT ?? DEFAULT_AGENT;
@@ -105,6 +113,13 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
+    if (bossDefault.unrecognized !== undefined && ctx.hasUI) {
+      ctx.ui.notify(
+        `PI_ASD_BOSS 的值 "${bossDefault.unrecognized}" 认不出来，boss mode 保持关闭。` +
+          `可用值：1 / true / on / yes（开），0 / false / off / no（关）。`,
+        "warning",
+      );
+    }
   });
 
   pi.on("before_agent_start", async (event) => ({
@@ -301,14 +316,10 @@ export default function (pi: ExtensionAPI): void {
         return;
       }
       const was = bossMode;
+      const from = bossAgent;
       bossAgent = resolved.agent;
       bossMode = true;
-      ctx.ui.notify(
-        was
-          ? `boss mode 已经开着；默认 agent 设为 ${bossAgent}。`
-          : `boss mode 已打开，默认 agent ${bossAgent}。下一轮起会注入拆任务和监控的提示词。`,
-        "info",
-      );
+      ctx.ui.notify(bossStartMessage({ wasOn: was, from, to: bossAgent }), "info");
     },
   });
 
