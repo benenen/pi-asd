@@ -135,7 +135,39 @@ export function parseFollowOutput(stdout: string): string {
   return out;
 }
 
-export function createAsd(exec: Exec): Asd {
+/**
+ * 敲完文本到按下 Enter 之间等多久（毫秒）。
+ *
+ * **为什么必须分两次发、中间还要等。** `asd send --text X --enter` 会把正文和
+ * CR 拼成**同一个 payload**，被控端一次 read() 就全收到了 —— 实测（429 字节正文）：
+ *
+ *   一次调用：C1 len=430 tail=…,0d cr=YES        ← 正文和 CR 同一个 chunk
+ *   分两次：  C1 len=429 cr=no ；C2 len=1 cr=YES ← CR 是独立按键
+ *
+ * asd 自己的 `--enter` 帮助文本把这个语义写明了：让 session"see one keypress
+ * rather than a line break and then Enter"。对 shell 是对的；但 agent 的 TUI
+ * 输入框普遍按"一大坨字节一次到达"判定粘贴，于是那个尾部 CR 被当成粘贴内容里
+ * 的换行插进输入框，**不触发提交**。症状就是"内容发过去了，但没有回车成功"，
+ * 而且文本越长越容易命中 —— 这也是它表现为"有时候"的原因。
+ *
+ * 分两次发让 CR 成为一个独立的 1 字节 chunk，怎么看都是一次货真价实的按键。
+ */
+export const ENTER_DELAY_MS = 300;
+
+export interface AsdOptions {
+  /** 见 `ENTER_DELAY_MS`。传 0 表示不等（测试用）。 */
+  enterDelayMs?: number;
+  /** 等待实现；缺省真的 setTimeout。测试注入以免真的睡。 */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
+  const enterDelayMs = options.enterDelayMs ?? ENTER_DELAY_MS;
+  const sleep = options.sleep ?? realSleep;
+
   async function run(
     args: string[],
     opts?: { signal?: AbortSignal },
@@ -199,10 +231,24 @@ export function createAsd(exec: Exec): Asd {
       return r.stdout;
     },
 
+    /**
+     * 送一段文本并回车。**分两次发**，理由见 `ENTER_DELAY_MS`。
+     *
+     * 文本那一次失败就直接返回/抛出，不会去按那个 Enter —— 正文没进去的话，
+     * 一个孤零零的回车只会在目标 session 里凭空提交一次它当时输入框里的东西。
+     */
     async send(name, text) {
-      const r = await run(["send", name, "--text", text, "--enter"]);
+      const r = await run(["send", name, "--text", text]);
       if (r.code === NO_SESSION) return false;
       if (r.code !== 0) fail(r, "send");
+
+      if (enterDelayMs > 0) await sleep(enterDelayMs);
+
+      const e = await run(["send", name, "--key", "Enter"]);
+      // 这个窗口期里 session 没了：正文已经进去了但没提交，如实报告"没送到"，
+      // 别谎称成功 —— 调用方会据此清台账、停 watcher。
+      if (e.code === NO_SESSION) return false;
+      if (e.code !== 0) fail(e, "send（回车）");
       return true;
     },
 

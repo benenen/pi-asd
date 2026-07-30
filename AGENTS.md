@@ -135,7 +135,28 @@ pi 的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn
 两条都不可能完备（asd 只看得到终端字节，静默跑大编译的 agent 可以安静几分钟）。
 真正承重的是 `createdByUs` 那道闸门：最坏情况只会叠进自己的 agent，不会碰用户的。
 
-### 5. watcher 的冷启动止损要真的等时间
+### 5. 送文本必须分两次发：正文一次，Enter 一次
+
+`Asd.send()` 先 `asd send --text <正文>`，等 `ENTER_DELAY_MS`（300ms），再
+`asd send --key Enter`。**不许合成 `--text X --enter` 一次发。**
+
+`--enter` 会把 CR 拼进同一个 payload，被控端一次 `read()` 全收到。实测（429 字节正文）：
+
+```
+一次调用：C1 len=430 tail=…,0d cr=YES        ← 正文和 CR 同一个 chunk
+分两次：  C1 len=429 cr=no ；C2 len=1 cr=YES ← CR 是独立按键
+```
+
+agent 的 TUI 输入框普遍按"一大坨字节一次到达"判定粘贴，那个尾部 CR 于是被当成粘贴
+内容里的换行插进输入框，**不触发提交** —— 症状是"内容发过去了但没有回车成功"，文本
+越长越容易命中，所以表现为"有时候"。asd 的 `--enter` 帮助文本明说了它让 session
+"see one keypress rather than a line break and then Enter"：对 shell 正确，对 TUI 有害。
+
+写测试时注意：**一次逻辑送达现在是两条 `send`**。想断言"恰好送达一次"要用
+`deliveries()`（只数带 `--text` 的那条），拿 `subcommands().filter(c => c === "send")`
+数会翻倍。单测构造 `createAsd` 时传 `{ enterDelayMs: 0 }`，别真睡 300ms。
+
+### 6. watcher 的冷启动止损要真的等时间
 
 `asd follow` 对一个已经安静了的 session 是**立即返回**的，重挂一次只要几十毫秒。所以
 `EARLY_GRACE_MS`（20 秒宽限期）如果不配上 `EARLY_RETRY_DELAY_MS` 的真实 sleep，10 次重挂

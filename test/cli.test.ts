@@ -4,6 +4,7 @@ import {
   AsdError,
   AsdMissingError,
   createAsd,
+  ENTER_DELAY_MS,
   parseFollowOutput,
   type Exec,
   type ExecResult,
@@ -92,15 +93,82 @@ test("peek 遇到退出码 3 返回 null，不抛", async () => {
   assert.equal(await createAsd(exec).peek("pi-a"), null);
 });
 
-test("send 原样送 --text 并追加 --enter", async () => {
-  const { exec, calls } = fakeExec([{}]);
-  assert.equal(await createAsd(exec).send("pi-a", "干活 --now"), true);
-  assert.deepEqual(calls[0].args, ["send", "pi-a", "--text", "干活 --now", "--enter"]);
+/**
+ * 回归：send 必须**分两次**发 —— 正文一次，`--key Enter` 一次。
+ *
+ * `asd send --text X --enter` 会把正文和 CR 拼成同一个 payload，被控端一次
+ * read() 全收到。agent 的 TUI 输入框普遍按"一大坨字节一次到达"判定粘贴，那个
+ * 尾部 CR 于是被当成粘贴内容里的换行插进输入框，**不提交** —— 症状是"内容发过去
+ * 了但没有回车成功"，文本越长越容易命中。实测字节形状（429 字节正文）：
+ *   一次调用：len=430 结尾 0d      ← 正文和 CR 同一个 chunk
+ *   分两次：  len=429；len=1 是 0d ← CR 是独立按键
+ * 见 cli.ts 的 ENTER_DELAY_MS。
+ */
+test("回归：send 分两次发 —— 正文不带 --enter，回车单独用 --key Enter", async () => {
+  const { exec, calls } = fakeExec([{}, {}]);
+  const asd = createAsd(exec, { enterDelayMs: 0 });
+  assert.equal(await asd.send("pi-a", "干活 --now"), true);
+
+  assert.equal(calls.length, 2, "必须是两次调用");
+  assert.deepEqual(calls[0].args, ["send", "pi-a", "--text", "干活 --now"]);
+  assert.ok(!calls[0].args.includes("--enter"), "正文那次绝不能带 --enter —— 那会把 CR 折进同一个 payload");
+  assert.deepEqual(calls[1].args, ["send", "pi-a", "--key", "Enter"]);
+});
+
+test("send 在正文和回车之间等 enterDelayMs，且等待发生在两次调用之间", async () => {
+  const { exec, calls } = fakeExec([{}, {}]);
+  const slept: number[] = [];
+  const asd = createAsd(exec, {
+    enterDelayMs: 300,
+    sleep: async (ms) => {
+      // 睡的时候正文已经发了、回车还没发 —— 顺序错了就没有意义
+      slept.push(ms);
+      assert.equal(calls.length, 1, "必须是发完正文、发回车之前才等");
+    },
+  });
+  await asd.send("pi-a", "hi");
+  assert.deepEqual(slept, [300]);
+});
+
+test("enterDelayMs 为 0 时完全不调 sleep", async () => {
+  const { exec } = fakeExec([{}, {}]);
+  let slept = false;
+  const asd = createAsd(exec, {
+    enterDelayMs: 0,
+    sleep: async () => {
+      slept = true;
+    },
+  });
+  await asd.send("pi-a", "hi");
+  assert.equal(slept, false);
+});
+
+test("ENTER_DELAY_MS 默认 300ms", () => {
+  assert.equal(ENTER_DELAY_MS, 300);
 });
 
 test("send 遇到退出码 3 返回 false", async () => {
-  const { exec } = fakeExec([{ code: 3 }]);
-  assert.equal(await createAsd(exec).send("pi-a", "hi"), false);
+  const { exec, calls } = fakeExec([{ code: 3 }]);
+  assert.equal(await createAsd(exec, { enterDelayMs: 0 }).send("pi-a", "hi"), false);
+  assert.equal(calls.length, 1, "正文都没送到就不该再去按那个回车");
+});
+
+/**
+ * 正文送到了、按回车时 session 没了。必须如实返回 false：调用方据此清台账、停
+ * watcher。谎称成功会留下一条指向已消失 session 的台账记录。
+ */
+test("回车那一步遇到退出码 3 也返回 false", async () => {
+  const { exec, calls } = fakeExec([{}, { code: 3 }]);
+  assert.equal(await createAsd(exec, { enterDelayMs: 0 }).send("pi-a", "hi"), false);
+  assert.equal(calls.length, 2);
+});
+
+test("回车那一步的非语义错误照常抛出，并且报清是回车这步", async () => {
+  const { exec } = fakeExec([{}, { code: 1, stderr: "boom" }]);
+  await assert.rejects(
+    () => createAsd(exec, { enterDelayMs: 0 }).send("pi-a", "hi"),
+    (e: unknown) => e instanceof AsdError && /回车/.test((e as Error).message),
+  );
 });
 
 /** 一行 `asd follow --json` 事件。 */

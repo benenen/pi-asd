@@ -104,7 +104,8 @@ function harness(
     }
   };
 
-  const asd = createAsd(exec);
+  // enterDelayMs: 0 —— send 现在分两次发（正文、Enter），单测不该真睡 300ms
+  const asd = createAsd(exec, { enterDelayMs: 0 });
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
   const mkdirs: string[] = [];
@@ -129,9 +130,25 @@ function harness(
   return { tools, registry, watchers, calls, live, mkdirs };
 }
 
-/** 这次跑过的 asd 子命令名。 */
+/** 这次跑过的 asd 子命令名。注意一次逻辑送达现在是两条 send（正文 + Enter）。 */
 function subcommands(h: Harness): string[] {
   return h.calls.map((c) => c[0]);
+}
+
+/**
+ * 真正"送达"了几次 —— 只数带 `--text` 的那条 send。
+ *
+ * `send` 现在分两次发（正文一次、`--key Enter` 一次，见 cli.ts 的
+ * ENTER_DELAY_MS），所以再拿 `subcommands().filter(c => c === "send").length`
+ * 当"送达次数"就会翻倍。想表达"恰好送达一次"的断言必须用这个。
+ */
+function deliveries(h: Harness): string[][] {
+  return h.calls.filter((c) => c[0] === "send" && c.includes("--text"));
+}
+
+/** 补发的回车调用。 */
+function enterKeys(h: Harness): string[][] {
+  return h.calls.filter((c) => c[0] === "send" && c.includes("--key"));
 }
 
 /**
@@ -184,7 +201,8 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
     }
   };
 
-  const asd = createAsd(exec);
+  // enterDelayMs: 0 —— send 现在分两次发（正文、Enter），单测不该真睡 300ms
+  const asd = createAsd(exec, { enterDelayMs: 0 });
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
   const mkdirs: string[] = [];
@@ -257,7 +275,8 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
 
   const r = await h.tools.spawn({ task: "新任务" });
   assert.match(r.text, /复用/);
-  assert.deepEqual(subcommands(h), ["list", "send", "follow"]);
+  assert.deepEqual(subcommands(h), ["list", "send", "send", "follow"], "一次送达是两条 send：正文 + Enter");
+  assert.equal(deliveries(h).length, 1);
   assert.equal(h.registry.get("pi-agent1")?.task, "新任务");
   assert.equal(h.watchers.isWatching("pi-agent1"), true);
   h.watchers.stopAll();
@@ -459,7 +478,8 @@ test("steer 送消息并重挂 watcher", async () => {
   });
   const r = await h.tools.steer({ session: "pi-a", message: "换个思路" });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(subcommands(h), ["send", "follow"]);
+  assert.deepEqual(subcommands(h), ["send", "send", "follow"], "一次送达是两条 send：正文 + Enter");
+  assert.equal(deliveries(h).length, 1);
   assert.equal(h.watchers.isWatching("pi-a"), true);
   h.watchers.stopAll();
 });
@@ -501,7 +521,8 @@ test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状�
     }
   };
 
-  const asd = createAsd(exec);
+  // enterDelayMs: 0 —— send 现在分两次发（正文、Enter），单测不该真睡 300ms
+  const asd = createAsd(exec, { enterDelayMs: 0 });
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
   const tools = createTools({
@@ -834,9 +855,9 @@ test("并发指名交给同一个 session：只有一次真正送达，另一次
   assert.equal(rejected.length, 1);
   assert.match(rejected[0].text, /正在被另一次 spawn 处理/);
   assert.equal(
-    subcommands(h).filter((c) => c === "send").length,
+    deliveries(h).length,
     1,
-    "只应该真正 send 一次 —— 不能把两段不相关的任务文本都敲进目标 session",
+    "只应该真正送达一次 —— 不能把两段不相关的任务文本都敲进目标 session",
   );
   h.watchers.stopAll();
 });
@@ -886,7 +907,7 @@ test("并发 spawn 抢同一个空闲 agent：只有一个复用，另一个新�
   ]);
 
   const subs = subcommands(h);
-  assert.equal(subs.filter((c) => c === "send").length, 1, "应该恰好一次复用（send）");
+  assert.equal(deliveries(h).length, 1, "应该恰好一次复用（一次送达）");
   assert.equal(subs.filter((c) => c === "new").length, 1, "应该恰好一次新建（new）");
   const sessions = [r1, r2].map((r) => r.details?.session);
   assert.equal(new Set(sessions).size, 2, "两次 spawn 不能落在同一个 session 上");
@@ -952,7 +973,8 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
     }
   };
 
-  const asd = createAsd(exec);
+  // enterDelayMs: 0 —— send 现在分两次发（正文、Enter），单测不该真睡 300ms
+  const asd = createAsd(exec, { enterDelayMs: 0 });
   const registry = new Registry("pi-");
   const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
   const tools = createTools({
