@@ -10,10 +10,10 @@ import {
   createTools,
   parseBossDefault,
   resolveAgentArg,
-  resolveWorkspaceBase,
   shellEscape,
   type Tools,
 } from "../extensions/asd/tools.ts";
+import { resolveWorkspaceBase } from "../extensions/asd/config.ts";
 
 interface Harness {
   tools: Tools;

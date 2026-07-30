@@ -73,16 +73,6 @@ export function resolveAgentArg(
   return { ok: true, agent: name };
 }
 
-/**
- * 解析 `PI_ASD_WORKSPACE`：新 agent 的工作区基坐目录。
- *
- * 空串按"没设置"处理，理由同 `parseBossDefault`。
- */
-export function resolveWorkspaceBase(raw: string | undefined, fallback: string): string {
-  const v = (raw ?? "").trim();
-  return v.length > 0 ? v : fallback;
-}
-
 export interface BossDefault {
   enabled: boolean;
   /** 设了值但认不出来时带出原值，供调用方提醒 —— 静默忽略配置是个坑。 */

@@ -13,13 +13,13 @@ import { Type } from "typebox";
 import { createAsd, type Exec } from "./cli.ts";
 import { bossModePrompt } from "./prompt.ts";
 import { Registry } from "./registry.ts";
+import { loadConfig, readConfigFile, resolveWorkspaceBase } from "./config.ts";
 import {
   bossStartMessage,
   createTools,
   parseBossDefault,
   PRESETS,
   resolveAgentArg,
-  resolveWorkspaceBase,
   type ToolResult,
 } from "./tools.ts";
 import { WatcherPool } from "./watcher.ts";
@@ -61,10 +61,26 @@ export default function (pi: ExtensionAPI): void {
 
   const exec: Exec = (cmd, args, opts) => pi.exec(cmd, args, opts);
   const asd = createAsd(exec);
-  const registry = new Registry(process.env.PI_ASD_PREFIX ?? DEFAULT_PREFIX);
+  const agentDir = getAgentDir();
+  // 静态配置只从 agent 目录读（cwd 随 session 变，workspaceBase/prefix/followTimeout 不应跟着变）
+  const staticConfig = loadConfig({
+    files: [readConfigFile(path.join(agentDir, "asd.json"))],
+    env: process.env,
+    cwd: process.cwd(),
+    agentDir,
+  });
+
+  const prefix = process.env.PI_ASD_PREFIX ?? staticConfig.prefix ?? DEFAULT_PREFIX;
+  const followTimeout = process.env.PI_ASD_FOLLOW_TIMEOUT ?? staticConfig.followTimeout ?? DEFAULT_FOLLOW_TIMEOUT;
+  const workspaceBase = resolveWorkspaceBase(
+    process.env.PI_ASD_WORKSPACE ?? staticConfig.workspaceBase,
+    path.join(agentDir, "asd-workspaces"),
+  );
+
+  const registry = new Registry(prefix);
   const watchers = new WatcherPool({
     asd,
-    timeout: process.env.PI_ASD_FOLLOW_TIMEOUT ?? DEFAULT_FOLLOW_TIMEOUT,
+    timeout: followTimeout,
     now: () => Date.now(),
     notify: (text) => {
       // pi.sendMessage 的类型签名是 void，实测（dist/core/agent-session.js
@@ -85,15 +101,23 @@ export default function (pi: ExtensionAPI): void {
   // parentSession 那样随 session_start 变化 —— 一次性读出来注入即可。
   // `tools.ts` 不读 process.env，这是它拿到这个值的唯一路径。
   const bossSession = process.env.ASD_SESSION;
+  // boss mode 开关：env PI_ASD_BOSS 优先于配置文件 bossMode.autoStart
   const bossDefault = parseBossDefault(process.env.PI_ASD_BOSS);
   /**
-   * boss mode 开关。默认关闭，`PI_ASD_BOSS=1` 可以让它装好就开。
+   * boss mode 开关。默认关闭，可通过配置文件 `bossMode.autoStart` 或
+   * 环境变量 `PI_ASD_BOSS=1` 让它在 session 启动时自动打开。
    * 进程内状态，不持久化（和台账一致）。
    */
-  let bossMode = bossDefault.enabled;
+  let bossMode: boolean;
+  if (process.env.PI_ASD_BOSS !== undefined) {
+    bossMode = bossDefault.enabled;
+  } else {
+    bossMode = staticConfig.bossMode.autoStart;
+  }
 
-  /** 不给参数时回到的基线 agent。 */
-  const baselineAgent = process.env.PI_ASD_AGENT ?? DEFAULT_AGENT;
+  /** 不给参数时回到的基线 agent。env PI_ASD_AGENT > 配置文件 bossMode.defaultAgent > 内置默认 */
+  const baselineAgent =
+    process.env.PI_ASD_AGENT ?? staticConfig.bossMode.defaultAgent ?? DEFAULT_AGENT;
   /** 这一轮用哪个 agent，由 `/asd:boss-start <agent>` 定。 */
   let bossAgent = baselineAgent;
   const tools = createTools({
@@ -105,11 +129,8 @@ export default function (pi: ExtensionAPI): void {
       get defaultAgent() {
         return bossAgent;
       },
-      workspaceBase: resolveWorkspaceBase(
-        process.env.PI_ASD_WORKSPACE,
-        path.join(getAgentDir(), "asd-workspaces"),
-      ),
-      followTimeout: process.env.PI_ASD_FOLLOW_TIMEOUT ?? DEFAULT_FOLLOW_TIMEOUT,
+      workspaceBase,
+      followTimeout,
       bossSession,
       get parentSession() {
         return parentSession;
@@ -122,6 +143,29 @@ export default function (pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
+
+    // 加载会话级配置：agent 目录 + 项目目录 .pi/asd.json
+    const sessionConfig = loadConfig({
+      files: [
+        readConfigFile(path.join(agentDir, "asd.json")),
+        readConfigFile(path.join(ctx.cwd, ".pi", "asd.json")),
+      ],
+      env: process.env,
+      cwd: ctx.cwd,
+      agentDir,
+    });
+
+    // 项目级配置声明了 bossMode.autoStart 且还没开 → 自动打开
+    if (!bossMode && sessionConfig.bossMode.autoStart) {
+      bossMode = true;
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `boss mode 已自动开启（${ctx.cwd}/.pi/asd.json），默认 agent ${bossAgent}。`,
+          "info",
+        );
+      }
+    }
+
     if (bossDefault.unrecognized !== undefined && ctx.hasUI) {
       ctx.ui.notify(
         `PI_ASD_BOSS 的值 "${bossDefault.unrecognized}" 认不出来，boss mode 保持关闭。` +

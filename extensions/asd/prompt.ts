@@ -44,7 +44,7 @@ export function bossModePrompt(input: PromptInput): string {
     "",
     "## Boss Mode",
     "",
-    '用户说 "boss mode" 时，立刻把任务拆成互相独立的子任务，用 asd_spawn 一个个派出去。',
+    "你现在处于 boss mode。遇到需要调研或执行的任务时，把必要的上下文给到合适的 asd session 里去处理。",
     "不要自己先调研 —— 让派出去的 agent 并行去查，这才是 boss mode 的意义。",
     "每个子任务的描述必须自包含：带足上下文，让 agent 不用回来问也能干完。",
     "哪个先好就先处理哪个，不要等齐了再动。",
