@@ -9,11 +9,12 @@ test("没有活跃 agent 时只给定义段，不给清单段", () => {
   assert.doesNotMatch(p, /当前 agent/);
 });
 
-test("定义段写明不要自己先调研、不要等齐、必须跟到结束", () => {
+test("定义段写明 boss 只分配不执行、通过 candidates 选 session", () => {
   const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
-  assert.match(p, /不要自己先调研|不要先自己调研/);
-  assert.match(p, /不要等齐/);
-  assert.match(p, /不许 spawn 完就|必须跟到/);
+  assert.match(p, /分派任务.*不是自己干/);
+  assert.match(p, /绝不要自己动手/);
+  assert.match(p, /asd_candidates/);
+  assert.match(p, /不读文件.*不跑命令.*不做调研/);
 });
 
 test("有 agent 时列出清单，任务被截断到 80 字", () => {

@@ -75,6 +75,17 @@ export function resolveAgentArg(
 
 export interface BossDefault {
   enabled: boolean;
+  /**
+   * 环境变量是否真的给了值（trim 后非空）。
+   *
+   * 调用方必须用这个、而不是 `env.PI_ASD_BOSS !== undefined` 来判断"用户设了没"：
+   * 后者挡不住 `PI_ASD_BOSS=`，那种空值会把配置文件里的 `bossMode.autoStart`
+   * 无声压掉 —— 正是下面注释里要防的场景。
+   *
+   * 认不出来的值算"设了"：那条路径会强制关闭并弹提醒（"boss mode 保持关闭"），
+   * 让配置文件在背后把它打开会让那句提醒变成谎话。
+   */
+  configured: boolean;
   /** 设了值但认不出来时带出原值，供调用方提醒 —— 静默忽略配置是个坑。 */
   unrecognized?: string;
 }
@@ -91,10 +102,10 @@ const BOSS_FALSE = new Set(["0", "false", "off", "no"]);
  */
 export function parseBossDefault(raw: string | undefined): BossDefault {
   const v = (raw ?? "").trim().toLowerCase();
-  if (v.length === 0) return { enabled: false };
-  if (BOSS_TRUE.has(v)) return { enabled: true };
-  if (BOSS_FALSE.has(v)) return { enabled: false };
-  return { enabled: false, unrecognized: raw ?? "" };
+  if (v.length === 0) return { enabled: false, configured: false };
+  if (BOSS_TRUE.has(v)) return { enabled: true, configured: true };
+  if (BOSS_FALSE.has(v)) return { enabled: false, configured: true };
+  return { enabled: false, configured: true, unrecognized: raw ?? "" };
 }
 
 /**

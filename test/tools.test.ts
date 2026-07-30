@@ -952,21 +952,22 @@ test("resolveAgentArg 拒绝不认识的名字并列出可选项", () => {
   assert.match(r.ok === false ? r.message : "", /claude/);
 });
 
-test("parseBossDefault 未设置 / 空串 / 纯空白都是关闭", () => {
-  assert.deepEqual(parseBossDefault(undefined), { enabled: false });
-  assert.deepEqual(parseBossDefault(""), { enabled: false });
-  assert.deepEqual(parseBossDefault("   "), { enabled: false });
+test("parseBossDefault 未设置 / 空串 / 纯空白都是关闭，且都算「没设置」", () => {
+  assert.deepEqual(parseBossDefault(undefined), { enabled: false, configured: false });
+  assert.deepEqual(parseBossDefault(""), { enabled: false, configured: false });
+  assert.deepEqual(parseBossDefault("   "), { enabled: false, configured: false });
 });
 
 test("parseBossDefault 认这四个真值，且忽略大小写和首尾空白", () => {
   for (const v of ["1", "true", "on", "yes", "TRUE", "On", " yes "]) {
     assert.equal(parseBossDefault(v).enabled, true, `${v} 应当是开启`);
+    assert.equal(parseBossDefault(v).configured, true, `${v} 应当算设置过`);
   }
 });
 
 test("parseBossDefault 认这些假值", () => {
   for (const v of ["0", "false", "off", "no", "FALSE"]) {
-    assert.deepEqual(parseBossDefault(v), { enabled: false }, `${v} 应当是关闭`);
+    assert.deepEqual(parseBossDefault(v), { enabled: false, configured: true }, `${v} 应当是关闭`);
   }
 });
 
@@ -974,6 +975,41 @@ test("parseBossDefault 对认不出的值关闭，但把原值带出来供提醒
   const r = parseBossDefault("enable");
   assert.equal(r.enabled, false);
   assert.equal(r.unrecognized, "enable");
+});
+
+/**
+ * 回归：`PI_ASD_BOSS=`（空串）曾经会把配置文件里的 `bossMode.autoStart` 无声压掉。
+ *
+ * 起因是 index.ts 用 `process.env.PI_ASD_BOSS !== undefined` 判断"用户设了没"，
+ * 而空串是 `""` 不是 `undefined` —— 判断通过，于是走 env 分支拿到 enabled=false，
+ * 配置文件根本没机会生效。`configured` 就是为了让调用方问对这个问题。
+ */
+test("回归：空串不算「设置过」——配置文件的 autoStart 必须还能生效", () => {
+  // 这三个值都来自现实：.env 里的空行、`docker -e PI_ASD_BOSS=`、没展开的 shell 变量
+  for (const raw of ["", "   ", undefined]) {
+    const d = parseBossDefault(raw);
+    assert.equal(d.configured, false, `${JSON.stringify(raw)} 不该算设置过`);
+
+    // 模拟 index.ts 的取值：configured 为假时必须回落到配置文件
+    const fromConfigFile = true;
+    const bossMode = d.configured ? d.enabled : fromConfigFile;
+    assert.equal(bossMode, true, `${JSON.stringify(raw)} 时配置文件的 autoStart 应当生效`);
+  }
+});
+
+test("回归：认不出的值算「设置过」——强制关闭，不让配置文件在背后打开它", () => {
+  // 这条路径会弹"boss mode 保持关闭"的提醒，配置文件若能把它打开，那句提醒就成了谎话
+  const d = parseBossDefault("enable");
+  assert.equal(d.configured, true);
+  const bossMode = d.configured ? d.enabled : true;
+  assert.equal(bossMode, false, "认不出的值必须压过配置文件，保持关闭");
+});
+
+test("显式假值也算「设置过」——env 关掉时配置文件不能把它打开", () => {
+  const d = parseBossDefault("0");
+  assert.equal(d.configured, true);
+  const bossMode = d.configured ? d.enabled : true;
+  assert.equal(bossMode, false, "PI_ASD_BOSS=0 必须压过配置文件的 autoStart");
 });
 
 test("bossStartMessage 三种情况分得清", () => {

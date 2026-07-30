@@ -1,18 +1,24 @@
 import fs from "node:fs";
 import path from "node:path";
 
+/**
+ * asd.json 配置文件的结构。
+ *
+ * 所有字段都可选，不写的走内置默认值。环境变量优先级高于配置文件——
+ * 如果在 env 里设了对应的变量，配置文件的值会被忽略。
+ */
 export interface AsdConfig {
-  /** boss mode 是否在 session_start 时自动打开 */
+  /** boss mode 是否在 session_start 时自动打开。对应环境变量 `PI_ASD_BOSS` */
   bossMode: {
     autoStart: boolean;
-    /** boss mode 默认用哪个 agent（pi / claude / codex） */
+    /** boss mode 默认用哪个 agent。对应环境变量 `PI_ASD_AGENT`（pi / claude / codex） */
     defaultAgent?: string;
   };
-  /** 新 agent 的工作区基坐目录。不显式给 cwd 的 spawn 会拿到 <workspaceBase>/<session 名> */
+  /** 新 agent 的工作区基坐目录。不显式给 cwd 的 spawn 会拿到 <workspaceBase>/<session 名>。对应环境变量 `PI_ASD_WORKSPACE` */
   workspaceBase?: string;
-  /** session 名前缀 */
+  /** session 名前缀。对应环境变量 `PI_ASD_PREFIX` */
   prefix?: string;
-  /** follow 超时，如 "30m" */
+  /** follow 超时，如 "30m"。对应环境变量 `PI_ASD_FOLLOW_TIMEOUT` */
   followTimeout?: string;
 }
 
@@ -131,6 +137,35 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
     prefix,
     followTimeout,
   };
+}
+
+export interface SafeConfig {
+  config: AsdConfig;
+  /** 读配置时发现的问题；一切正常时为空数组。 */
+  problems: string[];
+}
+
+/**
+ * `loadConfig` 的不抛版本：配置坏了就整份退回内置默认，把问题原样带出来。
+ *
+ * 调用方（扩展入口、`session_start`）都不能让 `ConfigError` 逃出去：入口抛 =
+ * 整个 pi-asd 加载失败、用户只看到一坨 stack trace；`session_start` 的 async
+ * handler 里抛 = unhandled rejection，任何一个 `.pi/asd.json` 坏掉的项目目录
+ * 都起不来 session。上面特意区分"文件不存在"和"JSON 有语法错"、特意把
+ * problems 汇总成一句人话，就是为了送到用户眼前 —— 没人接住的话那份力气
+ * 一次都送不出去。
+ *
+ * 退回默认是整份退，不是逐字段挑好的留下：配置文件已经被证明不可信，从里面
+ * 半信半疑地捡值出来只会让最终生效的配置更难猜。
+ */
+export function loadConfigSafely(args: LoadConfigArgs): SafeConfig {
+  try {
+    return { config: loadConfig(args), problems: [] };
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    // 空 files 没有任何可校验的东西，这一次不可能再抛。
+    return { config: loadConfig({ ...args, files: [] }), problems: err.problems };
+  }
 }
 
 export function resolveWorkspaceBase(raw: string | undefined, fallback: string): string {

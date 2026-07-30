@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   readConfigFile,
   loadConfig,
+  loadConfigSafely,
   resolveWorkspaceBase,
   ConfigError,
   type ConfigFile,
@@ -271,6 +272,75 @@ test("loadConfig bossMode 不是对象（比如数字）时，asRecord 变成 {}
     agentDir: "/agent",
   });
   assert.equal(cfg.bossMode.autoStart, false);
+});
+
+// --- loadConfigSafely ---
+//
+// 回归：这两个调用点（扩展入口、session_start 的 async handler）都不能让
+// ConfigError 逃出去。入口抛 = 整个 pi-asd 加载失败；handler 里抛 =
+// unhandled rejection，坏掉的 .pi/asd.json 会让那个项目起不来 session。
+
+test("loadConfigSafely 配置正常时：等价于 loadConfig，problems 为空", () => {
+  const r = loadConfigSafely({
+    files: [{ prefix: "ok-", bossMode: { autoStart: true } }],
+    env: {},
+    cwd: "/cwd",
+    agentDir: "/agent",
+  });
+  assert.deepEqual(r.problems, []);
+  assert.equal(r.config.prefix, "ok-");
+  assert.equal(r.config.bossMode.autoStart, true);
+});
+
+test("回归：JSON 语法错不再抛出 —— 退回默认并带出问题", () => {
+  const broken: ConfigFile = { value: undefined, problem: "asd.json 不是合法的 JSON：Unexpected token" };
+  let r: ReturnType<typeof loadConfigSafely>;
+  assert.doesNotThrow(() => {
+    r = loadConfigSafely({ files: [broken], env: {}, cwd: "/cwd", agentDir: "/agent" });
+  }, "坏配置必须被接住，不能抛到扩展入口 / async handler 外面");
+  assert.equal(r!.problems.length, 1);
+  assert.match(r!.problems[0]!, /不是合法的 JSON/);
+  // 退回内置默认
+  assert.equal(r!.config.bossMode.autoStart, false);
+  assert.equal(r!.config.prefix, undefined);
+});
+
+test("回归：字段类型错不再抛出 —— 退回默认并带出全部问题", () => {
+  const r = loadConfigSafely({
+    files: [{ bossMode: { autoStart: "yes" }, prefix: 123 }],
+    env: {},
+    cwd: "/cwd",
+    agentDir: "/agent",
+  });
+  assert.equal(r.problems.length, 2);
+  assert.ok(r.problems.some((p) => p.includes("autoStart")));
+  assert.ok(r.problems.some((p) => p.includes("prefix")));
+  assert.equal(r.config.bossMode.autoStart, false);
+  assert.equal(r.config.prefix, undefined);
+});
+
+test("loadConfigSafely 退回默认是整份退，不从坏配置里挑好字段留下", () => {
+  // prefix 是合法的，但同一份配置里 autoStart 类型错 —— 整份不可信，prefix 也不留
+  const r = loadConfigSafely({
+    files: [{ prefix: "good-", bossMode: { autoStart: 1 } }],
+    env: {},
+    cwd: "/cwd",
+    agentDir: "/agent",
+  });
+  assert.ok(r.problems.length > 0);
+  assert.equal(r.config.prefix, undefined, "坏配置已被证明不可信，好字段也不该半信半疑地留下");
+});
+
+test("loadConfigSafely 对非 ConfigError 的异常不吞 —— 只兜配置问题，不兜 bug", () => {
+  const exploding = {
+    get value() {
+      throw new TypeError("不是配置问题，是 bug");
+    },
+  };
+  assert.throws(
+    () => loadConfigSafely({ files: [exploding], env: {}, cwd: "/cwd", agentDir: "/agent" }),
+    TypeError,
+  );
 });
 
 // --- ConfigError ---

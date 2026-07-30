@@ -23,6 +23,11 @@ export interface WatcherDeps {
    * `EARLY_RETRY_DELAY_MS` 上面那段注释：这就是 C2 量纲修复的核心。
    */
   earlyRetryDelayMs?: number;
+  /**
+   * session 停下或消失时调用（settle / gone），用于 kill 进程 + 清台账。
+   * timeout 时不调 —— 那个 agent 还在跑，不该杀。
+   */
+  onDone?: (session: string) => void;
 }
 
 /** `252000` → `"4m12s"`。 */
@@ -125,6 +130,7 @@ export class WatcherPool {
       if (outcome.kind === "gone") {
         this.#early.delete(session);
         this.#finish(session, ctrl);
+        this.#deps.onDone?.(session);
         this.#notify(`[pi-asd] agent "${session}" 的 session 已结束。`);
         return;
       }
@@ -177,6 +183,7 @@ export class WatcherPool {
       // 从这次侥幸成功的重挂算起 —— 不然 boss 看到的耗时会比实际短一大截。
       const took = formatDuration(this.#deps.now() - (early?.mountedAt ?? startedAt));
       this.#early.delete(session);
+      this.#deps.onDone?.(session);
       this.#notify(
         `[pi-asd] agent "${session}" 已停下（历时 ${took}）。\n` +
           `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,

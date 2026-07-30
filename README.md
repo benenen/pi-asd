@@ -92,13 +92,49 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 
 ## 配置
 
-| 环境变量 | 默认 | 作用 |
-|---|---|---|
-| `PI_ASD_PREFIX` | `pi-` | spawn 出来的 session 名前缀 |
-| `PI_ASD_AGENT` | `pi` | 默认 agent（`pi` / `claude` / `codex`） |
-| `PI_ASD_FOLLOW_TIMEOUT` | `30m` | watcher 等待上限 |
-| `PI_ASD_BOSS` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
-| `PI_ASD_WORKSPACE` | `~/.pi/agent/asd-workspaces` | 新 agent 的工作区基坐目录 |
+所有配置项都可以通过**环境变量**或 **JSON 配置文件**设置，优先级统一为：
+
+```
+环境变量 > asd.json 配置文件 > 内置默认值
+```
+
+### 配置文件
+
+启动时依次合并两个 asd.json（后面的覆盖前面的）：
+
+1. `~/.pi/agents/<agent-name>/asd.json` —— agent 级通用配置
+2. `<项目根>/.pi/asd.json` —— 项目级覆盖（在 `session_start` 事件里加载）
+
+项目级配置目前仅支持 `bossMode.autoStart`：可以在某个项目里放一个 `.pi/asd.json`
+申明 `"bossMode": { "autoStart": true }`，打开那个项目时自动开启 boss mode。
+
+```jsonc
+{
+  // boss mode 自启动 + 默认 agent（对应 PI_ASD_BOSS / PI_ASD_AGENT）
+  "bossMode": {
+    "autoStart": false,
+    "defaultAgent": "pi"
+  },
+  // 子 agent 工作区基坐目录（对应 PI_ASD_WORKSPACE）
+  "workspaceBase": "/path/to/workspaces",
+  // session 名前缀（对应 PI_ASD_PREFIX）
+  "prefix": "pi-",
+  // follow 超时（对应 PI_ASD_FOLLOW_TIMEOUT）
+  "followTimeout": "30m"
+}
+```
+
+所有字段都可选，不写的字段走默认值。
+
+### 环境变量
+
+| 环境变量 | 配置文件字段 | 默认值 | 作用 |
+|---|---|---|---|
+| `PI_ASD_PREFIX` | `prefix` | `pi-` | spawn 出来的 session 名前缀 |
+| `PI_ASD_AGENT` | `bossMode.defaultAgent` | `pi` | 默认 agent（`pi` / `claude` / `codex`） |
+| `PI_ASD_FOLLOW_TIMEOUT` | `followTimeout` | `30m` | watcher 等待上限 |
+| `PI_ASD_BOSS` | `bossMode.autoStart` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
+| `PI_ASD_WORKSPACE` | `workspaceBase` | `~/.pi/agent/asd-workspaces` | 新 agent 的工作区基坐目录 |
 
 ### agent 在哪里开工
 

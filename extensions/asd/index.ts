@@ -13,7 +13,7 @@ import { Type } from "typebox";
 import { createAsd, type Exec } from "./cli.ts";
 import { bossModePrompt } from "./prompt.ts";
 import { Registry } from "./registry.ts";
-import { loadConfig, readConfigFile, resolveWorkspaceBase } from "./config.ts";
+import { loadConfigSafely, readConfigFile, resolveWorkspaceBase } from "./config.ts";
 import {
   bossStartMessage,
   createTools,
@@ -62,13 +62,16 @@ export default function (pi: ExtensionAPI): void {
   const exec: Exec = (cmd, args, opts) => pi.exec(cmd, args, opts);
   const asd = createAsd(exec);
   const agentDir = getAgentDir();
-  // 静态配置只从 agent 目录读（cwd 随 session 变，workspaceBase/prefix/followTimeout 不应跟着变）
-  const staticConfig = loadConfig({
+
+  // 静态配置只从 agent 目录读（cwd 随 session 变，workspaceBase/prefix/followTimeout 不应跟着变）。
+  // 用 loadConfigSafely：配置坏了不能掀掉整个扩展的加载，问题攒着等有 UI 了再报。
+  const startup = loadConfigSafely({
     files: [readConfigFile(path.join(agentDir, "asd.json"))],
     env: process.env,
     cwd: process.cwd(),
     agentDir,
   });
+  const staticConfig = startup.config;
 
   const prefix = process.env.PI_ASD_PREFIX ?? staticConfig.prefix ?? DEFAULT_PREFIX;
   const followTimeout = process.env.PI_ASD_FOLLOW_TIMEOUT ?? staticConfig.followTimeout ?? DEFAULT_FOLLOW_TIMEOUT;
@@ -94,6 +97,14 @@ export default function (pi: ExtensionAPI): void {
         { deliverAs: "followUp", triggerTurn: true },
       );
     },
+    onDone: (session) => {
+      const ours = registry.get(session)?.createdByUs === true;
+      registry.remove(session);
+      // 只有自己 spawn 出来的才 kill —— 收养/用户手建的 session 不能碰
+      if (ours) {
+        asd.kill(session).catch(() => {});
+      }
+    },
   });
 
   let parentSession: string | undefined;
@@ -108,12 +119,9 @@ export default function (pi: ExtensionAPI): void {
    * 环境变量 `PI_ASD_BOSS=1` 让它在 session 启动时自动打开。
    * 进程内状态，不持久化（和台账一致）。
    */
-  let bossMode: boolean;
-  if (process.env.PI_ASD_BOSS !== undefined) {
-    bossMode = bossDefault.enabled;
-  } else {
-    bossMode = staticConfig.bossMode.autoStart;
-  }
+  // configured 而不是 `!== undefined`：`PI_ASD_BOSS=`（.env 空行、docker -e VAR=、
+  // 没展开的 shell 变量）必须当"没设置"，让配置文件的 autoStart 正常生效。
+  let bossMode = bossDefault.configured ? bossDefault.enabled : staticConfig.bossMode.autoStart;
 
   /** 不给参数时回到的基线 agent。env PI_ASD_AGENT > 配置文件 bossMode.defaultAgent > 内置默认 */
   const baselineAgent =
@@ -145,7 +153,7 @@ export default function (pi: ExtensionAPI): void {
     parentSession = ctx.sessionManager.getSessionFile() ?? undefined;
 
     // 加载会话级配置：agent 目录 + 项目目录 .pi/asd.json
-    const sessionConfig = loadConfig({
+    const loaded = loadConfigSafely({
       files: [
         readConfigFile(path.join(agentDir, "asd.json")),
         readConfigFile(path.join(ctx.cwd, ".pi", "asd.json")),
@@ -154,6 +162,17 @@ export default function (pi: ExtensionAPI): void {
       cwd: ctx.cwd,
       agentDir,
     });
+    const sessionConfig = loaded.config;
+
+    // 启动时那份问题也在这儿一起报 —— 它来自同一个 agent asd.json，去重后正好
+    // 是"这台机器上所有坏掉的配置"。配置坏了相关设置已经退回默认，得说清楚。
+    const problems = [...new Set([...startup.problems, ...loaded.problems])];
+    if (problems.length > 0 && ctx.hasUI) {
+      ctx.ui.notify(
+        `pi-asd 配置有 ${problems.length} 处问题，相关设置已退回默认：\n- ${problems.join("\n- ")}`,
+        "warning",
+      );
+    }
 
     // 项目级配置声明了 bossMode.autoStart 且还没开 → 自动打开
     if (!bossMode && sessionConfig.bossMode.autoStart) {
