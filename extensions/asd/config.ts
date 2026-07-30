@@ -35,6 +35,21 @@ export interface AsdConfig {
   envPassthrough?: string[];
   /** 直接指定透传给子 agent 的环境变量（覆盖同名的 envPassthrough 结果）。 */
   spawnEnv?: Record<string, string>;
+  /**
+   * agent → 本机别名/包装命令。配了就用它启动，没配才用预设里的原名。
+   *
+   * ```jsonc
+   * { "aliases": { "claude": "clp" } }
+   * ```
+   *
+   * 典型用途：本机有个自带环境变量的包装。比在 `envPassthrough` 里维护变量名单
+   * 更省心 —— 包装改了不用重启 pi，配置是每次加载时读的。
+   *
+   * 实现上会用**交互式 bash** 去跑它（`bash -ic '<别名> …'`），因为 shell 别名
+   * 只有那样才展开，详见 `tools.ts` 的 `bashInteractive`。写脚本名也可以，
+   * 只是那种情况下走 bash 是多余的一层。
+   */
+  aliases?: Record<string, string>;
 }
 
 export class ConfigError extends Error {
@@ -176,6 +191,7 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
   const idleKillAfter = readOptionalString(merged.idleKillAfter, "idleKillAfter", problems);
   const envPassthrough = readStringArray(merged.envPassthrough, "envPassthrough", problems);
   const spawnEnv = readStringMap(merged.spawnEnv, "spawnEnv", problems);
+  const aliases = readStringMap(merged.aliases, "aliases", problems);
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -187,6 +203,7 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
     idleKillAfter,
     envPassthrough,
     spawnEnv,
+    aliases,
   };
 }
 

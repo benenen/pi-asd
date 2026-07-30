@@ -96,6 +96,31 @@ IS_SANDBOX   DISABLE_AUTOUPDATER
 > 变量则是起得来但 API 403。这些变量在交互 shell 里通常由别名（如 `clp`）设好，
 > daemon 里没有。
 
+### 用本机别名启动 agent
+
+如果你本机有个自带环境变量的包装（比如 `alias clp='HTTPS_PROXY=… IS_SANDBOX=1
+claude --dangerously-skip-permissions'`），可以直接让 pi-asd 用它：
+
+```jsonc
+{ "aliases": { "claude": "clp" } }
+```
+
+比在 `envPassthrough` 里维护变量名单省心，而且**包装改了不用重启 pi** —— 配置是
+每次加载时读的，而环境透传是启动时快照的。
+
+pi-asd 会用 `bash -ic '<别名>'` 去跑它。**shell 别名只在交互式 bash 里展开**：
+`/bin/sh` 常是 dash，非交互 bash 既不 source `~/.bashrc` 也不展开别名。实测：
+
+```
+clp              → session 立刻消失（command not found）
+sh -c 'clp'      → session 立刻消失（command not found）
+bash -ic 'clp'   → 起得来，别名带的环境变量也生效
+```
+
+代价是会 source 整个 `~/.bashrc`。好处是 `asd list` 报的前台进程仍是被 exec 的
+真命令（实测就是 `claude --dangerously-skip-permissions`），所以按前台进程认
+agent 的那套判断不受影响。
+
 ### 启动期的模态 UI
 
 **claude 在没被信任过的目录里会先弹工作目录信任确认**，而每个新 session 拿到的
@@ -182,7 +207,9 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
   // 从 pi 自己的环境里透传给子 agent 的变量名（不写就用内置那一组）
   "envPassthrough": ["HTTPS_PROXY", "NO_PROXY", "IS_SANDBOX"],
   // 直接指定透传的值，覆盖 envPassthrough 里的同名项
-  "spawnEnv": { "IS_SANDBOX": "1" }
+  "spawnEnv": { "IS_SANDBOX": "1" },
+  // agent → 本机别名/包装命令。配了就用它启动，没配才用原名
+  "aliases": { "claude": "clp" }
 }
 ```
 
@@ -200,6 +227,7 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 | `PI_ASD_IDLE_KILL` | `idleKillAfter` | `2m` | agent 空闲这么久后自动回收。写法 `30s` / `2m` / `1h`；`off` / `0` 关掉 |
 | （无） | `envPassthrough` | 见上文 | 从 pi 环境透传给子 agent 的变量名 |
 | （无） | `spawnEnv` | （空） | 直接指定透传的值，覆盖 `envPassthrough` 同名项 |
+| （无） | `aliases` | （空） | agent → 本机别名/包装命令，如 `{"claude": "clp"}` |
 
 ### agent 在哪里开工
 

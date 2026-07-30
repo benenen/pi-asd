@@ -21,6 +21,8 @@ import {
   parseBossDefault,
   PRESETS,
   resolveAgentArg,
+  withAlias,
+  type AgentPreset,
   type ToolResult,
 } from "./tools.ts";
 import { WatcherPool } from "./watcher.ts";
@@ -127,6 +129,18 @@ export default function (pi: ExtensionAPI): void {
     ...(staticConfig.spawnEnv ?? {}),
   };
 
+  // agent → 本机别名/包装命令。配了的用别名启动，没配的保持预设原样。
+  // 认不出的 agent 名不静默忽略 —— 配错了字最容易表现成"配置没生效"。
+  const presets: Record<string, AgentPreset> = { ...PRESETS };
+  for (const [name, alias] of Object.entries(staticConfig.aliases ?? {})) {
+    const base = PRESETS[name];
+    if (base === undefined) {
+      startup.problems.push(`aliases.${name}：不认识的 agent，可选：${Object.keys(PRESETS).join(" / ")}`);
+      continue;
+    }
+    presets[name] = withAlias(base, alias);
+  }
+
   const registry = new Registry(prefix);
 
   // pi.sendMessage 的类型签名是 void，实测（dist/core/agent-session.js 的
@@ -215,6 +229,7 @@ export default function (pi: ExtensionAPI): void {
         return parentSession;
       },
       spawnEnv,
+      presets,
     },
     mkdirp: async (dir) => {
       await mkdir(dir, { recursive: true });
@@ -345,7 +360,7 @@ export default function (pi: ExtensionAPI): void {
       name: Type.Optional(Type.String({ description: "session 名（会自动加前缀并避重）" })),
       cwd: Type.Optional(Type.String({ description: "工作目录，默认当前目录" })),
       agent: Type.Optional(
-        StringEnum(Object.keys(PRESETS) as [string, ...string[]], { description: "用哪个 agent" }),
+        StringEnum(Object.keys(presets) as [string, ...string[]], { description: "用哪个 agent" }),
       ),
       watch: Type.Optional(Type.Boolean({ description: "是否挂后台 watcher，默认 true" })),
       reuse: Type.Optional(Type.Boolean({ description: "是否复用空闲 agent，默认 true" })),
@@ -452,13 +467,13 @@ export default function (pi: ExtensionAPI): void {
   pi.registerCommand("asd:boss-start", {
     description: "打开 boss mode（可带 agent 名：pi / claude / codex）",
     getArgumentCompletions: (prefix: string) => {
-      const items = Object.keys(PRESETS)
+      const items = Object.keys(presets)
         .filter((n) => n.startsWith(prefix))
         .map((n) => ({ value: n, label: n }));
       return items.length > 0 ? items : null;
     },
     handler: async (args, ctx) => {
-      const resolved = resolveAgentArg(args ?? "", baselineAgent, PRESETS);
+      const resolved = resolveAgentArg(args ?? "", baselineAgent, presets);
       if (!resolved.ok) {
         // 参数不对就什么都不改 —— 半开状态比不开更糟。
         ctx.ui.notify(resolved.message, "error");

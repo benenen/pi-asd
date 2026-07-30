@@ -268,6 +268,34 @@ export function buildSpawnCommand(o: {
   return withEnv(o.env, parts.join(" "));
 }
 
+/**
+ * 用**交互式** bash 跑一条命令，好让 shell 别名展开。
+ *
+ * 别名只在交互式 bash 里存在：`/bin/sh` 在很多系统上是 dash（本机就是），而
+ * 非交互的 bash 既不 source `~/.bashrc` 也不展开别名。实测（真 pty 里，
+ * daemon 环境已剥干净）：
+ *
+ *   clp                      → session 立刻消失（command not found）
+ *   sh -c 'clp'              → session 立刻消失（command not found）
+ *   bash -ic 'clp'           → 起得来，别名带的环境变量也生效
+ *
+ * 代价：会 source 整个 `~/.bashrc`。好处是 `asd list` 报的前台进程仍是被 exec
+ * 的那个真命令（实测 `bash -ic 'clp'` 报的是 `claude --dangerously-skip-permissions`），
+ * 所以 `agentOfCommand` 照样认得出，收养/候选那套判断不受影响。
+ */
+export function bashInteractive(cmd: string): string {
+  return `bash -ic ${shellEscape(cmd)}`;
+}
+
+/** 把一个预设改成走本机别名/包装命令启动。 */
+export function withAlias(base: AgentPreset, alias: string): AgentPreset {
+  return {
+    ...base,
+    command: (escapedTask) => bashInteractive(`${alias} ${escapedTask}`),
+    bare: bashInteractive(alias),
+  };
+}
+
 export interface ToolConfig {
   defaultAgent: string;
   /**

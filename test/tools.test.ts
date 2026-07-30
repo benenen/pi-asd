@@ -5,16 +5,20 @@ import { Registry } from "../extensions/asd/registry.ts";
 import { WatcherPool } from "../extensions/asd/watcher.ts";
 import {
   agentOfCommand,
+  bashInteractive,
   bossStartMessage,
   buildSpawnCommand,
   createTools,
   looksIdle,
+  PRESETS,
   screenHasText,
   parseBossDefault,
   REUSE_MIN_IDLE_MS,
   resolveAgentArg,
   shellEscape,
+  withAlias,
   withEnv,
+  type AgentPreset,
   type Tools,
 } from "../extensions/asd/tools.ts";
 import { resolveWorkspaceBase } from "../extensions/asd/config.ts";
@@ -84,6 +88,8 @@ function harness(
     stuckOnDialog?: boolean;
     /** 透传给子 agent 的环境变量。 */
     spawnEnv?: Record<string, string>;
+    /** 覆盖预设表（测别名映射用）。 */
+    presets?: Record<string, AgentPreset>;
   } = {},
 ): Harness {
   const calls: string[][] = [];
@@ -144,6 +150,7 @@ function harness(
       bossSession: o.bossSession,
       reuseMinIdleMs: o.reuseMinIdleMs ?? 0,
       spawnEnv: o.spawnEnv,
+      presets: o.presets,
     },
     mkdirp: async (d) => {
       mkdirs.push(d);
@@ -1457,5 +1464,62 @@ test("没配 spawnEnv 时命令不变 —— 不给不相干的项目凭空加�
   await h.tools.spawn({ task: "t", agent: "claude" });
   const newCall = h.calls.find((c) => c[0] === "new")!;
   assert.equal(newCall[newCall.indexOf("--cmd") + 1], "claude --dangerously-skip-permissions");
+  h.watchers.stopAll();
+});
+
+// --- agent → 本机别名 ---
+//
+// shell 别名只在**交互式** bash 里展开：/bin/sh 常是 dash（本机就是），非交互的
+// bash 既不 source ~/.bashrc 也不展开别名。实测（真 pty、daemon 环境已剥干净）：
+//   clp             → session 立刻消失（command not found）
+//   sh -c 'clp'     → session 立刻消失（command not found）
+//   bash -ic 'clp'  → 起得来，别名带的环境变量也生效
+// 所以别名必须包一层 `bash -ic`，不能直接当命令用。
+
+test("bashInteractive 包成交互式 bash —— 别名只有这样才展开", () => {
+  assert.equal(bashInteractive("clp"), "bash -ic 'clp'");
+  // 内层带引号也不能把命令拼断
+  assert.equal(bashInteractive("clp 'a b'"), "bash -ic 'clp '\\''a b'\\'''");
+});
+
+test("withAlias 换掉带任务和不带任务两个启动命令", () => {
+  const aliased = withAlias(PRESETS.claude!, "clp");
+  assert.equal(aliased.bare, "bash -ic 'clp'");
+  assert.match(aliased.command("'干活'"), /^bash -ic 'clp /);
+  // 其余字段原样保留 —— 尤其 deliver 和启动期对话框
+  assert.equal(aliased.deliver, PRESETS.claude!.deliver);
+  assert.deepEqual(aliased.startupDialogs, PRESETS.claude!.startupDialogs);
+});
+
+test("配了别名的 agent 用别名启动（裸启动路径）", async () => {
+  const presets = { ...PRESETS, claude: withAlias(PRESETS.claude!, "clp") };
+  const h = harness({ presets });
+  const r = await h.tools.spawn({ task: "查一下新闻", agent: "claude" });
+  assert.equal(r.isError, undefined, r.text);
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  assert.equal(newCall[newCall.indexOf("--cmd") + 1], "bash -ic 'clp'");
+  h.watchers.stopAll();
+});
+
+test("配了别名的 agent 用别名启动（argv 路径），任务仍然拼在后面", async () => {
+  const presets = { ...PRESETS, pi: withAlias(PRESETS.pi!, "mypi") };
+  const h = harness({ presets });
+  await h.tools.spawn({ task: "查一下新闻", agent: "pi" });
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  const cmd = newCall[newCall.indexOf("--cmd") + 1]!;
+  // 夹具里 parentSession 有值，所以 PI_PARENT_SESSION 也在
+  assert.match(cmd, /^PI_SPAWNED=1 PI_PARENT_SESSION='\/s\.jsonl' bash -ic 'mypi /, `实际：${cmd}`);
+  assert.match(cmd, /查一下新闻/);
+  h.watchers.stopAll();
+});
+
+test("没配别名的 agent 保持原样 —— 不给别人的机器凭空加 bash -ic", async () => {
+  const presets = { ...PRESETS, claude: withAlias(PRESETS.claude!, "clp") };
+  const h = harness({ presets });
+  await h.tools.spawn({ task: "t", agent: "codex" });
+  const newCall = h.calls.find((c) => c[0] === "new")!;
+  const cmd = newCall[newCall.indexOf("--cmd") + 1]!;
+  assert.match(cmd, /^codex /, `实际：${cmd}`);
+  assert.doesNotMatch(cmd, /bash -ic/);
   h.watchers.stopAll();
 });
