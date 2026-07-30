@@ -240,16 +240,16 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
   h.watchers.stopAll();
 });
 
-// C1 回归：收养过的用户 session 记进台账时 createdByUs 是 false —— 一次
+// C1 回归：指名交过任务的用户 session 记进台账时 createdByUs 是 false —— 一次
 // **没有点名**任何 session 的普通 asd_spawn 绝不能把它当成自己人自动复用。
-// 复现的是审查报告里那个场景：boss 先指名收养了 "mem"，之后再随手 spawn 一个
+// 复现的是审查报告里那个场景：boss 先指名把任务交给了 "mem"，之后再随手 spawn 一个
 // 没点名的任务，如果 pickReusable 只看 agent/cwd/running，"mem" 会被当成
 // 空闲的自己人，任务被 send 进用户正在用的终端。
-test("spawn 不会把收养来的用户 session 自动复用 —— 即使 agent/cwd 都匹配、且空闲", async () => {
+test("spawn 不会把指名交过任务的用户 session 自动复用 —— 即使 agent/cwd 都匹配、且空闲", async () => {
   const h = harness({ live: [info("mem", { running: false, command: "claude", idle_ms: 999_999 })] });
   h.registry.add({
     session: "mem",
-    task: "上一轮收养的任务",
+    task: "上一轮交给它的任务",
     cwd: "/w",
     agent: "pi",
     createdAt: 0,
@@ -260,10 +260,10 @@ test("spawn 不会把收养来的用户 session 自动复用 —— 即使 agent
   assert.equal(r.isError, undefined, r.text);
   assert.ok(
     subcommands(h).includes("new"),
-    "台账里唯一匹配的候选是收养来的，必须走新建，不能走 send",
+    "台账里唯一匹配的候选是指名交过任务的，必须走新建，不能走 send",
   );
-  assert.ok(!subcommands(h).includes("send"), "绝不能把任务 send 进收养来的用户 session");
-  assert.equal(h.registry.get("mem")?.task, "上一轮收养的任务", "收养记录的任务不该被这次 spawn 覆盖");
+  assert.ok(!subcommands(h).includes("send"), "绝不能把任务 send 进指名交过任务的用户 session");
+  assert.equal(h.registry.get("mem")?.task, "上一轮交给它的任务", "指名交过任务的记录的任务不该被这次 spawn 覆盖");
   h.watchers.stopAll();
 });
 
@@ -660,12 +660,12 @@ test("candidates 标出哪些不是本 boss 建的", async () => {
   assert.match(foreign.text, /不能 kill/);
 });
 
-test("candidates 里已经收养过的 session（在台账里但 createdByUs=false）仍然标不能 kill", async () => {
+test("candidates 里已经指名交过任务的 session（在台账里但 createdByUs=false）仍然标不能 kill", async () => {
   const h = harness({
     live: [info("mem", { running: false, command: "claude" })],
     cards: [card("mem", "/w/mem")],
   });
-  // 模拟"已经被收养过一次"：在台账里，但不是我们建的。
+  // 模拟"已经被指名交过一次任务"：在台账里，但不是我们建的。
   h.registry.add({
     session: "mem",
     task: "上一轮的任务",
@@ -684,7 +684,7 @@ test("candidates 一个都没有时明确说明", async () => {
   assert.match(r.text, /没有/);
 });
 
-test("spawn 指名收养：送任务、以 createdByUs=false 记账、挂 watcher", async () => {
+test("spawn 指名交给：送任务、以 createdByUs=false 记账、挂 watcher", async () => {
   const h = harness({
     live: [info("mem", { running: false, command: "claude --dangerously-skip-permissions" })],
     cards: [card("mem", "/w/mem", ["README.md"])],
@@ -692,17 +692,17 @@ test("spawn 指名收养：送任务、以 createdByUs=false 记账、挂 watche
   const r = await h.tools.spawn({ task: "查一下这个", session: "mem" });
   assert.equal(r.isError, undefined, r.text);
   assert.ok(subcommands(h).includes("send"));
-  assert.ok(!subcommands(h).includes("new"), "收养不该新建 session");
+  assert.ok(!subcommands(h).includes("new"), "指名交给不该新建 session");
   const rec = h.registry.get("mem");
   assert.equal(rec?.createdByUs, false);
   assert.equal(rec?.agent, "claude");
   assert.equal(rec?.cwd, "/w/mem");
-  assert.match(r.text, /不会结束它|不是 pi-asd 建的/);
+  assert.match(r.text, /关不掉它|不是 pi-asd 自己创建的/);
   assert.equal(h.watchers.isWatching("mem"), true);
   h.watchers.stopAll();
 });
 
-test("spawn 拒绝收养正在干活的 session，且不发送任何东西", async () => {
+test("spawn 拒绝把任务交给正在干活的 session，且不发送任何东西", async () => {
   const h = harness({
     live: [info("busy", { running: true, command: "claude" })],
     cards: [card("busy", "/w")],
@@ -713,7 +713,7 @@ test("spawn 拒绝收养正在干活的 session，且不发送任何东西", asy
   assert.equal(h.registry.size, 0);
 });
 
-test("spawn 拒绝收养裸 shell —— 任务描述会被当命令执行", async () => {
+test("spawn 拒绝把任务交给裸 shell —— 任务描述会被当命令执行", async () => {
   const h = harness({
     live: [info("shell", { running: false, command: "bash" })],
     cards: [card("shell", "/w")],
@@ -725,17 +725,44 @@ test("spawn 拒绝收养裸 shell —— 任务描述会被当命令执行", asy
   assert.equal(h.registry.size, 0);
 });
 
-test("spawn 拒绝收养 asd 里不存在的 session", async () => {
+test("spawn 拒绝把任务交给 asd 里不存在的 session", async () => {
   const h = harness();
   const r = await h.tools.spawn({ task: "t", session: "ghost" });
   assert.equal(r.isError, true);
   assert.ok(!subcommands(h).includes("send"));
+  assert.ok(!subcommands(h).includes("new"), "名字不存在时绝不能顺手新建一个");
+  assert.equal(h.registry.size, 0);
 });
 
-// M5：代码层面兜底，不能收养 boss 自己所在的 session。提示词里也这么说，但
+// 名字不存在时，模型最容易自作主张：改派给一个看起来差不多的 session，或者
+// 拿这个名字新建一个 —— 两种用户都会以为任务进了它点名的那个会话。报错里必须
+// 把"别改派、别新建、去问用户"说死，光说"没找到"挡不住模型自己往下走。
+test("不存在的 session：报错要指明别改派、别新建、去问用户", async () => {
+  const h = harness();
+  const r = await h.tools.spawn({ task: "t", session: "ghost" });
+  assert.match(r.text, /ghost/, "要点出是哪个名字没找到");
+  assert.match(r.text, /别改派给别的/);
+  assert.match(r.text, /别拿这个名字新建/);
+  assert.match(r.text, /asd_candidates/, "要指路到 candidates");
+  assert.match(r.text, /让它来定|告诉用户/, "要把决定权交回用户");
+});
+
+test("正在干活的 session：报错要把决定权交回用户，而不是建议自己另开", async () => {
+  const h = harness({
+    live: [info("busy", { running: true, command: "claude" })],
+    cards: [card("busy", "/w")],
+  });
+  const r = await h.tools.spawn({ task: "t", session: "busy" });
+  assert.match(r.text, /不会打断它/);
+  assert.match(r.text, /告诉用户/);
+  assert.match(r.text, /让它决定/);
+  assert.ok(!subcommands(h).includes("new"), "目标正忙时也不能顺手新建");
+});
+
+// M5：代码层面兜底，不能把任务交给 boss 自己所在的 session。提示词里也这么说，但
 // 那只是"建议"——config.bossSession 是 index.ts 从 $ASD_SESSION 读出来注入
 // 的，tools.ts 自己不读 process.env（保持依赖注入边界）。
-test("spawn 拒绝收养 boss 自己所在的 session，且完全不碰 asd", async () => {
+test("spawn 拒绝把任务交给 boss 自己所在的 session，且完全不碰 asd", async () => {
   const h = harness({
     bossSession: "boss-self",
     live: [info("boss-self", { running: false, command: "claude" })],
@@ -743,12 +770,12 @@ test("spawn 拒绝收养 boss 自己所在的 session，且完全不碰 asd", as
   });
   const r = await h.tools.spawn({ task: "t", session: "boss-self" });
   assert.equal(r.isError, true);
-  assert.match(r.text, /自己|不能收养自己/);
+  assert.match(r.text, /不能把任务交给自己/);
   assert.deepEqual(h.calls, [], "拒绝路径上不该有任何 asd 调用");
   assert.equal(h.registry.size, 0);
 });
 
-test("收养来的 session 永远不能被 kill —— 守卫承重", async () => {
+test("指名交过任务的 session 永远不能被 kill —— 守卫承重", async () => {
   const h = harness({
     live: [info("mem", { running: false, command: "claude" })],
     cards: [card("mem", "/w/mem")],
@@ -764,7 +791,7 @@ test("收养来的 session 永远不能被 kill —— 守卫承重", async () =
   assert.equal(h.registry.size, 1, "被拒绝的记录不该被摘掉");
 });
 
-test("并发指名收养同一个 session：只有一次真正送达，另一次被屏障挡下", async () => {
+test("并发指名交给同一个 session：只有一次真正送达，另一次被屏障挡下", async () => {
   const h = harness({
     live: [info("mem", { running: false, command: "claude --dangerously-skip-permissions" })],
     cards: [card("mem", "/w/mem")],
@@ -780,7 +807,7 @@ test("并发指名收养同一个 session：只有一次真正送达，另一次
   const results = [r1, r2];
   const ok = results.filter((r) => r.isError === undefined);
   const rejected = results.filter((r) => r.isError === true);
-  assert.equal(ok.length, 1, "两次并发收养同一个 session，只能有一次真正成功");
+  assert.equal(ok.length, 1, "两次并发把任务交给同一个 session，只能有一次真正成功");
   assert.equal(rejected.length, 1);
   assert.match(rejected[0].text, /正在被另一次 spawn 处理/);
   assert.equal(
@@ -791,7 +818,7 @@ test("并发指名收养同一个 session：只有一次真正送达，另一次
   h.watchers.stopAll();
 });
 
-test("收养的早退路径（目标正忙）之后，预留会被释放，下一次仍能真正送达", async () => {
+test("指名交给的早退路径（目标正忙）之后，预留会被释放，下一次仍能真正送达", async () => {
   const h = harness({
     live: [info("busy", { running: true, command: "claude" })],
     cards: [card("busy", "/w")],

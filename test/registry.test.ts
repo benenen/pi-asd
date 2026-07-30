@@ -151,23 +151,23 @@ test("pickReusable 给了 name 就只认同名那个", () => {
   assert.equal(r.pickReusable({ name: "pi-zzz", agent: "pi", cwd: "/w" }, live), undefined);
 });
 
-// --- C1 回归：收养过的用户 session 不能掉进自动复用池 ---
+// --- C1 回归：指名交过任务的用户 session 不能掉进自动复用池 ---
 //
-// `adopt()`（tools.ts）把指名收养来的用户 session 记进台账时用的是
+// `adopt()`（tools.ts）把指名指名交过任务的用户 session 记进台账时用的是
 // `createdByUs: false`。硬不变量是"自动复用只在台账内、且必须是我们自己建
-// 的；台账外/收养来的 session 只能指名收养，绝不自动挑中"—— `pickReusable`
-// 如果只看 agent/cwd/running 三件事、不看 `createdByUs`，那么收养一次之后，
+// 的；台账外/指名交过任务的 session 只能指名交给，绝不自动挑中"—— `pickReusable`
+// 如果只看 agent/cwd/running 三件事、不看 `createdByUs`，那么指名交过一次之后，
 // 后续任何一次**没点名**的自动复用都可能把这个用户会话当成自己人送进任务，
 // 无论是走"给了 name"这条支路，还是"没给 name、从所有候选里挑最闲的"这条。
 
 test("pickReusable 跳过 createdByUs 为 false 的记录（没给 name 的最闲挑选支路）", () => {
   const r = new Registry("pi-");
-  r.add(rec({ session: "mem", agent: "claude", cwd: "/w", createdByUs: false, task: "上一轮收养的任务" }));
+  r.add(rec({ session: "mem", agent: "claude", cwd: "/w", createdByUs: false, task: "上一轮交给它的任务" }));
   const live = liveMap(info("mem", { running: false, idle_ms: 999_999 }));
   assert.equal(
     r.pickReusable({ agent: "claude", cwd: "/w" }, live),
     undefined,
-    "收养来的用户 session 即使 agent/cwd 都匹配、又闲得最久，也绝不能被自动复用",
+    "指名交过任务的用户 session 即使 agent/cwd 都匹配、又闲得最久，也绝不能被自动复用",
   );
 });
 
@@ -178,7 +178,7 @@ test("pickReusable 跳过 createdByUs 为 false 的记录（给了 name 精确�
   assert.equal(
     r.pickReusable({ name: "mem", agent: "claude", cwd: "/w" }, live),
     undefined,
-    "点名 name 撞上收养记录时也必须拒绝，不能因为字符串对上了就绕过 createdByUs",
+    "点名 name 撞上指名交过任务的记录时也必须拒绝，不能因为字符串对上了就绕过 createdByUs",
   );
 });
 

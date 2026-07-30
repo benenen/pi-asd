@@ -159,8 +159,8 @@ export interface ToolConfig {
   /**
    * boss 自己所在的 asd session 名（`$ASD_SESSION`）。`tools.ts` 不读
    * `process.env` —— 这是唯一入口，由 `index.ts` 读了环境变量再注入进来。
-   * `adopt()` 靠它挡住"收养 boss 自己"这个连提示词都说了"不要"、但没有代码
-   * 兜底的动作。
+   * `adopt()` 靠它挡住"把任务交给 boss 自己"这个连提示词都说了"不要"、但没有
+   * 代码兜底的动作。
    */
   bossSession?: string;
   /**
@@ -186,8 +186,8 @@ export interface ToolDeps {
 export interface SpawnParams {
   task: string;
   /**
-   * 指名把任务交给这个**已经存在**的 session（可以不是 pi-asd 建的）。
-   * 给了它就走收养路径，不做自动复用、也不新建。
+   * 指名把任务交给这个**已经存在**的 session（可以不是 pi-asd 自己创建的）。
+   * 给了它就走"指名交给"这条路，不做自动复用、也不新建。
    */
   session?: string;
   name?: string;
@@ -257,10 +257,10 @@ export function createTools(deps: ToolDeps): Tools {
   }
 
   /**
-   * 指名收养一个已存在的空闲 session。任何校验不过都不发送任何东西。
+   * 指名把任务交给一个已存在的空闲 session。任何校验不过都不发送任何东西。
    *
    * 屏障必须在第一次 `await` 之前**同步**占住：`reserved.has` 检查和
-   * `reserved.add` 中间不能有任何 await 缝隙，否则两个并发收养同一个 session
+   * `reserved.add` 中间不能有任何 await 缝隙，否则两个并发交给同一个 session
    * 的请求会都通过入口检查（这里以前就是这么错的 —— `reserved.add` 挪到了
    * `await asd.list()`/`await asd.cards()` 之后，两次并发调用都能挤过
    * `reserved.has` 那道同步检查，各自 await 完再各自 `send`，导致同一个
@@ -268,11 +268,11 @@ export function createTools(deps: ToolDeps): Tools {
    * 分支都用同一层 `try/finally` 收尾，不再叠一层嵌套的 try/finally。
    */
   async function adopt(session: string, task: string, wantWatch: boolean): Promise<ToolResult> {
-    // 代码层面兜底：绝不收养 boss 自己所在的 session。提示词里也这么说，但
-    // 那只是"建议"；万一模型没看、看漏了、或者干脆决定赌一把，这里必须硬挡
-    // 住 —— 收养自己会让 boss 把任务描述当输入敲进自己正在跑的终端。
+    // 代码层面兜底：绝不把任务交给 boss 自己所在的 session。提示词里也这么说，
+    // 但那只是"建议"；万一模型没看、看漏了、或者干脆决定赌一把，这里必须硬挡
+    // 住 —— 交给自己会让 boss 把任务描述当输入敲进自己正在跑的终端。
     if (config.bossSession !== undefined && session === config.bossSession) {
-      return err(`"${session}" 是你自己所在的 session，不能收养自己。`);
+      return err(`"${session}" 是你自己所在的 session，不能把任务交给自己。`);
     }
     if (reserved.has(session)) {
       return err(`"${session}" 正在被另一次 spawn 处理，稍后再试。`);
@@ -282,10 +282,19 @@ export function createTools(deps: ToolDeps): Tools {
       const live = await asd.list();
       const info = live.find((s) => s.session === session);
       if (info === undefined) {
-        return err(`asd 里没有叫 "${session}" 的 session。先用 asd_candidates 看看哪些能接活。`);
+        // 这条报错要顺手把"接下来该干什么"说死。模型在这里最容易自作主张：
+        // 要么改派给一个看起来差不多的 session，要么拿这个名字新建一个 ——
+        // 两种做法用户都会以为任务进了它点名的那个会话，而实际上没有。
+        return err(
+          `asd 里没有叫 "${session}" 的 session。别改派给别的，也别拿这个名字新建 —— ` +
+            `先用 asd_candidates 看看有哪些能接活，把名字告诉用户，让它来定。`,
+        );
       }
       if (info.running) {
-        return err(`"${session}" 正在干活，不会打断它。等它闲下来，或者另开一个。`);
+        return err(
+          `"${session}" 正在干活，不会打断它。如果是用户点名要它，把这个情况告诉用户，` +
+            `让它决定是等它闲下来、换一个、还是新建。`,
+        );
       }
       const agent = agentOfCommand(info.command, presets);
       if (agent === undefined) {
@@ -326,7 +335,7 @@ export function createTools(deps: ToolDeps): Tools {
       return {
         text:
           `任务已送给 "${session}"（${agent}，${card.cwd}）。` +
-          (mine ? "" : `这个 session 不是 pi-asd 建的，asd_kill 不会结束它。`) +
+          (mine ? "" : `这个 session 不是 pi-asd 自己创建的，asd_kill 关不掉它。`) +
           (watching ? "watcher 已挂上，它停下来时结果会自动推给你。" : ""),
         details: { session, agent, cwd: card.cwd, adopted: !mine, watching },
       };
@@ -340,7 +349,7 @@ export function createTools(deps: ToolDeps): Tools {
       if (typeof p.task !== "string" || p.task.trim().length === 0) {
         return err("task 不能为空 —— 派给 agent 的任务描述必须自包含。");
       }
-      // 指名收养：走完就返回，不做自动复用、也不新建。
+      // 指名交给已有 session：走完就返回，不做自动复用、也不新建。
       if (p.session !== undefined) {
         return await adopt(p.session, p.task, p.watch !== false);
       }
@@ -499,7 +508,7 @@ export function createTools(deps: ToolDeps): Tools {
           agent,
           idleMs: info.idle_ms,
           // "mine" 是"asd_kill 能不能碰它"的判据，不是"台账里有没有它"——
-          // 收养来的 session 也在台账里，但 createdByUs 是 false，仍然不能 kill。
+          // 指名交过任务的 session 也在台账里，但 createdByUs 是 false，仍然不能 kill。
           mine: registry.get(info.session)?.createdByUs === true,
         });
       }
@@ -517,7 +526,7 @@ export function createTools(deps: ToolDeps): Tools {
 
       const lines = rows.map((r) => {
         const head = `${r.session}（${r.agent}，闲了 ${formatDuration(r.idleMs)}${
-          r.mine ? "" : "，不是本 boss 建的：收养后不能 kill"
+          r.mine ? "" : "，不是自己创建的：交给它之后也不能 kill"
         }）`;
         const parts = [head, `  目录：${r.cwd}`];
         if (r.docs.length > 0) parts.push(`  文档：${r.docs.join(" ")}`);

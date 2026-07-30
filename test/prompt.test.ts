@@ -43,6 +43,25 @@ test("清单里标出 watcher 挂没挂上", () => {
   assert.match(p, /^- pi-b.*watcher 未挂/m);
 });
 
+/**
+ * 提示词以前从没提过 asd_steer，boss 想给在跑的 agent 补一句话时只知道 spawn ——
+ * 那会走复用/指名交给的路径，把补充信息当成一个新任务发过去，语义是错的。
+ * 这条只在有活跃 agent 时才有意义，所以放在清单段。
+ */
+test("有 agent 时告诉 boss 补充信息用 asd_steer，而不是再 spawn 一遍", () => {
+  const p = bossModePrompt({
+    enabled: true,
+    defaultAgent: "pi",
+    agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
+  });
+  assert.match(p, /asd_steer\(session, message\)/);
+  assert.match(p, /不要用 asd_spawn 再发一遍/);
+
+  // 没有活跃 agent 时不该出现 —— 那会儿还没人可 steer
+  const empty = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
+  assert.doesNotMatch(empty, /asd_steer/);
+});
+
 test("有 agent 时明确禁止 sleep 轮询", () => {
   const p = bossModePrompt({
     enabled: true,
@@ -65,7 +84,55 @@ test("定义段告诉 boss 可以先看候选再指名把任务交出去", () =>
   const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
   assert.match(p, /asd_candidates/);
   assert.match(p, /session:/);
-  assert.match(p, /asd_kill 不会结束它/);
+  assert.match(p, /asd_kill 只关得掉.*自己创建的/);
+  assert.match(p, /不是自己创建的，关不掉/);
+});
+
+/**
+ * 派活的三档优先级必须写死在提示词里，而且顺序不能乱：用户点了名就直接发给
+ * 那个名字（用户已经替 boss 决定了），没点名才轮到 boss 自己从 candidates 里
+ * 挑，一个都不对口才允许新建。少了第一档，boss 会在用户明说"让 mem 去查"时
+ * 还去挑一遍甚至另起一个 session。
+ */
+test("定义段写明派活的三档顺序：点名 → 自己挑 → 新建", () => {
+  const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
+  assert.match(p, /严格按这个顺序/);
+
+  const named = p.indexOf("用户点了名");
+  const pick = p.indexOf("没点名");
+  const create = p.indexOf("一个都不对口");
+  assert.ok(named > 0, "第一档：用户点名直接发过去");
+  assert.ok(pick > 0, "第二档：没点名时自己挑");
+  assert.ok(create > 0, "第三档：都不对口才新建");
+  assert.ok(named < pick && pick < create, "三档必须按 点名 → 自己挑 → 新建 的顺序出现");
+
+  // 第一档要说清"那个名字就是 asd session 名"，否则 boss 可能把它当成别的东西
+  assert.match(p, /那个名字就是[\s\S]*asd session 名/);
+  assert.match(p, /不要再挑、也不要新建/);
+});
+
+/**
+ * 第一档最危险的失败模式：用户点的名字根本不存在（打错了、或者那个 session
+ * 已经结束了）。这时 boss 有两种自作主张的走法 —— 改派给一个看起来差不多的，
+ * 或者拿这个名字新建一个 —— 两种用户都会以为任务进了它点名的那个会话，而
+ * 实际上没有。提示词必须要求先确认存在，找不到就停下来问。
+ */
+test("第一档要求先确认 session 存在，找不到就中止并问用户", () => {
+  const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
+  assert.match(p, /先用 asd_candidates 确认它真的在/, "发之前必须先确认存在");
+  assert.match(p, /停下来问用户/, "找不到时必须中止并问用户，不能自己往下走");
+  assert.match(p, /绝不要自己改派/, "不许改派给别的 session");
+  assert.match(p, /绝不要拿这个名字新建/, "不许拿这个名字新建");
+});
+
+test("第二档挑候选的依据里必须有 session 名字 —— 它最能说明用途", () => {
+  const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
+  // asd_candidates 每行开头就是 session 名（见 tools.ts 的 candidates()），
+  // 判断依据里漏掉它，等于让 boss 忽略信号最强的那一项。
+  assert.match(p, /名字（session）/);
+  for (const key of ["cwd", "docs", "title"]) {
+    assert.match(p, new RegExp(`（${key}）`), `判断依据里应当有 ${key}`);
+  }
 });
 
 test("关闭时返回空串，一个字都不加", () => {

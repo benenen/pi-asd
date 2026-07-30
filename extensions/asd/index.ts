@@ -100,7 +100,7 @@ export default function (pi: ExtensionAPI): void {
     onDone: (session) => {
       const ours = registry.get(session)?.createdByUs === true;
       registry.remove(session);
-      // 只有自己 spawn 出来的才 kill —— 收养/用户手建的 session 不能碰
+      // 只有自己创建的才 kill —— 指名交过任务的、用户手建的 session 都不能碰
       if (ours) {
         asd.kill(session).catch(() => {});
       }
@@ -244,11 +244,11 @@ export default function (pi: ExtensionAPI): void {
         );
       }
       if (adopted.length > 0) {
-        // 收养来的是用户自己的 session —— 不建议 kill，pi-asd 自己的
+        // 这些不是自己创建的，是用户的 session —— 不建议 kill，pi-asd 自己的
         // asd_kill 也永远会拒绝它们（createdByUs !== true）。
         parts.push(
-          `${adopted.map((r) => r.session).join(" / ")} 是收养来的用户会话，` +
-            `用 asd attach 接管就好，不建议 kill。`,
+          `${adopted.map((r) => r.session).join(" / ")} 不是 pi-asd 自己创建的，` +
+            `是用户的会话，用 asd attach 接管就好，不建议 kill。`,
         );
       }
       ctx.ui.notify(parts.join(""), "info");

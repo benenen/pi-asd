@@ -45,7 +45,7 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 
 | 工具 | 做什么 |
 |---|---|
-| `asd_spawn` | 派任务。指名收养 → 台账内复用 → 新建，按这个顺序 |
+| `asd_spawn` | 派任务。指名交给 → 台账内复用 → 新建，按这个顺序 |
 | `asd_agents` | 列出本次 spawn 的 agent 和实时 running / idle 状态 |
 | `asd_candidates` | 列出所有空闲、能接活的 session（含不是本扩展建的），供挑选 |
 | `asd_peek` | 读一个 agent 当前的屏幕，不阻塞 |
@@ -55,9 +55,9 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 
 ### 派任务的三条路
 
-1. **指名收养** —— `asd_spawn(task, session: "mem")` 把任务交给一个已经在跑的
+1. **指名交给** —— `asd_spawn(task, session: "mem")` 把任务交给一个已经在跑的
    空闲 session，哪怕它是你自己手建的。这条路只在明确点名时走，**永远不会自动
-   发生**。收养前会校验它确实空闲、且前台跑的是认得出的 agent；如果那是个裸
+   发生**。交之前会校验它确实空闲、且前台跑的是认得出的 agent；如果那是个裸
    shell 就直接拒绝——把任务描述 `send` 进 bash 提示符会被当命令执行。
 2. **台账内复用** —— 没点名时，如果台账里有 agent 和 cwd 都对得上、当前空闲的
    session，就把新任务送进去。`reuse: false` 强制新建。自动复用**不碰台账外的
@@ -72,7 +72,8 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 
 `asd_kill` 在执行前必须同时满足两条：名字在台账里、且该记录是本扩展 `asd new`
 出来的。任何一条不满足就直接报错返回，**不会执行 `asd kill`**。你手建的 session
-碰不到——**包括被收养进台账的那些**：收养记录带 `createdByUs: false`，永远杀不掉。
+碰不到——**包括被指名交过任务、因此进了台账的那些**：那些记录带
+`createdByUs: false`，永远杀不掉。
 
 `asd kill --all` 在这个项目的任何代码路径里都不存在。
 
@@ -169,8 +170,8 @@ asd_spawn(task: "修 auth 的 bug", cwd: "/path/to/repo")
 - **spawn 出来的 session 是 80x24。** `asd new` 没有 `--cols` / `--rows`，没有
   客户端 attach 时就是这个尺寸。agent 的 TUI 跑得起来但很挤，`asd_peek` 默认只
   看得到 24 行，要更多得用 `scrollback` 参数。
-- **只支持预设表里的 agent**（`pi` / `claude` / `codex`），不接受裸命令。收养时也
-  按这张表认前台进程，认不出就拒绝。
+- **只支持预设表里的 agent**（`pi` / `claude` / `codex`），不接受裸命令。指名交给已有
+  session 时也按这张表认前台进程，认不出就拒绝。
 - **`asd_candidates` 只对本地 daemon 有效。** 它依赖 `asd card`，而 card 的工作
   目录是从 session 自己的进程读的，远端 daemon 给不出。
 - **不做远程 spawn。** asd 支持 SSH 远端 daemon，pi-asd 只打本地 `asd`。

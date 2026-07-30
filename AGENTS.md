@@ -78,16 +78,20 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 
 ### 1. `createdByUs` —— 用户手建的 session 碰不得
 
-台账里混着两种记录：pi-asd 自己 `asd new` 出来的（`createdByUs: true`），和指名收养进来的
-用户 session（`createdByUs: false`）。**「在台账里」不等于「是我们的」**，两道闸门都只认
-`createdByUs === true`：
+台账里混着两种记录：pi-asd 自己创建的（`asd new` 出来的，`createdByUs: true`），和被指名
+交过任务、因此也进了台账的用户 session（`createdByUs: false`）。**「在台账里」不等于
+「是自己创建的」**，两道闸门都只认 `createdByUs === true`：
 
 - `Registry.canKill()` —— `asd_kill` 必须先问过它拿到 `ok: true` 才允许执行 `asd kill`
-- `Registry.pickReusable()` —— 自动复用池同样只收自己人。这里漏掉这一条的后果是：收养过
-  一次之后，任何一次**没点名**的 `asd_spawn` 都可能把用户正在用的会话静默塞进下一个任务
+- `Registry.pickReusable()` —— 自动复用池同样只收自己创建的。这里漏掉这一条的后果是：
+  指名交过一次任务之后，任何一次**没点名**的 `asd_spawn` 都可能把用户正在用的会话静默
+  塞进下一个任务
 
 自动复用**永远不碰台账外的 session**；台账外的只能由主 agent 看过 `asd_candidates` 之后
-指名收养。
+指名交给它。
+
+术语：用户可见的文案一律说**「自己创建的」/「不是自己创建的」**（对应 `createdByUs`），
+动作说**「指名交给」**。不要用「收养」——中文里那是收养孩子的意思，和这里的动作对不上。
 
 ### 2. `asd kill --all` 在任何代码路径里都不存在
 
