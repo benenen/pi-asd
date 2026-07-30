@@ -270,8 +270,15 @@ watcher 超时（退出码 4，默认 30 分钟）时通知 boss "watcher 超时
 | `/asd:boss-start [agent]` | 打开 —— 从下一轮开始注入 boss mode 提示词；可带 `pi` / `claude` / `codex` 定这一轮的默认 agent（有参数补全）。**不给参数回到基线 `PI_ASD_AGENT`（默认 `pi`），不沿用上一次**；名字不认识时什么都不改、也不打开 |
 | `/asd:boss-stop` | 关闭 —— 不再注入提示词 |
 
-关闭状态下 `bossModePrompt()` 返回空串，系统提示词一个字都不加。开关是进程内状态，
-不持久化（和台账一致），重启后回到关闭。重复开/关是幂等的，命令会说明当前状态。
+关闭状态下 `bossModePrompt()` 返回空串，系统提示词一个字都不加。
+
+**默认值由 `PI_ASD_BOSS` 决定**（未设置就是关闭）：`1` / `true` / `on` / `yes` 开，
+`0` / `false` / `off` / `no` 关。**空串必须当成没设置** —— `env.X ?? default` 只挡
+undefined/null，挡不住 `PI_ASD_BOSS=`（.env 空行、`docker -e VAR=`、未展开的 shell
+变量），那种空值穿过去会变成意外开启。设了值但认不出来时保持关闭并提醒一次，
+不许静默忽略。
+
+开关是进程内状态，不持久化（和台账一致），重启后回到 `PI_ASD_BOSS` 决定的初始值。重复开/关是幂等的，命令会说明当前状态。
 
 **`/asd:boss-stop` 不杀任何 agent、也不停 watcher。** 它只停止注入提示词。已经派出去
 的 agent 照跑，它们停下时结果照样推给主 agent —— 关掉 boss mode 不该让你对已经在跑的
