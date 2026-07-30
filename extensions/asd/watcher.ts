@@ -24,10 +24,23 @@ export interface WatcherDeps {
    */
   earlyRetryDelayMs?: number;
   /**
-   * session 停下或消失时调用（settle / gone），用于 kill 进程 + 清台账。
-   * timeout 时不调 —— 那个 agent 还在跑，不该杀。
+   * session 在 asd 里**真的没了**时调用（只有 `gone` 这一条路），用于清台账。
+   *
+   * **绝不能挂在 settle 上，也绝不能在这里 kill。** 这两条都是踩过的坑：
+   *
+   * `asd follow` 判"停下"的依据是终端安静了约 2 秒，而这个信号在冷启动时不
+   * 可靠 —— 刚 spawn 出来的 agent 画完 TUI 首屏、正在等模型第一个 token 时，
+   * 屏幕非空（冷启动止损那条分支不适用）而且安静，正好被判成 settle。曾经
+   * 这个回调叫 onDone、settle 也触发、调用方接上去直接 `asd kill`，结果就是
+   * agent 在真正开始干活之前被杀掉。
+   *
+   * 而且 settle 的 agent 是**活着且在等输入**，那是它最有用的状态：可以
+   * asd_steer 追加任务、可以被 pickReusable 复用、可以 asd attach 接管
+   * （README「生命周期」把最后一条列为 asd 相对 tmux 真正多出来的能力）。
+   *
+   * timeout 更不调 —— 那个 agent 还在跑。
    */
-  onDone?: (session: string) => void;
+  onGone?: (session: string) => void;
 }
 
 /** `252000` → `"4m12s"`。 */
@@ -130,7 +143,7 @@ export class WatcherPool {
       if (outcome.kind === "gone") {
         this.#early.delete(session);
         this.#finish(session, ctrl);
-        this.#deps.onDone?.(session);
+        this.#deps.onGone?.(session);
         this.#notify(`[pi-asd] agent "${session}" 的 session 已结束。`);
         return;
       }
@@ -183,7 +196,8 @@ export class WatcherPool {
       // 从这次侥幸成功的重挂算起 —— 不然 boss 看到的耗时会比实际短一大截。
       const took = formatDuration(this.#deps.now() - (early?.mountedAt ?? startedAt));
       this.#early.delete(session);
-      this.#deps.onDone?.(session);
+      // 这里**没有** onGone —— settle 只是"安静下来了"，session 还活着。
+      // 见 WatcherDeps.onGone 的注释。
       this.#notify(
         `[pi-asd] agent "${session}" 已停下（历时 ${took}）。\n` +
           `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,

@@ -8,7 +8,9 @@ import {
   bossStartMessage,
   buildSpawnCommand,
   createTools,
+  looksIdle,
   parseBossDefault,
+  REUSE_MIN_IDLE_MS,
   resolveAgentArg,
   shellEscape,
   type Tools,
@@ -58,7 +60,21 @@ function card(session: string, cwd: string, docs: string[] = []): {
  * "有没有挂上"。
  */
 function harness(
-  o: { live?: SessionInfo[]; cards?: ReturnType<typeof card>[]; bossSession?: string; newEchoes?: string } = {},
+  o: {
+    live?: SessionInfo[];
+    cards?: ReturnType<typeof card>[];
+    bossSession?: string;
+    newEchoes?: string;
+    /**
+     * 认定"停下来等输入"所需的最短静默，默认 0。
+     *
+     * 这一组测试关心的是复用/候选/收养的**判定逻辑**，不是那道静默门槛，所以
+     * 默认把门槛放到 0（等价于旧的"只看 running"）。要用真实门槛就**显式传**
+     * `REUSE_MIN_IDLE_MS` —— 传 undefined 会被这里的 `?? 0` 吃掉，拿到的还是 0。
+     * 门槛本身有它自己的一组测试，见文件末尾"静默门槛"那一节。
+     */
+    reuseMinIdleMs?: number;
+  } = {},
 ): Harness {
   const calls: string[][] = [];
   const live = o.live ?? [];
@@ -102,6 +118,7 @@ function harness(
       followTimeout: "30m",
       parentSession: "/s.jsonl",
       bossSession: o.bossSession,
+      reuseMinIdleMs: o.reuseMinIdleMs ?? 0,
     },
     mkdirp: async (d) => {
       mkdirs.push(d);
@@ -175,7 +192,13 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m", parentSession: "/s.jsonl" },
+    config: {
+      defaultAgent: "pi",
+      workspaceBase: "/base",
+      followTimeout: "30m",
+      parentSession: "/s.jsonl",
+      reuseMinIdleMs: 0,
+    },
     mkdirp: async (d) => {
       mkdirs.push(d);
     },
@@ -936,7 +959,13 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
     asd,
     registry,
     watchers,
-    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m", parentSession: "/s.jsonl" },
+    config: {
+      defaultAgent: "pi",
+      workspaceBase: "/base",
+      followTimeout: "30m",
+      parentSession: "/s.jsonl",
+      reuseMinIdleMs: 0,
+    },
     mkdirp: async () => {},
     now: () => 0,
   });
@@ -1056,4 +1085,108 @@ test("bossStartMessage 三种情况分得清", () => {
   assert.match(switched, /已经开着/);
   assert.match(switched, /claude/);
   assert.match(switched, /pi/);
+});
+
+// --- 静默门槛（REUSE_MIN_IDLE_MS）---
+//
+// 实测 asd 0.1.9：`running`（和 `status`）恒等于"idle_ms 小于约 2 秒"，是
+// "终端最近有动静"，**不是"进程在执行"**。一个跑着 `sleep 8` 的 session 在
+// 第 3.7 秒报的就是 running:false / status:idle。所以只看 running 的话，一个
+// 沉默思考了两秒多的 agent 会被当成空闲：被自动复用、或者被列进 candidates，
+// 任务直接 send 进去打断它。
+//
+// 上面那一组测试把门槛设成 0（它们测的是判定逻辑本身），这一节用真实默认值。
+
+test("looksIdle 要求连续静默够久，不只看 running", () => {
+  // running=true：终端刚有动静，明确排除
+  assert.equal(looksIdle(info("a", { running: true, idle_ms: 500 })), false);
+  // running=false 但只静了 3 秒 —— 正是 `sleep 8` 跑到一半的样子，必须排除
+  assert.equal(looksIdle(info("a", { running: false, idle_ms: 3_000 })), false);
+  assert.equal(looksIdle(info("a", { running: false, idle_ms: REUSE_MIN_IDLE_MS - 1 })), false);
+  // 到点了
+  assert.equal(looksIdle(info("a", { running: false, idle_ms: REUSE_MIN_IDLE_MS })), true);
+  assert.equal(looksIdle(info("a", { running: false, idle_ms: 600_000 })), true);
+});
+
+test("looksIdle 的门槛可以覆盖 —— 但覆盖成 0 就退回旧的「只看 running」", () => {
+  assert.equal(looksIdle(info("a", { running: false, idle_ms: 0 }), 0), true);
+  assert.equal(looksIdle(info("a", { running: true, idle_ms: 0 }), 0), false);
+});
+
+test("回归：只静默了几秒的自家 agent 不会被自动复用，走新建", async () => {
+  // 默认门槛（15s），agent 只静了 3 秒 —— 可能还在沉默地跑命令
+  const h = harness({ reuseMinIdleMs: REUSE_MIN_IDLE_MS, live: [info("pi-agent1", { idle_ms: 3_000 })] });
+  h.registry.add({
+    session: "pi-agent1",
+    task: "上一个任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task: "新任务" });
+  assert.ok(subcommands(h).includes("new"), "静默不够久就必须新建，不能复用");
+  assert.ok(!subcommands(h).includes("send"), "绝不能把任务 send 进可能还在干活的 agent");
+  assert.equal(h.registry.get("pi-agent1")?.task, "上一个任务", "原任务不该被覆盖");
+  assert.doesNotMatch(r.text, /复用/);
+  h.watchers.stopAll();
+});
+
+test("静默够久的自家 agent 照常复用 —— 门槛不该把功能整个废掉", async () => {
+  const h = harness({ reuseMinIdleMs: REUSE_MIN_IDLE_MS, live: [info("pi-agent1", { idle_ms: 60_000 })] });
+  h.registry.add({
+    session: "pi-agent1",
+    task: "上一个任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task: "新任务" });
+  assert.match(r.text, /复用/);
+  assert.ok(!subcommands(h).includes("new"));
+  h.watchers.stopAll();
+});
+
+test("回归：只静默了几秒的 session 不进 candidates 列表", async () => {
+  const h = harness({
+    reuseMinIdleMs: REUSE_MIN_IDLE_MS,
+    live: [
+      info("thinking", { command: "claude", idle_ms: 3_000 }),
+      info("really-idle", { command: "claude", idle_ms: 60_000 }),
+    ],
+    cards: [card("thinking", "/w/a"), card("really-idle", "/w/b")],
+  });
+  const r = await h.tools.candidates({});
+  assert.doesNotMatch(r.text, /thinking/, "静默不够久的不能列成候选，boss 一交任务就打断它");
+  assert.match(r.text, /really-idle/);
+});
+
+test("回归：指名交给只静默了几秒的 session 会被拒绝，且说清为什么", async () => {
+  const h = harness({
+    reuseMinIdleMs: REUSE_MIN_IDLE_MS,
+    live: [info("mem", { command: "claude", idle_ms: 3_000 })],
+    cards: [card("mem", "/w/mem")],
+  });
+  const r = await h.tools.spawn({ task: "t", session: "mem" });
+  assert.equal(r.isError, true);
+  assert.ok(!subcommands(h).includes("send"), "拒绝路径上绝不能 send");
+  assert.match(r.text, /才安静了/);
+  assert.match(r.text, /看不出是等输入还是在沉默地跑命令/);
+  assert.match(r.text, /告诉用户/, "决定权交回用户");
+  assert.equal(h.registry.size, 0);
+});
+
+test("running=true 的目标仍然报「正在干活」，两种情况文案分得开", async () => {
+  const h = harness({
+    reuseMinIdleMs: REUSE_MIN_IDLE_MS,
+    live: [info("busy", { command: "claude", running: true, idle_ms: 500 })],
+    cards: [card("busy", "/w")],
+  });
+  const r = await h.tools.spawn({ task: "t", session: "busy" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /正在干活/);
+  assert.doesNotMatch(r.text, /才安静了/);
 });

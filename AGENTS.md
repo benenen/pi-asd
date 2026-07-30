@@ -55,6 +55,7 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
   ├── cli.ts       asd 命令行的薄封装（注入 exec）
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
+  ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
   ├── tools.ts     7 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
@@ -107,7 +108,34 @@ pi 的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn
 `asd new` 实际回显的名字可能不一样，两个都要占，否则中间那条缝隙会漏。失败、成功、复用转
 新建的中途改道，收尾时都必须放行预留。
 
-### 4. watcher 的冷启动止损要真的等时间
+### 4. asd 的 `running` 不是「进程在执行」，`settle` 不是「干完了」
+
+实测 asd 0.1.9（`extensions/asd/reaper.ts` 顶部有完整记录）：
+
+- **`SessionInfo.running` 恒等于「`idle_ms` 小于约 2 秒」**，也就是"终端最近有动静"。
+  一个跑着 `sleep 5` 的 session 在第 3.5 秒报的是 `running: false`；它刚跑完的那
+  一瞬间反而报 `running: true`。**别把它当成"agent 在干活"。**
+- **`asd follow` 的 settle 判据同样是终端安静约 2 秒**，所以一个刚 spawn 出来、
+  画完 TUI 首屏、正在等模型第一个 token 的 agent，会在第 2 秒被判成"已停下"。
+- **`idle_ms` 是唯一可靠的空闲信号**，且 `asd send` 会让它归零。
+
+由此得出两条硬规矩：
+
+**a. 任何不可逆的动作（尤其 kill）都不许挂在 settle 上。** 这条是踩出来的 ——
+曾经 watcher 的回调在 settle 时触发并直接 `asd kill`，结果 spawn 出来的 agent
+全部在真正开始干活之前被杀掉，而 164 个单测全绿（单测把 asd mock 掉了，测不到
+这个时序）。回收改成 `Reaper` 按 `idle_ms` 扫描之后才对。`Reaper` 也因此不需要
+"被 steer 了要取消"这类逻辑：送任何输入都会把 `idle_ms` 打回零，够不够格每轮现算。
+
+**b. 判"这个 session 能不能接活"要用 `looksIdle()`，不许直接读 `info.running`。**
+`tools.ts` 的 `looksIdle()` 要求连续静默 ≥ `REUSE_MIN_IDLE_MS`（15s）。三个决策点
+（自动复用的候选池、`candidates()`、`adopt()`）都走它。直接读 `running` 会让一个
+沉默思考了两秒多的 agent 被当成空闲，任务 send 进去打断它。
+
+两条都不可能完备（asd 只看得到终端字节，静默跑大编译的 agent 可以安静几分钟）。
+真正承重的是 `createdByUs` 那道闸门：最坏情况只会叠进自己的 agent，不会碰用户的。
+
+### 5. watcher 的冷启动止损要真的等时间
 
 `asd follow` 对一个已经安静了的 session 是**立即返回**的，重挂一次只要几十毫秒。所以
 `EARLY_GRACE_MS`（20 秒宽限期）如果不配上 `EARLY_RETRY_DELAY_MS` 的真实 sleep，10 次重挂

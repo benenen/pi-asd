@@ -68,6 +68,20 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 文档）和 `asd list --json`（正在做什么、闲了多久、跑的哪个 agent），只列空闲且
 能接活的，闲最久的排前面，并标出哪些不是本扩展建的。
 
+### 「空闲」是怎么判的
+
+复用、`asd_candidates`、指名交给都要求目标**连续静默至少 15 秒**，不只是
+`asd list` 说它不忙。
+
+因为 asd 的 `running` / `status` 字段并不是"进程在执行"的意思——实测它恒等于
+"`idle_ms` 小于约 2 秒"，也就是"终端最近有动静"。一个跑着 `sleep 8` 的 session
+在第 3.7 秒报的就是 `running: false` / `status: idle`。只看这个字段的话，一个
+沉默思考了两秒多的 agent 会被当成空闲，任务直接 `send` 进去，打断它正在做的事。
+
+> **这条判据不可能完备。** asd 只看得到终端字节，一个 shell 出去跑静默大编译的
+> agent 可以安静几分钟。真正承重的是另一条：自动复用池只收本扩展自己创建的
+> session，所以最坏情况是把两个任务叠进自己的 agent，绝不会叠进你的会话。
+
 ### kill 的边界
 
 `asd_kill` 在执行前必须同时满足两条：名字在台账里、且该记录是本扩展 `asd new`
@@ -121,7 +135,9 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
   // session 名前缀（对应 PI_ASD_PREFIX）
   "prefix": "pi-",
   // follow 超时（对应 PI_ASD_FOLLOW_TIMEOUT）
-  "followTimeout": "30m"
+  "followTimeout": "30m",
+  // 空闲多久之后自动回收 agent，"off" 关掉（对应 PI_ASD_IDLE_KILL）
+  "idleKillAfter": "2m"
 }
 ```
 
@@ -136,6 +152,7 @@ git clone https://github.com/benenen/pi-asd ~/.pi/agent/extensions/pi-asd
 | `PI_ASD_FOLLOW_TIMEOUT` | `followTimeout` | `30m` | watcher 等待上限 |
 | `PI_ASD_BOSS` | `bossMode.autoStart` | （未设置） | 装好就默认开启 boss mode。`1` / `true` / `on` / `yes` 开；未设置、空串或 `0` / `false` / `off` / `no` 关 |
 | `PI_ASD_WORKSPACE` | `workspaceBase` | `~/.pi/agent/asd-workspaces` | 新 agent 的工作区基坐目录 |
+| `PI_ASD_IDLE_KILL` | `idleKillAfter` | `2m` | agent 空闲这么久后自动回收。写法 `30s` / `2m` / `1h`；`off` / `0` 关掉 |
 
 ### agent 在哪里开工
 
@@ -158,9 +175,29 @@ asd_spawn(task: "修 auth 的 bug", cwd: "/path/to/repo")
 
 ## 生命周期
 
-主 agent 退出时**不杀任何 session**，只掐掉 watcher，并列出仍在运行的 agent。
-子 agent 照跑，你可以 `asd attach <名字>` 进去接管 —— 这是 asd 相对 tmux pane
-真正多出来的能力。
+### 空闲回收
+
+agent 干完活之后**空闲超过 `PI_ASD_IDLE_KILL`（默认 2 分钟）会被自动 kill**，
+免得 session 无限堆积。只回收本扩展自己创建的（`createdByUs: true`）——
+指名交过任务的用户 session 和你手建的都不碰，和 `asd_kill` 是同一条闸门。
+
+判据是 asd 的 `idle_ms`（距上次终端活动的时长）。`asd send` 会让它归零，所以
+被 `asd_steer` 追加过任务、或者被复用过的 agent 会自动重新计时，不会被误收。
+
+> **注意 `idle_ms` 分不出"闲着"和"在跑一个长时间不输出的命令"。** 一个沉默地
+> 跑着大编译的 agent 超过阈值一样会被回收。这种活多的话就把阈值调大，或者
+> `PI_ASD_IDLE_KILL=off` 整个关掉。
+>
+> **不要用 `asd follow` 判"停下"来做回收。** 它的依据是终端安静了约 2 秒，
+> 冷启动时完全不可靠：实测一个刚 spawn 出来的 agent 在第 2 秒就会被判成停下
+> （那会儿它才刚画完首屏、还在等模型第一个 token）。这条踩过 —— 见
+> `extensions/asd/reaper.ts` 顶部的注释。
+
+### 退出
+
+主 agent 退出时**不杀任何 session**，只掐掉 watcher 和回收器，并列出仍在运行的
+agent（退出时不会补扫一轮回收）。子 agent 照跑，你可以 `asd attach <名字>`
+进去接管 —— 这是 asd 相对 tmux pane 真正多出来的能力。
 
 台账只活在进程内存里：主 agent 重启后 `asd_agents` 是空的，但 session 仍在
 `asd list` 里。

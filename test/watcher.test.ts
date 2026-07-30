@@ -14,6 +14,8 @@ interface Harness {
   rejectPeek(session: string, err: Error): void;
   followCalls: string[];
   peekCalls: string[];
+  /** onGone 回调收到的 session，按顺序。 */
+  goneCalls: string[];
   clock: { t: number };
 }
 
@@ -46,6 +48,7 @@ function harness(
   const followCalls: string[] = [];
   const peekCalls: string[] = [];
   const notes: string[] = [];
+  const goneCalls: string[] = [];
   const clock = { t: 0 };
 
   const asd = {
@@ -84,6 +87,7 @@ function harness(
     timeout: "30m",
     now: () => clock.t,
     earlyRetryDelayMs: o.earlyRetryDelayMs ?? 0,
+    onGone: (s) => goneCalls.push(s),
   });
 
   return {
@@ -91,6 +95,7 @@ function harness(
     notes,
     followCalls,
     peekCalls,
+    goneCalls,
     clock,
     settle(session, outcome) {
       const resolve = pendingFollow.get(session);
@@ -475,4 +480,84 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
   assert.equal(pool.isWatching("pi-a"), false);
   assert.equal(pool.watch("pi-a"), true);
   pool.stopAll();
+});
+
+// --- onGone：session 真的没了才回调 ---
+//
+// 回归（b004da8 引入，用户实测「spawn 出来的 agent 刚起来就被停掉」）：
+// 这个回调最初叫 onDone，在 settle 和 gone 两条路上都触发，index.ts 接上去
+// 直接 `asd kill`。问题在于 settle **不等于** agent 做完了：
+//
+//   `asd follow` 判"停下"的依据是终端安静了约 2 秒。一个刚 spawn 出来的 agent
+//   画完 TUI 首屏、正在等模型的第一个 token 时，屏幕非空（所以冷启动止损那条
+//   分支不适用）而且安静 —— 正好被判成 settle。于是 agent 在真正开始干活之前
+//   就被 kill 了，而且屏幕上还留着任务文本，看起来就像"它自己停了"。
+//
+// 更根本的是：settle 状态的 agent 是**活着且在等输入**，那是它最有用的状态 ——
+// 可以 asd_steer 追加任务、可以被 pickReusable 复用、可以 asd attach 接管
+// （README「生命周期」把这条列为 asd 相对 tmux 真正多出来的能力）。
+// 在一个已知不可靠的信号上挂一个不可逆的销毁动作，是这次事故的根。
+//
+// 所以：settle 绝不回调。只有 gone（asd 里这个 session 真的没了）才回调，
+// 而且回调方只清台账、不 kill —— 都没了，也没什么可 kill 的。
+
+test("回归：settle 绝不触发 onGone —— 停下来的 agent 还活着，不该被销毁", async () => {
+  const h = harness({ peek: "╭─ pi ─╮\n│ > 排查 token watcher │\n╰──────╯" });
+  h.pool.watch("pi-a");
+  h.settle("pi-a", { kind: "settled", text: "" });
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, [], "settle 不是「session 没了」，绝不能回调");
+  assert.equal(h.notes.length, 1, "但通知照发 —— boss 要知道它停下来了");
+  assert.match(h.notes[0]!, /已停下/);
+});
+
+test("回归：冷启动那一屏（TUI 已画出、还没出结果）settle 时也不回调", async () => {
+  // 这就是用户实测踩到的那一屏：非空，所以冷启动止损不适用，直接走 settle。
+  const h = harness({ instantFollow: { kind: "settled", text: "" }, peek: "pi v0.1  > 排查 token watcher" });
+  h.pool.watch("pi-agent1");
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, [], "刚起来的 agent 绝不能因为安静了两秒就被收尾");
+});
+
+test("gone 才触发 onGone —— session 在 asd 里真的没了，台账该清", async () => {
+  const h = harness();
+  h.pool.watch("pi-a");
+  h.settle("pi-a", { kind: "gone" });
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, ["pi-a"]);
+  assert.equal(h.peekCalls.length, 0, "都没了就不该再 peek");
+});
+
+test("timeout 不触发 onGone —— 那个 agent 还在跑", async () => {
+  const h = harness();
+  h.pool.watch("pi-a");
+  h.settle("pi-a", { kind: "timeout", text: "" });
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, []);
+});
+
+test("冷启动重挂路径上不触发 onGone", async () => {
+  const h = harness({ instantFollow: { kind: "settled", text: "" }, peek: "" });
+  h.pool.watch("pi-a");
+  await waitFor(() => h.followCalls.length >= 2);
+  h.pool.stopAll();
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, [], "重挂说明还没真开始，更不该收尾");
+});
+
+test("watcher 出错时不触发 onGone —— 不知道 session 状态就不要乱收尾", async () => {
+  const h = harness({ pausePeek: true });
+  h.pool.watch("pi-a");
+  h.settle("pi-a", { kind: "settled", text: "" });
+  await waitFor(() => h.peekCalls.length === 1);
+  h.rejectPeek("pi-a", new Error("asd 挂了"));
+  await h.pool.idle();
+
+  assert.deepEqual(h.goneCalls, [], "peek 失败只说明我们不知道状态，不能当成 session 没了");
+  assert.match(h.notes[0]!, /出错/);
 });

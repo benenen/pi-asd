@@ -20,6 +20,11 @@ export interface AsdConfig {
   prefix?: string;
   /** follow 超时，如 "30m"。对应环境变量 `PI_ASD_FOLLOW_TIMEOUT` */
   followTimeout?: string;
+  /**
+   * agent 空闲多久之后自动回收（kill），如 "2m"。`off` 关掉。
+   * 对应环境变量 `PI_ASD_IDLE_KILL`
+   */
+  idleKillAfter?: string;
 }
 
 export class ConfigError extends Error {
@@ -128,6 +133,7 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
   const workspaceBase = readOptionalString(merged.workspaceBase, "workspaceBase", problems);
   const prefix = readOptionalString(merged.prefix, "prefix", problems);
   const followTimeout = readOptionalString(merged.followTimeout, "followTimeout", problems);
+  const idleKillAfter = readOptionalString(merged.idleKillAfter, "idleKillAfter", problems);
 
   if (problems.length > 0) throw new ConfigError(problems);
 
@@ -136,6 +142,7 @@ export function loadConfig({ files, env, cwd, agentDir }: LoadConfigArgs): AsdCo
     workspaceBase,
     prefix,
     followTimeout,
+    idleKillAfter,
   };
 }
 

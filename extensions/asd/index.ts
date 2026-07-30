@@ -14,6 +14,7 @@ import { createAsd, type Exec } from "./cli.ts";
 import { bossModePrompt } from "./prompt.ts";
 import { Registry } from "./registry.ts";
 import { loadConfigSafely, readConfigFile, resolveWorkspaceBase } from "./config.ts";
+import { parseDuration, Reaper } from "./reaper.ts";
 import {
   bossStartMessage,
   createTools,
@@ -27,6 +28,8 @@ import { WatcherPool } from "./watcher.ts";
 const DEFAULT_PREFIX = "pi-";
 const DEFAULT_AGENT = "pi";
 const DEFAULT_FOLLOW_TIMEOUT = "30m";
+/** agent 空闲这么久之后自动回收。`PI_ASD_IDLE_KILL=off` 可以关掉。 */
+const DEFAULT_IDLE_KILL = "2m";
 
 function toolResult(r: ToolResult) {
   return {
@@ -81,29 +84,34 @@ export default function (pi: ExtensionAPI): void {
   );
 
   const registry = new Registry(prefix);
+
+  // pi.sendMessage 的类型签名是 void，实测（dist/core/agent-session.js 的
+  // _bindExtensionCore）也确实是同步 void：内部 sendCustomMessage() 的 promise
+  // 已经在 pi 自己那层用 .catch() 接住并转成 runner.emitError，不会向外抛出未
+  // 处理 rejection。所以这里不需要、也没有额外的 .catch()。
+  const notify = (text: string): void => {
+    pi.sendMessage(
+      { customType: "pi-asd-agent", content: text, display: true },
+      // followUp：不打断 boss 手头正在执行的工具调用，等这一轮做完再送。
+      // triggerTurn：boss 已经闲坐着时也要把它唤醒。
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+  };
+
   const watchers = new WatcherPool({
     asd,
     timeout: followTimeout,
     now: () => Date.now(),
-    notify: (text) => {
-      // pi.sendMessage 的类型签名是 void，实测（dist/core/agent-session.js
-      // 的 _bindExtensionCore）也确实是同步 void：内部 sendCustomMessage()
-      // 的 promise 已经在 pi 自己那层用 .catch() 接住并转成 runner.emitError，
-      // 不会向外抛出未处理 rejection。所以这里不需要、也没有额外的 .catch()。
-      pi.sendMessage(
-        { customType: "pi-asd-agent", content: text, display: true },
-        // followUp：不打断 boss 手头正在执行的工具调用，等这一轮做完再送。
-        // triggerTurn：boss 已经闲坐着时也要把它唤醒。
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-    },
-    onDone: (session) => {
-      const ours = registry.get(session)?.createdByUs === true;
+    notify,
+    // session 在 asd 里真的没了 —— 台账里那条已经是幽灵记录，清掉它，
+    // 免得 asd_agents 和 pickReusable 还拿它当活的。
+    //
+    // 这里只清台账、不 kill：都没了，没什么可 kill 的。真正的"干完活之后回收"
+    // 交给下面的 Reaper，它按 idle_ms 判断，不碰 settle 这个不可靠信号 ——
+    // 曾经这个回调挂在 settle 上并且真的 kill，把刚 spawn 出来还在冷启动的
+    // agent 杀了。见 WatcherDeps.onGone 的注释。
+    onGone: (session) => {
       registry.remove(session);
-      // 只有自己创建的才 kill —— 指名交过任务的、用户手建的 session 都不能碰
-      if (ours) {
-        asd.kill(session).catch(() => {});
-      }
     },
   });
 
@@ -112,6 +120,25 @@ export default function (pi: ExtensionAPI): void {
   // parentSession 那样随 session_start 变化 —— 一次性读出来注入即可。
   // `tools.ts` 不读 process.env，这是它拿到这个值的唯一路径。
   const bossSession = process.env.ASD_SESSION;
+
+  // 延迟回收：干完活之后空闲够久的自家 agent 自动 kill 掉。判据是 asd 的
+  // idle_ms（送任何输入都会让它归零），所以被 steer / 被复用之后不会再被回收，
+  // 不需要额外的取消逻辑。认不出的时长值不静默忽略，攒进 startupProblems 一起报。
+  const idleKill = parseDuration(
+    process.env.PI_ASD_IDLE_KILL ?? staticConfig.idleKillAfter ?? DEFAULT_IDLE_KILL,
+  );
+  if (idleKill.problem !== undefined) startup.problems.push(`idleKillAfter：${idleKill.problem}`);
+  const reaper =
+    idleKill.ms === undefined
+      ? undefined
+      : new Reaper({
+          asd,
+          registry,
+          idleKillMs: idleKill.ms,
+          bossSession,
+          notify,
+        });
+  reaper?.start();
   // boss mode 开关：env PI_ASD_BOSS 优先于配置文件 bossMode.autoStart
   const bossDefault = parseBossDefault(process.env.PI_ASD_BOSS);
   /**
@@ -217,6 +244,9 @@ export default function (pi: ExtensionAPI): void {
   // 只掐 watcher，绝不杀 session —— 子 agent 照跑，用户可以 asd attach 接管。
   pi.on("session_shutdown", async (_event, ctx) => {
     watchers.stopAll();
+    // 退出时停掉回收器。**不在这里补扫一轮** —— 退出时不杀任何 session 是
+    // README「生命周期」明写的契约：子 agent 照跑，用户可以 asd attach 接管。
+    reaper?.stop();
     // 台账是内存快照，可能已经跟 asd 的实际状态脱节（agent 早退出了、或者
     // 反过来台账里的记录其实还活着）—— 退出前跟 `asd list` 对账一遍，只报告
     // 真正还存活的，不能拍脑袋说台账里每一条都"仍在运行"。

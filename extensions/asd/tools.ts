@@ -6,9 +6,38 @@
  */
 
 import path from "node:path";
-import type { Asd } from "./cli.ts";
+import type { Asd, SessionInfo } from "./cli.ts";
 import type { Registry } from "./registry.ts";
 import { formatDuration, type WatcherPool } from "./watcher.ts";
+
+/**
+ * 一个 session 至少要**连续安静**这么久，才当它是"停下来等输入"而不是"正在干活"。
+ *
+ * 为什么不能只看 `info.running`：实测 asd 0.1.9 的 `running`（以及 `status`）
+ * 恒等于"`idle_ms` 小于约 2 秒"，它是"终端最近有动静"，**不是"进程在执行"**。
+ * 一个跑着 `sleep 8` 的 session 在第 3.7 秒报的就是 `running: false` / `idle`。
+ * 只看 `running` 的话，一个沉默思考了两秒多的 agent 就会被当成空闲，然后被自动
+ * 复用、或者被列进 asd_candidates —— 任务直接 send 进去，打断它正在做的事。
+ *
+ * 15 秒是权衡：终端里两三秒的静默是常态（冷启动、两次工具调用之间、等 API），
+ * 连续 15 秒一个字节都没有则大概率真的在等输入。
+ *
+ * **这条判据不可能完备，也不假装完备。** asd 只看得到终端字节，一个 shell 出去
+ * 跑静默大编译的 agent 可以安静几分钟 —— 任何阈值都救不了那种情况。真正承重的
+ * 是另一条：自动复用池只收 `createdByUs === true`，所以最坏情况是把两个任务叠进
+ * 我们自己的 agent，绝不会叠进用户的会话。
+ */
+export const REUSE_MIN_IDLE_MS = 15_000;
+
+/** 看起来是"停下来等输入"了。判据见 `REUSE_MIN_IDLE_MS`。 */
+export function looksIdle(
+  info: Pick<SessionInfo, "running" | "idle_ms">,
+  minIdleMs: number = REUSE_MIN_IDLE_MS,
+): boolean {
+  // running 这一条在当前 asd 语义下已被 idle_ms 那条覆盖，留着是为了万一哪天
+  // asd 把 running 改成真的"进程在执行"，这里能立刻跟着变严，而不是变松。
+  return !info.running && info.idle_ms >= minIdleMs;
+}
 
 export interface ToolResult {
   text: string;
@@ -171,6 +200,11 @@ export interface ToolConfig {
    * 传一份自己的表，不碰全局状态。
    */
   presets?: Record<string, AgentPreset>;
+  /**
+   * 认定"停下来等输入"所需的最短连续静默；缺省 `REUSE_MIN_IDLE_MS`。
+   * 主要给测试用 —— 单测不想为了跨过 15 秒这道门槛去编造巨大的 idle_ms。
+   */
+  reuseMinIdleMs?: number;
 }
 
 export interface ToolDeps {
@@ -221,6 +255,7 @@ function preview(task: string): string {
 export function createTools(deps: ToolDeps): Tools {
   const { asd, registry, watchers, config, mkdirp, now } = deps;
   const presets = config.presets ?? PRESETS;
+  const minIdleMs = config.reuseMinIdleMs ?? REUSE_MIN_IDLE_MS;
 
   /**
    * 并发 spawn 之间的临界区屏障：正在处理中、还没落盘到 registry 的 session
@@ -290,10 +325,19 @@ export function createTools(deps: ToolDeps): Tools {
             `先用 asd_candidates 看看有哪些能接活，把名字告诉用户，让它来定。`,
         );
       }
-      if (info.running) {
+      if (!looksIdle(info, minIdleMs)) {
+        // 两种情况分开说：终端还在动是明确的"在干活"；刚安静下来几秒则是
+        // "看不出来"——asd 分不出它是等输入还是在沉默地跑一个命令，
+        // 所以宁可拒绝。见 REUSE_MIN_IDLE_MS。
+        //
+        // 第一句必须说清：session 是存在的，只是不空闲 —— 避免模型/人误读成
+        // "session 不存在"然后自作主张去新建或改派。
+        const why = info.running
+          ? "正在干活"
+          : `才安静了 ${formatDuration(info.idle_ms)}，看不出是等输入还是在沉默地跑命令`;
         return err(
-          `"${session}" 正在干活，不会打断它。如果是用户点名要它，把这个情况告诉用户，` +
-            `让它决定是等它闲下来、换一个、还是新建。`,
+          `"${session}" 是存在的，但${why}，不会打断它。如果是用户点名要它，` +
+            `把这个情况告诉用户，让它决定是等它闲下来、换一个、还是新建。`,
         );
       }
       const agent = agentOfCommand(info.command, presets);
@@ -387,8 +431,15 @@ export function createTools(deps: ToolDeps): Tools {
           // 并发的另一个 spawn 可能已经在这份快照上预订了某个空闲 agent ——
           // 从候选池里摘掉，避免两边挑中同一个 session（registry.pickReusable
           // 对不在 map 里的条目本来就会跳过，不需要改它的签名）。
+          //
+          // 同一个 map 上顺手把"安静得还不够久"的也摘掉：pickReusable 只看
+          // `info.running`，而那个字段分不出"等输入"和"沉默地在跑命令"。策略
+          // 收在这一处，registry 那层不用知道这条规则。见 REUSE_MIN_IDLE_MS。
           const available = new Map(liveMap);
           for (const s of reserved) available.delete(s);
+          for (const [name, info] of liveMap) {
+            if (!looksIdle(info, minIdleMs)) available.delete(name);
+          }
 
           const target = registry.pickReusable(
             {
@@ -494,7 +545,9 @@ export function createTools(deps: ToolDeps): Tools {
         mine: boolean;
       }[] = [];
       for (const info of live) {
-        if (info.running) continue;
+        // 只看 running 会把"沉默思考了两秒多"的 agent 列成候选，boss 一交任务
+        // 就打断它。见 REUSE_MIN_IDLE_MS。
+        if (!looksIdle(info, minIdleMs)) continue;
         const agent = agentOfCommand(info.command, presets);
         if (agent === undefined) continue;
         const card = cardBy.get(info.session);
