@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，215 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，229 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -51,12 +51,12 @@ e2e 在 `asd` 不在 PATH 上时自动跳过。
 
 ```
 index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sendMessage 适配成 notify，
-                  读 process.env，注册 7 个工具和 2 个斜杠命令。只接线，不放逻辑。
+                  读 process.env，注册 8 个工具和 2 个斜杠命令。只接线，不放逻辑。
   ├── cli.ts       asd 命令行的薄封装（注入 exec）
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
-  ├── tools.ts     7 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
+  ├── tools.ts     8 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
 ```

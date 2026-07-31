@@ -15,6 +15,7 @@ import {
   parseBossDefault,
   REUSE_MIN_IDLE_MS,
   resolveAgentArg,
+  resolveNavKeys,
   shellEscape,
   withAlias,
   withEnv,
@@ -1522,4 +1523,108 @@ test("没配别名的 agent 保持原样 —— 不给别人的机器凭空加 b
   assert.match(cmd, /^codex /, `实际：${cmd}`);
   assert.doesNotMatch(cmd, /bash -ic/);
   h.watchers.stopAll();
+});
+
+// --- asd_nav：往会话里按键 ---
+//
+// 存在的理由：对话框是模态的，会把输入框顶掉。那时 asd_steer 的投递校验会失败
+// 并**拒绝按回车** —— 那是对的，因为那一下回车会去确认对话框当前选中的项
+// （claude 信任对话框的第二项是 "No, exit"）。所以"操作对话框"必须是独立动作。
+
+test("resolveNavKeys 同时认 ArrowDown 和 Down 两套写法，大小写随便", () => {
+  assert.deepEqual(resolveNavKeys(["ArrowDown", "Enter"]), { ok: true, keys: ["Down", "Enter"] });
+  assert.deepEqual(resolveNavKeys(["down", "ENTER"]), { ok: true, keys: ["Down", "Enter"] });
+  assert.deepEqual(resolveNavKeys([" Tab ", "space"]), { ok: true, keys: ["Tab", "Space"] });
+  assert.deepEqual(resolveNavKeys(["esc"]), { ok: true, keys: ["Escape"] });
+});
+
+test("resolveNavKeys 认 C-a..C-z", () => {
+  assert.deepEqual(resolveNavKeys(["C-c"]), { ok: true, keys: ["C-c"] });
+  assert.deepEqual(resolveNavKeys(["c-a", "C-Z"]), { ok: true, keys: ["C-a", "C-z"] });
+});
+
+/**
+ * 认不出的名字一律拒绝、一个都不送 —— 这个工具是往别人的会话里按键，猜错一个
+ * 可能就确认了一个对话框。宁可让调用方看到报错重来，也不要送出一半。
+ */
+test("resolveNavKeys 拒绝认不出的按键，并列出可选项", () => {
+  const r = resolveNavKeys(["ArrowDown", "PageDown"]);
+  assert.equal(r.ok, false);
+  assert.match((r as { message: string }).message, /PageDown/);
+  assert.match((r as { message: string }).message, /ArrowDown/);
+});
+
+test("resolveNavKeys 拒绝空数组和非字符串项", () => {
+  assert.equal(resolveNavKeys([]).ok, false);
+  assert.equal(resolveNavKeys("Enter").ok, false);
+  assert.equal(resolveNavKeys(undefined).ok, false);
+  assert.equal(resolveNavKeys(["Enter", 3]).ok, false);
+});
+
+function navHarness() {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })] });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  return h;
+}
+
+test("nav 逐个送键，顺序不变，且用 --key 而不是 --text", async () => {
+  const h = navHarness();
+  const r = await h.tools.nav({ session: "pi-a", keys: ["ArrowDown", "Enter"] });
+  assert.equal(r.isError, undefined, r.text);
+
+  const keyCalls = h.calls.filter((c) => c[0] === "send" && c.includes("--key"));
+  assert.deepEqual(
+    keyCalls.map((c) => c[c.indexOf("--key") + 1]),
+    ["Down", "Enter"],
+    "顺序必须和调用方给的一致",
+  );
+  assert.equal(deliveries(h).length, 0, "nav 绝不能走 --text");
+  h.watchers.stopAll();
+});
+
+/**
+ * 一次 asd 调用送一串（`--key a,b,c`）会让所有按键挤在同一个 payload 里到达，
+ * TUI 那套"一大坨字节 = 粘贴"的判定会再咬一次；而且对话框来不及重绘。
+ */
+test("nav 每个键一次 asd 调用 —— 不用逗号把一串挤进一个 payload", async () => {
+  const h = navHarness();
+  await h.tools.nav({ session: "pi-a", keys: ["Down", "Down", "Enter"] });
+  const keyCalls = h.calls.filter((c) => c[0] === "send" && c.includes("--key"));
+  assert.equal(keyCalls.length, 3, "三个键就该有三次调用");
+  for (const c of keyCalls) {
+    assert.doesNotMatch(c[c.indexOf("--key") + 1]!, /,/, "单次调用里不该出现逗号分隔的一串");
+  }
+  h.watchers.stopAll();
+});
+
+test("nav 把按完之后的屏幕一并返回 —— 省掉调用方再 peek 一次", async () => {
+  const h = navHarness();
+  const r = await h.tools.nav({ session: "pi-a", keys: ["Enter"] });
+  assert.match(r.text, /按键之后的屏幕/);
+  assert.match(r.text, /SCREEN:pi-a/);
+  h.watchers.stopAll();
+});
+
+test("nav 认不出按键时一个都不送，也不碰 asd", async () => {
+  const h = navHarness();
+  const before = h.calls.length;
+  const r = await h.tools.nav({ session: "pi-a", keys: ["ArrowDown", "F13"] });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /F13/);
+  assert.equal(h.calls.length, before, "校验不过的路径上一次 asd 调用都不该有");
+});
+
+test("nav 拒绝台账外的 session —— 和 steer / peek 同一道闸门", async () => {
+  const h = harness({ live: [info("someone-else", { idle_ms: 60_000 })] });
+  const r = await h.tools.nav({ session: "someone-else", keys: ["Enter"] });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /不是本次 spawn 出来的/);
+  assert.equal(h.calls.length, 0);
 });

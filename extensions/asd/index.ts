@@ -20,6 +20,7 @@ import {
   createTools,
   parseBossDefault,
   PRESETS,
+  NAV_KEY_NAMES,
   resolveAgentArg,
   withAlias,
   type AgentPreset,
@@ -446,6 +447,31 @@ export default function (pi: ExtensionAPI): void {
     }),
     async execute(_id, params) {
       return toolResult(await tools.steer(params));
+    },
+  });
+
+  pi.registerTool({
+    name: "asd_nav",
+    label: "Send keys to agent",
+    description: [
+      "往一个 agent 的会话里按键，用来操作它弹出的对话框（选择框、确认框之类）。",
+      "对话框是模态的，会把输入框顶掉 —— 那时 asd_steer 会投递失败并拒绝按回车，",
+      "因为那一下回车会去确认对话框当前选中的项。要操作对话框就用这个工具。",
+      "**先用 asd_peek 看清楚当前是什么界面、选中的是哪一项，再按。**",
+      "这个工具不做投递校验（按键本就不是往输入框送的），但会把按完之后的屏幕一并返回。",
+    ].join("\n"),
+    parameters: Type.Object({
+      session: Type.String({ description: "session 名" }),
+      keys: Type.Array(
+        StringEnum(NAV_KEY_NAMES as [string, ...string[]]),
+        {
+          description:
+            '按顺序送出的按键，例如 ["ArrowDown", "Enter"]。C-a..C-z 表示 Ctrl 组合键（C-c 会中断 agent）。',
+        },
+      ),
+    }),
+    async execute(_id, params) {
+      return toolResult(await tools.nav(params));
     },
   });
 

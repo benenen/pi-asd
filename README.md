@@ -51,6 +51,7 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 | `asd_peek` | 读一个 agent 当前的屏幕，不阻塞 |
 | `asd_follow` | 阻塞到 agent 停下来，返回过程输出 + 最后一屏 |
 | `asd_steer` | 往 agent 会话里打一条消息，然后重挂 watcher |
+| `asd_nav` | 往 agent 会话里按键，用来操作它弹出的对话框 |
 | `asd_kill` | 结束 session —— **只能结束本扩展自己新建的** |
 
 ### 派任务的三条路
@@ -147,6 +148,29 @@ agent 的那套判断不受影响。
 > **这条判据不可能完备。** asd 只看得到终端字节，一个 shell 出去跑静默大编译的
 > agent 可以安静几分钟。真正承重的是另一条：自动复用池只收本扩展自己创建的
 > session，所以最坏情况是把两个任务叠进自己的 agent，绝不会叠进你的会话。
+
+### agent 弹了对话框怎么办
+
+agent 有时会弹**模态对话框**（选择框、确认框）。它会把输入框顶掉，这时
+`asd_steer` 的投递校验会失败并**拒绝按回车** —— 那是对的：那一下回车会去确认
+对话框当前选中的项（claude 信任对话框的第二项是 `2. No, exit`）。
+
+要操作对话框就用 `asd_nav`：
+
+```
+asd_peek("pi-a")                          # 先看清楚是什么界面、选中的是哪一项
+asd_nav("pi-a", ["ArrowDown", "Enter"])   # 再按
+```
+
+支持 `Enter` / `Space` / `Tab` / `Escape` / `Backspace` / `Home` / `End` /
+`ArrowUp` `ArrowDown` `ArrowLeft` `ArrowRight` / `C-a`..`C-z`（`C-c` 会中断 agent）。
+`ArrowDown` 和 `Down` 两套写法都认，大小写随便。
+
+按键逐个送出、中间留空档，不会挤在一个 payload 里（原因同"送文本必须分两次发"）。
+认不出的按键名一律拒绝、**一个都不送** —— 猜错一个键可能就确认了一个对话框。
+
+这个工具**不做投递校验**（按键本就不是往输入框送的），所以调用方要自己先 peek。
+它会把按完之后的屏幕一并返回，省掉一次来回。
 
 ### kill 的边界
 

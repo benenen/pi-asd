@@ -69,6 +69,97 @@ export function screenHasText(screen: string, text: string): boolean {
 export type Delivery = { ok: true } | { ok: false; reason: string };
 
 /**
+ * 送按键之间的间隔。
+ *
+ * 逐个发、中间留空档，**不要**用 asd `--key` 的逗号分隔一次送一串：那样所有按键
+ * 会在同一个 payload 里到达，TUI 按"一大坨字节一次到达"判定粘贴的老问题会再来
+ * 一遍（见 `ENTER_DELAY_MS`）。而且对话框要时间重绘，连发容易把第二个键送进
+ * 还没画出来的界面。
+ */
+export const NAV_KEY_DELAY_MS = 120;
+
+/**
+ * `asd_nav` 接受的按键名 → asd `--key` 认的名字。
+ *
+ * 同时收两套写法：调用方常写 `ArrowDown`（Web/DOM 那套），asd 自己叫 `Down`。
+ * 与其让模型去记哪套对，不如两套都认。查表前统一转小写，大小写随便写。
+ */
+const NAV_KEY_ALIASES: Record<string, string> = {
+  enter: "Enter",
+  return: "Enter",
+  space: "Space",
+  tab: "Tab",
+  escape: "Escape",
+  esc: "Escape",
+  backspace: "Backspace",
+  home: "Home",
+  end: "End",
+  up: "Up",
+  arrowup: "Up",
+  down: "Down",
+  arrowdown: "Down",
+  left: "Left",
+  arrowleft: "Left",
+  right: "Right",
+  arrowright: "Right",
+};
+
+/** `C-a` … `C-z`：asd 原生支持，用来送 Ctrl 组合键。 */
+const CTRL_KEY = /^c-([a-z])$/;
+
+/** 给报错文案用的可选项清单。 */
+export const NAV_KEY_NAMES = [
+  "Enter",
+  "Space",
+  "Tab",
+  "Escape",
+  "Backspace",
+  "Home",
+  "End",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "C-a..C-z",
+];
+
+export type NavKeys = { ok: true; keys: string[] } | { ok: false; message: string };
+
+/**
+ * 校验并翻译一串按键名。
+ *
+ * **认不出的名字一律拒绝，不猜、不跳过。** 这个工具是往别人的会话里按键，猜错
+ * 一个键可能就确认了一个对话框；宁可让调用方看到报错重来，也不要送出一半。
+ */
+export function resolveNavKeys(raw: unknown): NavKeys {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ok: false, message: `keys 必须是非空数组。可用：${NAV_KEY_NAMES.join(" / ")}` };
+  }
+  const out: string[] = [];
+  for (const k of raw) {
+    if (typeof k !== "string") {
+      return { ok: false, message: `keys 里有非字符串项：${JSON.stringify(k)}` };
+    }
+    const norm = k.trim().toLowerCase();
+    const ctrl = CTRL_KEY.exec(norm);
+    if (ctrl !== null) {
+      out.push(`C-${ctrl[1]}`);
+      continue;
+    }
+    const mapped = NAV_KEY_ALIASES[norm];
+    if (mapped === undefined) {
+      return {
+        ok: false,
+        message: `不认识的按键 "${k}"。可用：${NAV_KEY_NAMES.join(" / ")}`,
+      };
+    }
+    out.push(mapped);
+  }
+  return { ok: true, keys: out };
+}
+
+
+/**
  * agent 启动期可能挡在最前面的 UI（信任确认、首次引导之类）。
  *
  * 这类 UI 是**模态**的：它盖在输入框上层，任务文本会送到它后面，回车被它吃掉 ——
@@ -380,6 +471,7 @@ export interface Tools {
   peek(p: { session: string; scrollback?: number }): Promise<ToolResult>;
   follow(p: { session: string; mode?: "settle" | "end"; timeout?: string }): Promise<ToolResult>;
   steer(p: { session: string; message: string }): Promise<ToolResult>;
+  nav(p: { session: string; keys: unknown }): Promise<ToolResult>;
   kill(p: { session: string }): Promise<ToolResult>;
 }
 
@@ -902,6 +994,56 @@ export function createTools(deps: ToolDeps): Tools {
       return {
         text: `已把消息送给 "${p.session}"。${watching ? "watcher 已重挂。" : ""}`,
         details: { session: p.session, watching },
+      };
+    },
+
+    /**
+     * 往 session 里按键，用来操作 agent 弹出的对话框（选择框、确认框之类）。
+     *
+     * 为什么需要它：对话框是模态的，它把输入框顶掉了。这时 `asd_steer` 送文本会
+     * 投递校验失败并**拒绝按回车** —— 那是对的，输入框里是对话框，那一下回车会
+     * 去确认它当前选中的项（claude 信任对话框的第二项是 "No, exit"）。所以
+     * "操作对话框"必须是一个和"投消息"分开的动作。
+     *
+     * **这里不做投递校验**：按键本来就不是往输入框送的，"文本有没有出现在屏幕上"
+     * 这个判据对它没有意义。代价是调用方要自己负责先 peek 看清楚再按 —— 所以
+     * 返回值里直接带上操作后的屏幕，省掉一次来回。
+     */
+    async nav(p) {
+      const bad = requireKnown(p.session);
+      if (bad) return bad;
+
+      const parsed = resolveNavKeys(p.keys);
+      if (!parsed.ok) return err(parsed.message);
+
+      // 逐个发、中间留空档。见 NAV_KEY_DELAY_MS：一次送一串会挤在同一个 payload
+      // 里，而且对话框来不及重绘。
+      const sent: string[] = [];
+      for (const key of parsed.keys) {
+        if (!(await asd.key(p.session, key))) {
+          registry.remove(p.session);
+          watchers.stop(p.session);
+          return err(
+            sent.length === 0
+              ? `"${p.session}" 的 session 已经不在了，一个键都没送出去。`
+              : `"${p.session}" 在送 ${key} 时消失了。已经送出去的：${sent.join(" ")}。`,
+          );
+        }
+        sent.push(key);
+        await sleep(NAV_KEY_DELAY_MS);
+      }
+
+      // 按完之后 agent 可能就开始干活了（比如刚确认掉一个对话框），watcher 要重挂。
+      const watching = rewatch(p.session, true);
+      const screen = await asd.peek(p.session);
+      if (screen === null) return dropGone(p.session);
+
+      return {
+        text:
+          `已向 "${p.session}" 送出：${sent.join(" ")}。` +
+          `${watching ? "watcher 已重挂。" : ""}\n` +
+          `--- 按键之后的屏幕 ---\n${screen}`,
+        details: { session: p.session, keys: sent, watching },
       };
     },
 
