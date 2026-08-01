@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，229 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，242 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -56,6 +56,7 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
+  ├── dialog.ts    从一屏文字里认出「agent 弹了对话框在等决策」。纯函数
   ├── tools.ts     8 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
@@ -214,7 +215,24 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 是假阳性，测的其实是别名版命令。**要验证环境相关的行为，必须显式把环境剥干净**，
 不能靠继承。
 
-### 9. watcher 的冷启动止损要真的等时间
+### 9. settle 之后要复核一次，才分得出「思考中」和「真停下」
+
+`asd follow` 的 settle 只代表"终端安静约 2 秒"。watcher 在报"停下"之前会隔
+`SETTLE_CONFIRM_MS`(1.2s) 再 peek 一屏：**两屏不一样 = agent 还在重绘 = 还在干活**，
+安静重挂，不打扰 boss。这是目前唯一能把两者分开的判据 —— asd 自己给不出。
+
+复核之后屏幕仍静止，再用 `dialog.ts` 的 `detectDialog()` 分「等决策」和「真停下」，
+两种通知的措辞完全不同：前者必须有人按键、不处理就永远卡着，后者是去读结果。
+
+`detectDialog` 的取舍是**宁可漏认、不可错认**，所以要求「编号选项」和「底部按键
+提示」同时出现。漏认只是退回"已停下"（屏幕照样带上）；错认会把 boss 引去对一屏
+正常输出按键。
+
+写测试注意：watcher 的夹具默认 `settleConfirmMs: 0`（跳过整段复核，含那次 peek）——
+这一组用例大多按 follow/peek 的调用序列断言，多一次 peek 会全部错位。要测复核本身
+就显式传一个很小的非零值。
+
+### 10. watcher 的冷启动止损要真的等时间
 
 `asd follow` 对一个已经安静了的 session 是**立即返回**的，重挂一次只要几十毫秒。所以
 `EARLY_GRACE_MS`（20 秒宽限期）如果不配上 `EARLY_RETRY_DELAY_MS` 的真实 sleep，10 次重挂

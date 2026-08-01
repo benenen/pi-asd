@@ -9,6 +9,7 @@
  */
 
 import type { Asd } from "./cli.ts";
+import { detectDialog } from "./dialog.ts";
 
 export interface WatcherDeps {
   asd: Asd;
@@ -23,6 +24,11 @@ export interface WatcherDeps {
    * `EARLY_RETRY_DELAY_MS` 上面那段注释：这就是 C2 量纲修复的核心。
    */
   earlyRetryDelayMs?: number;
+  /**
+   * 判定"停下"之前的复核间隔，默认 `SETTLE_CONFIRM_MS`。
+   * 只在测试里覆盖成 0 —— 生产代码不传，吃默认值。
+   */
+  settleConfirmMs?: number;
   /**
    * session 在 asd 里**真的没了**时调用（只有 `gone` 这一条路），用于清台账。
    *
@@ -74,12 +80,30 @@ const EARLY_MAX_RETRIES = 10;
  */
 const EARLY_RETRY_DELAY_MS = 1_000;
 
+/**
+ * 判定"停下"之前的复核间隔。
+ *
+ * `asd follow` 的 settle 只代表"终端安静了约 2 秒"，它分不出**在思考**和**真停下**。
+ * 但这两者在屏幕上是能分开的：还在干活的 agent 会持续重绘（转圈指示器、逐字输出），
+ * 静止的则不会。所以 settle 之后隔一会儿再看一眼 —— **两屏不一样就说明它还在动**，
+ * 那不是停下，安静重挂即可，不打扰 boss。
+ *
+ * 这是目前唯一能把"思考中"和"停下了"分开的判据：asd 自己给不出（`running` 恒等于
+ * `idle_ms < 2s`，`status` 只是它的字符串版）。
+ */
+const SETTLE_CONFIRM_MS = 1_200;
+
+/** 复核后仍在变化时，最多安静重挂多少次，避免一个永远滚动的屏幕把 watcher 钉死。 */
+const MAX_QUIET_REARMS = 40;
+
 export class WatcherPool {
   readonly #deps: WatcherDeps;
   readonly #running = new Map<string, AbortController>();
   readonly #inflight = new Set<Promise<void>>();
   /** session → 这一轮"冷启动止损"的挂载时间和已经重挂过几次。 */
   readonly #early = new Map<string, { mountedAt: number; attempts: number }>();
+  /** session → 复核发现"还在动"而安静重挂过几次。见 SETTLE_CONFIRM_MS。 */
+  readonly #quiet = new Map<string, number>();
 
   constructor(deps: WatcherDeps) {
     this.#deps = deps;
@@ -111,6 +135,7 @@ export class WatcherPool {
     // 监视彻底结束，下次 watch() 应该当成全新的一轮冷启动止损来算，不能继承
     // 上一轮的挂载时间/次数。
     this.#early.delete(session);
+    this.#quiet.delete(session);
     const ctrl = this.#running.get(session);
     if (!ctrl) return;
     ctrl.abort();
@@ -121,6 +146,7 @@ export class WatcherPool {
     for (const ctrl of this.#running.values()) ctrl.abort();
     this.#running.clear();
     this.#early.clear();
+    this.#quiet.clear();
   }
 
   /** 等所有在跑的 watcher 回调走完 —— 测试用，让断言不和 fire-and-forget 抢跑。 */
@@ -191,6 +217,27 @@ export class WatcherPool {
         return;
       }
 
+      // 复核：隔一会儿再看一眼。两屏不一样 = agent 还在产出，settle 是误判，
+      // 安静重挂，不打扰 boss。见 SETTLE_CONFIRM_MS。
+      const confirmMs = this.#deps.settleConfirmMs ?? SETTLE_CONFIRM_MS;
+      const quiet = this.#quiet.get(session) ?? 0;
+      // confirmMs 为 0 时整段跳过（含那次复核 peek）—— 测试注入 0 就是要"不复核"，
+      // 多打一次 peek 会让所有按调用序列断言的用例错位。
+      if (confirmMs > 0 && screen !== null && quiet < MAX_QUIET_REARMS) {
+        await this.#sleep(confirmMs, ctrl.signal);
+        if (ctrl.signal.aborted) return;
+        const again = await this.#deps.asd.peek(session);
+        if (ctrl.signal.aborted) return;
+        if (again !== null && again !== screen) {
+          this.#quiet.set(session, quiet + 1);
+          // #finish 和 watch() 之间没有 await，外部观察不到"没在挂"的空档。
+          this.#finish(session, ctrl);
+          this.watch(session);
+          return;
+        }
+      }
+      this.#quiet.delete(session);
+
       this.#finish(session, ctrl);
       // "历时"从这一轮冷启动止损最初挂载的时刻算起（如果有过重挂），而不是
       // 从这次侥幸成功的重挂算起 —— 不然 boss 看到的耗时会比实际短一大截。
@@ -198,6 +245,19 @@ export class WatcherPool {
       this.#early.delete(session);
       // 这里**没有** onGone —— settle 只是"安静下来了"，session 还活着。
       // 见 WatcherDeps.onGone 的注释。
+      // 静止的这一屏是"等决策"还是"干完了"？对 boss 来说是两个完全不同的动作：
+      // 前者必须有人按键，不处理就永远卡着；后者是去读结果。
+      const dialog = detectDialog(screen);
+      if (dialog !== undefined) {
+        this.#notify(
+          `[pi-asd] ⚠️ agent "${session}" 需要用户决策（已等待 ${took}）。\n` +
+            `${dialog.summary}\n` +
+            `用 asd_nav("${session}", [...]) 按键作答；` +
+            `作答之后 watcher 会自动重挂，不用重新 spawn。\n` +
+            `--- 当前屏幕 ---\n${screen ?? ""}`,
+        );
+        return;
+      }
       this.#notify(
         `[pi-asd] agent "${session}" 已停下（历时 ${took}）。\n` +
           `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,

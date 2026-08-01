@@ -41,6 +41,7 @@ function harness(
     pausePeek?: boolean;
     instantFollow?: FollowOutcome;
     earlyRetryDelayMs?: number;
+    settleConfirmMs?: number;
   } = {},
 ): Harness {
   const pendingFollow = new Map<string, (out: FollowOutcome) => void>();
@@ -93,6 +94,9 @@ function harness(
     timeout: "30m",
     now: () => clock.t,
     earlyRetryDelayMs: o.earlyRetryDelayMs ?? 0,
+    // 默认不复核：这一组用例大多按 follow/peek 的调用序列断言，多一次复核 peek
+    // 会全部错位。复核逻辑本身有自己的一组用例，见文件末尾「复核」那一节。
+    settleConfirmMs: o.settleConfirmMs ?? 0,
     onGone: (s) => goneCalls.push(s),
   });
 
@@ -572,4 +576,110 @@ test("watcher 出错时不触发 onGone —— 不知道 session 状态就不要
 
   assert.deepEqual(h.goneCalls, [], "peek 失败只说明我们不知道状态，不能当成 session 没了");
   assert.match(h.notes[0]!, /出错/);
+});
+
+// --- 复核：把「思考中」和「真停下」分开 ---
+//
+// `asd follow` 的 settle 只代表"终端安静了约 2 秒"，分不出在思考还是干完了。
+// 但屏幕能分：还在干活的 agent 会持续重绘（转圈、逐字输出），静止的不会。
+// 所以 settle 之后隔一会儿再看一眼，两屏不一样就说明它还在动 —— 安静重挂，
+// 不打扰 boss。这是目前唯一能把两者分开的判据（asd 自己给不出）。
+
+/** 每次 peek 依次吐出预设的屏幕，用完之后一直吐最后一屏。 */
+function screenSeq(screens: string[]) {
+  let i = 0;
+  return () => screens[Math.min(i++, screens.length - 1)]!;
+}
+
+function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
+  const next = screenSeq(o.screens);
+  const notes: string[] = [];
+  const followCalls: string[] = [];
+  const asd = {
+    async create() {
+      throw new Error("用不到");
+    },
+    async list(): Promise<SessionInfo[]> {
+      return [];
+    },
+    async cards() {
+      return [];
+    },
+    async peek() {
+      return next();
+    },
+    async send() {
+      return true;
+    },
+    async sendText() {
+      return true;
+    },
+    async key() {
+      return true;
+    },
+    async follow(name: string): Promise<FollowOutcome> {
+      followCalls.push(name);
+      return { kind: "settled", text: "" };
+    },
+    async kill() {
+      return true;
+    },
+  } satisfies Asd;
+  const pool = new WatcherPool({
+    asd,
+    notify: (t) => notes.push(t),
+    timeout: "30m",
+    now: () => 0,
+    earlyRetryDelayMs: 0,
+    settleConfirmMs: 1, // 真的复核，但不用真等
+  });
+  return { pool, notes, followCalls };
+}
+
+test("回归：复核时屏幕还在变 → 判定为还在干活，安静重挂，不通知", async () => {
+  // 三次 peek 各不相同 = 一直在重绘；第 4 次起稳定
+  const h = confirmHarness({ screens: ["帧1", "帧2", "帧3", "稳定", "稳定", "稳定"] });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.ok(h.followCalls.length >= 2, "屏幕在变就该重挂，而不是报停下");
+  assert.equal(h.notes.length, 1, "只有稳定下来那一次才通知");
+  assert.match(h.notes[0]!, /已停下/);
+});
+
+test("屏幕静止 → 照常报「已停下」", async () => {
+  const h = confirmHarness({ screens: ["一动不动"] });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0]!, /已停下/);
+  assert.doesNotMatch(h.notes[0]!, /需要用户决策/);
+});
+
+/**
+ * 静止的这一屏是"等决策"还是"干完了"，对 boss 是两个完全不同的动作：
+ * 前者必须有人按键、不处理就永远卡着；后者是去读结果。
+ */
+test("静止且是对话框 → 报「需要用户决策」，带上摘要和下一步怎么做", async () => {
+  const dialog = " ❯ 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm · Esc to cancel";
+  const h = confirmHarness({ screens: [dialog] });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.equal(h.notes.length, 1);
+  const n = h.notes[0]!;
+  assert.match(n, /需要用户决策/);
+  assert.match(n, /选项：/);
+  assert.match(n, /当前选中：/);
+  assert.match(n, /asd_nav/, "要告诉 boss 用什么工具作答");
+  assert.match(n, /自动重挂/, "要说明作答后不用重新 spawn");
+  assert.doesNotMatch(n, /已停下/, "别再说成「已停下」——那会把 boss 引去读结果");
+});
+
+test("复核期间被 stop 掉：不通知、也不再重挂", async () => {
+  const h = confirmHarness({ screens: ["帧1", "帧2", "帧3"] });
+  h.pool.watch("pi-a");
+  h.pool.stopAll();
+  await h.pool.idle();
+  assert.deepEqual(h.notes, []);
 });
