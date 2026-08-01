@@ -26,6 +26,17 @@ export interface AgentRecord {
    * 字段才是用户手建 session 和"pi-asd 能不能动它"之间唯一的拦截。
    */
   createdByUs: boolean;
+  /**
+   * 长期员工：**不参与空闲自动回收**。缺省（undefined）按 false 处理。
+   *
+   * 和 `createdByUs` 是两回事，回收时两个都要看：
+   *   - `createdByUs` 管**能不能** kill —— 不是自己创建的，任何情况都不许动
+   *   - `persistent`  管**要不要** kill —— 是自己创建的，但这个是长期岗位，别收
+   *
+   * 只影响 Reaper 那条自动路径。`asd_kill` 是 boss 显式点名结束，不受它影响 ——
+   * 否则一个设了 persistent 的 agent 就再也关不掉了。
+   */
+  persistent?: boolean;
 }
 
 export interface ReuseQuery {
@@ -81,16 +92,23 @@ export class Registry {
     return this.#records.size;
   }
 
-  /** 加前缀 + 洗名，不做避重 —— 复用时拿它算"该找哪个 session"。 */
-  candidateName(name: string): string {
-    return sanitizeName(`${this.#prefix}${name}`);
+  /**
+   * 加前缀 + 洗名，不做避重 —— 复用时拿它算"该找哪个 session"。
+   *
+   * `prefix` 显式给了就用它，**空串就是"不加前缀"**（不是"没给"）。这里和
+   * `parseBossDefault`/`parseDuration` 那套"空串当没设置"的规则**故意相反**：
+   * 那些读的是环境变量/配置，空串多半是 `.env` 空行之类的意外；这个是调用方在
+   * 一次 spawn 里显式传的参数，写 `""` 就是真的要一个光名字。
+   */
+  candidateName(name: string, prefix?: string): string {
+    return sanitizeName(`${prefix ?? this.#prefix}${name}`);
   }
 
-  /** 加前缀 + 洗名 + 避开 `taken`（应当是 `asd list` 里的全部名字）。 */
-  allocateName(name: string | undefined, taken: ReadonlySet<string>): string {
+  /** 加前缀 + 洗名 + 避开 `taken`（应当是 `asd list` 里的全部名字）。前缀语义同上。 */
+  allocateName(name: string | undefined, taken: ReadonlySet<string>, prefix?: string): string {
     this.#seq += 1;
     const raw = name ?? `agent${this.#seq}`;
-    return uniqueName(sanitizeName(`${this.#prefix}${raw}`), taken);
+    return uniqueName(sanitizeName(`${prefix ?? this.#prefix}${raw}`), taken);
   }
 
   add(rec: AgentRecord): void {

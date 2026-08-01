@@ -462,6 +462,20 @@ export interface SpawnParams {
   agent?: string;
   watch?: boolean;
   reuse?: boolean;
+  /**
+   * 覆盖这一次的 session 名前缀。**传 `""` 就是不加前缀**。
+   *
+   * 不给就用全局配置的（`PI_ASD_PREFIX` / `prefix`，默认 `pi-`）。前缀纯粹是命名
+   * 约定，没有任何安全判断依赖它 —— "能不能 kill / 能不能自动复用"看的是台账里的
+   * `createdByUs`，不是名字长什么样。
+   */
+  prefix?: string;
+  /**
+   * 长期员工：不被空闲回收器超时收掉。默认 false。
+   *
+   * 适合"长期负责某个项目"的 agent。注意它只挡自动回收，`asd_kill` 照样能结束它。
+   */
+  persistent?: boolean;
 }
 
 export interface Tools {
@@ -763,7 +777,7 @@ export function createTools(deps: ToolDeps): Tools {
 
           const target = registry.pickReusable(
             {
-              name: p.name === undefined ? undefined : registry.candidateName(p.name),
+              name: p.name === undefined ? undefined : registry.candidateName(p.name, p.prefix),
               agent,
               cwd: explicitCwd,
             },
@@ -793,7 +807,7 @@ export function createTools(deps: ToolDeps): Tools {
         // 并发的另一个 spawn 可能已经预留了一个候选名字 —— 并进 taken，逼
         // allocateName 避开它，不然两边会算出同一个名字、第二次 asd new 被拒。
         const taken = new Set([...liveMap.keys(), ...reserved]);
-        const name = registry.allocateName(p.name, taken);
+        const name = registry.allocateName(p.name, taken, p.prefix);
         hold(name);
         // 没显式给 cwd 就给它一个自己的工作区。asd new 对不存在的目录直接失败，
         // 所以必须先建出来。显式给的路径不替他建 —— 打错了应当大声失败。
@@ -837,6 +851,7 @@ export function createTools(deps: ToolDeps): Tools {
           agent,
           createdAt: now(),
           createdByUs: true,
+          persistent: p.persistent === true,
         });
         const watching = rewatch(session, wantWatch);
         return {
@@ -865,7 +880,10 @@ export function createTools(deps: ToolDeps): Tools {
         // 漂移的影子状态（watcher 自然超时收尾不会回写台账，之前就是这么
         // 撒谎的：早就没人在等了，这里还在说"watcher 已挂"）。
         const w = watchers.isWatching(r.session) ? " watcher" : "";
-        return `${r.session} [${state}${w}] (${r.agent}, ${r.cwd}): ${preview(r.task)}`;
+        // 标出长期员工：boss 需要知道谁不会被空闲回收掉，否则会对"这个怎么一直在"
+        // 产生误解，或者反过来以为某个临时 agent 能一直留着。
+        const p = r.persistent === true ? " persistent" : "";
+        return `${r.session} [${state}${w}${p}] (${r.agent}, ${r.cwd}): ${preview(r.task)}`;
       });
       const goneLine =
         gone.length > 0 ? `\n已结束：${gone.map((g) => g.session).join(" / ")}` : "";

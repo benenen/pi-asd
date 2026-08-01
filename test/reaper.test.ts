@@ -236,3 +236,58 @@ test("start 挂上的定时器不会把进程吊着不退出", () => {
   reaper.stop();
   reaper.stop(); // 重复 stop 也要安全
 });
+
+// --- persistent：长期员工不参与自动回收 ---
+//
+// 和 createdByUs 是**两条不同的判断**，回收时两个都要看：
+//   createdByUs 管「能不能」kill —— 不是自己创建的，任何情况都不许动
+//   persistent  管「要不要」kill —— 是自己创建的，但这是长期岗位，别收
+
+test("persistent 的自家 session 闲多久都不回收", () => {
+  const r = new Registry("pi-");
+  r.add({
+    session: "nvr",
+    task: "长期负责 NVR",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+    persistent: true,
+  });
+  assert.deepEqual(sessionsToReap(r, { live: [info("nvr", 999_999_999)], idleKillMs: 120_000 }), []);
+});
+
+test("同一批里 persistent 的留下、非 persistent 的照收", () => {
+  const r = new Registry("pi-");
+  for (const [session, persistent] of [
+    ["nvr", true],
+    ["tmp", false],
+  ] as const) {
+    r.add({ session, task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true, persistent });
+  }
+  assert.deepEqual(
+    sessionsToReap(r, { live: [info("nvr", 900_000), info("tmp", 900_000)], idleKillMs: 120_000 }),
+    ["tmp"],
+  );
+});
+
+test("persistent 缺省（undefined）按 false 处理 —— 老记录不会突然变成不可回收", () => {
+  const r = ledger([{ session: "pi-a", createdByUs: true }]); // 不带 persistent 字段
+  assert.deepEqual(sessionsToReap(r, { live: [info("pi-a", 900_000)], idleKillMs: 120_000 }), ["pi-a"]);
+});
+
+/**
+ * persistent 只挡自动回收这一条路。asd_kill 是 boss 显式点名结束，不受它影响 ——
+ * 否则一个设了 persistent 的 agent 就再也关不掉了。
+ */
+test("persistent 不影响 canKill —— 显式 kill 照样能结束它", () => {
+  const r = new Registry("pi-");
+  r.add({ session: "nvr", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true, persistent: true });
+  assert.equal(r.canKill("nvr").ok, true, "显式 kill 不该被 persistent 挡住");
+});
+
+test("persistent 但不是自己创建的 —— 仍然不回收（两道判断都要过）", () => {
+  const r = new Registry("pi-");
+  r.add({ session: "mem", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: false, persistent: true });
+  assert.deepEqual(sessionsToReap(r, { live: [info("mem", 900_000)], idleKillMs: 120_000 }), []);
+});

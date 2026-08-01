@@ -1628,3 +1628,59 @@ test("nav 拒绝台账外的 session —— 和 steer / peek 同一道闸门", a
   assert.match(r.text, /不是本次 spawn 出来的/);
   assert.equal(h.calls.length, 0);
 });
+
+// --- prefix 覆盖 & persistent ---
+
+test("spawn 传 prefix:\"\" 就不加前缀 —— 想要 nvr 而不是 pi-nvr", async () => {
+  const h = harness();
+  const r = await h.tools.spawn({ task: "t", name: "nvr", prefix: "" });
+  assert.equal(r.isError, undefined, r.text);
+  assert.deepEqual(h.registry.names(), ["nvr"]);
+  h.watchers.stopAll();
+});
+
+test("spawn 传自定义 prefix 就用它", async () => {
+  const h = harness();
+  await h.tools.spawn({ task: "t", name: "nvr", prefix: "ops-" });
+  assert.deepEqual(h.registry.names(), ["ops-nvr"]);
+  h.watchers.stopAll();
+});
+
+/**
+ * 这里的空串语义和 parseBossDefault / parseDuration **故意相反**：那些读的是
+ * 环境变量/配置，空串多半是 .env 空行之类的意外；这个是调用方在一次 spawn 里
+ * 显式传的参数，写 "" 就是真的要一个光名字。
+ */
+test("不传 prefix 时仍然用全局前缀 —— 空串和「没传」不是一回事", async () => {
+  const h = harness();
+  await h.tools.spawn({ task: "t", name: "nvr" });
+  assert.deepEqual(h.registry.names(), ["pi-nvr"], "没传就该带上默认的 pi-");
+  h.watchers.stopAll();
+});
+
+test("spawn 的 persistent 会记进台账，默认 false", async () => {
+  const h1 = harness();
+  await h1.tools.spawn({ task: "t", name: "nvr", persistent: true });
+  assert.equal(h1.registry.get("pi-nvr")?.persistent, true);
+  h1.watchers.stopAll();
+
+  const h2 = harness();
+  await h2.tools.spawn({ task: "t", name: "tmp" });
+  assert.equal(h2.registry.get("pi-tmp")?.persistent, false, "不传就是普通员工");
+  h2.watchers.stopAll();
+});
+
+test("agents 列表标出 persistent —— boss 要知道谁不会被回收", async () => {
+  const h = harness({ live: [info("pi-nvr", { idle_ms: 60_000 })] });
+  h.registry.add({
+    session: "pi-nvr",
+    task: "长期负责 NVR",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+    persistent: true,
+  });
+  const r = await h.tools.agents();
+  assert.match(r.text, /persistent/);
+});

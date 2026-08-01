@@ -365,6 +365,18 @@ export default function (pi: ExtensionAPI): void {
       ),
       watch: Type.Optional(Type.Boolean({ description: "是否挂后台 watcher，默认 true" })),
       reuse: Type.Optional(Type.Boolean({ description: "是否复用空闲 agent，默认 true" })),
+      persistent: Type.Optional(
+        Type.Boolean({
+          description:
+            "长期员工：不被空闲回收器超时收掉（默认 false）。适合长期负责一个项目的 agent。asd_kill 仍然能结束它。",
+        }),
+      ),
+      prefix: Type.Optional(
+        Type.String({
+          description:
+            '覆盖 session 名前缀。传空串 "" 就不加前缀（比如想要 "nvr" 而不是 "pi-nvr"）。不给则用全局配置。',
+        }),
+      ),
       session: Type.Optional(
         Type.String({
           description:

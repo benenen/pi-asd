@@ -61,7 +61,8 @@ export interface ReapQuery {
  * 1. 在台账里、且 `createdByUs === true` —— 和 `asd_kill` 同一条硬不变量：
  *    用户手建的、以及指名交过任务的 session 永远不能被 pi-asd 结束。
  * 2. `idle_ms >= idleKillMs` —— 见文件头，这是唯一可靠的空闲信号。
- * 3. 不是 boss 自己。
+ * 3. 不是长期员工（`persistent`）—— 那是"要不要收"，和上面"能不能收"是两回事。
+ * 4. 不是 boss 自己。
  */
 export function sessionsToReap(registry: Registry, q: ReapQuery): string[] {
   const out: string[] = [];
@@ -70,6 +71,9 @@ export function sessionsToReap(registry: Registry, q: ReapQuery): string[] {
     const rec = registry.get(info.session);
     // createdByUs 这道闸门和 Registry.canKill 是同一条：不是自己创建的绝不动。
     if (rec === undefined || rec.createdByUs !== true) continue;
+    // 长期员工不参与自动回收。这两条是**不同**的判断：createdByUs 管"能不能"，
+    // persistent 管"要不要"。见 AgentRecord.persistent。
+    if (rec.persistent === true) continue;
     if (info.idle_ms < q.idleKillMs) continue;
     out.push(info.session);
   }

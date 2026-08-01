@@ -65,6 +65,43 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
    session**：自动挑中你正在用的工作会话是不能接受的默认行为。
 3. **新建** —— 前两条都没命中才建新 session。
 
+### session 名前缀
+
+新建的 session 默认叫 `<prefix><名字>`（前缀默认 `pi-`）。不想要前缀就在这一次
+spawn 里传空串：
+
+```
+asd_spawn(task: "…", name: "nvr", prefix: "")   → session 名就是 nvr
+asd_spawn(task: "…", name: "nvr")               → pi-nvr
+```
+
+> 这里空串 = "不加前缀"，和 `PI_ASD_BOSS=` 那种"空串当没设置"的规则**故意相反**：
+> 那是读环境变量，空串多半是意外；这个是一次调用里显式传的参数，写 `""` 就是真要。
+
+前缀纯粹是命名约定，**没有任何安全判断依赖它** —— 能不能 kill、能不能自动复用，
+看的都是台账里的 `createdByUs`，不是名字长什么样。
+
+已经建出来的 session 想改名：`asd ui` 里选中它按 `r`（pi-asd 这边没有改名工具，
+原因见下）。
+
+### 长期员工：persistent
+
+默认所有 agent 都参与空闲回收。长期负责某个项目的 agent 可以标成长期员工：
+
+```
+asd_spawn(task: "…", name: "nvr", prefix: "", persistent: true)
+```
+
+`persistent` 和 `createdByUs` 是**两条不同的判断**，回收时两个都要过：
+
+| | 管什么 | 不过关会怎样 |
+|---|---|---|
+| `createdByUs` | **能不能** kill | 不是自己创建的，任何情况都不许动 |
+| `persistent` | **要不要** kill | 是自己创建的，但这是长期岗位，别收 |
+
+`persistent` **只挡自动回收**。`asd_kill` 是显式点名结束，不受它影响 —— 否则设了
+persistent 的 agent 就再也关不掉了。`asd_agents` 会把长期员工标出来。
+
 ### 投递校验
 
 三条路都会在送出任务之后 **peek 一屏确认它真的进了 agent 的输入框**，没进就如实
@@ -309,8 +346,9 @@ asd_spawn(task: "修 auth 的 bug", cwd: "/path/to/repo")
 ### 空闲回收
 
 agent 干完活之后**空闲超过 `PI_ASD_IDLE_KILL`（默认 2 分钟）会被自动 kill**，
-免得 session 无限堆积。只回收本扩展自己创建的（`createdByUs: true`）——
-指名交过任务的用户 session 和你手建的都不碰，和 `asd_kill` 是同一条闸门。
+免得 session 无限堆积。两道判断都要过才收：`createdByUs: true`（是自己创建的）
+且 `persistent` 不为 true（不是长期员工）。指名交过任务的用户 session 和你手建的
+都不碰，和 `asd_kill` 是同一条闸门。
 
 判据是 asd 的 `idle_ms`（距上次终端活动的时长）。`asd send` 会让它归零，所以
 被 `asd_steer` 追加过任务、或者被复用过的 agent 会自动重新计时，不会被误收。

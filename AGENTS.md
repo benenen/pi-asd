@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，242 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，252 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -91,6 +91,20 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 
 自动复用**永远不碰台账外的 session**；台账外的只能由主 agent 看过 `asd_candidates` 之后
 指名交给它。
+
+**`persistent` 是另一条正交的判断，别和 `createdByUs` 混起来。** 空闲回收要两条都过：
+
+| | 管什么 |
+|---|---|
+| `createdByUs` | **能不能** kill —— 不是自己创建的，任何情况都不许动 |
+| `persistent` | **要不要** kill —— 是自己创建的，但这是长期岗位，别收 |
+
+`persistent` 只挡 `Reaper` 那条自动路径，**不影响 `canKill`** —— 否则设了 persistent
+的 agent 就再也关不掉了。缺省（undefined）按 false 处理，老记录不会突然变成不可回收。
+
+session 名前缀纯属命名约定，**没有任何安全判断依赖它**。`SpawnParams.prefix` 可以按次
+覆盖，传 `""` 就是不加前缀 —— 注意这里空串是"真的要空"，和读环境变量时"空串当没设置"
+那条规则故意相反（那是防 `.env` 空行，这是调用方显式传参）。
 
 术语：用户可见的文案一律说**「自己创建的」/「不是自己创建的」**（对应 `createdByUs`），
 动作说**「指名交给」**。不要用「收养」——中文里那是收养孩子的意思，和这里的动作对不上。
