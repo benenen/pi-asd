@@ -23,6 +23,7 @@ import {
   type Tools,
 } from "../extensions/asd/tools.ts";
 import { resolveWorkspaceBase } from "../extensions/asd/config.ts";
+import { sessionsToReap } from "../extensions/asd/reaper.ts";
 
 interface Harness {
   tools: Tools;
@@ -1683,4 +1684,130 @@ test("agents 列表标出 persistent —— boss 要知道谁不会被回收", a
   });
   const r = await h.tools.agents();
   assert.match(r.text, /persistent/);
+});
+
+// --- asd_unadopt：解除追踪，但不结束 session ---
+//
+// 和 kill 的分界：
+//   kill    结束进程。只能结束 pi-asd 自己创建的。
+//   unadopt 进程照跑，只是 pi-asd 不再追踪 —— 不挂 watcher、不进 asd_agents、
+//           Reaper 也不再考虑它（那两处都读台账，摘掉即生效）。
+
+function adoptedHarness() {
+  const h = harness({
+    live: [info("mem", { command: "claude", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+  });
+  return h;
+}
+
+test("unadopt 摘掉台账记录，但一次 asd kill 都不发生", async () => {
+  const h = adoptedHarness();
+  await h.tools.spawn({ task: "查一下", session: "mem", watch: false });
+  assert.ok(h.registry.get("mem") !== undefined, "先确认收养成功");
+
+  const before = h.calls.length;
+  const r = await h.tools.unadopt({ session: "mem" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(h.registry.get("mem"), undefined, "台账里应当没有了");
+  assert.ok(!subcommands(h).slice(before).includes("kill"), "绝不能 kill —— 那是另一个工具");
+  assert.match(r.text, /没有被结束|还在跑/);
+});
+
+test("unadopt 之后 asd_agents 不再列出它", async () => {
+  const h = adoptedHarness();
+  await h.tools.spawn({ task: "查一下", session: "mem", watch: false });
+  const listed = await h.tools.agents();
+  assert.match(listed.text, /mem/, "解除之前应当列出来");
+
+  await h.tools.unadopt({ session: "mem" });
+  const after = await h.tools.agents();
+  assert.doesNotMatch(after.text, /mem/);
+});
+
+test("unadopt 会停掉挂着的 watcher", async () => {
+  const h = adoptedHarness();
+  await h.tools.spawn({ task: "查一下", session: "mem" }); // watch 默认 true
+  assert.equal(h.watchers.isWatching("mem"), true, "先确认 watcher 挂上了");
+
+  await h.tools.unadopt({ session: "mem" });
+  assert.equal(h.watchers.isWatching("mem"), false, "解除追踪就不该还盯着它");
+});
+
+/**
+ * Reaper 读的是台账，摘掉即生效 —— 不需要 Reaper 那边改任何代码。
+ * 这条用例把这个隐含依赖钉住，免得以后有人给 Reaper 换个数据源就悄悄破坏它。
+ */
+test("unadopt 之后 Reaper 不再回收它（哪怕闲到天荒地老）", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 900_000 })] });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  assert.deepEqual(
+    sessionsToReap(h.registry, { live: [info("pi-a", { idle_ms: 900_000 })], idleKillMs: 120_000 }),
+    ["pi-a"],
+    "解除之前是会被回收的",
+  );
+
+  await h.tools.unadopt({ session: "pi-a" });
+  assert.deepEqual(
+    sessionsToReap(h.registry, { live: [info("pi-a", { idle_ms: 900_000 })], idleKillMs: 120_000 }),
+    [],
+    "摘掉之后 Reaper 不该再动它",
+  );
+});
+
+test("unadopt 之后还能再次指名交给它 —— 重新收养", async () => {
+  const h = adoptedHarness();
+  await h.tools.spawn({ task: "第一次", session: "mem", watch: false });
+  await h.tools.unadopt({ session: "mem" });
+  assert.equal(h.registry.get("mem"), undefined);
+
+  const again = await h.tools.spawn({ task: "第二次", session: "mem", watch: false });
+  assert.equal(again.isError, undefined, again.text);
+  assert.equal(h.registry.get("mem")?.task, "第二次");
+  assert.equal(h.registry.get("mem")?.createdByUs, false);
+});
+
+test("unadopt 台账里没有的名字 → 报错并列出台账，不碰 asd", async () => {
+  const h = harness();
+  const r = await h.tools.unadopt({ session: "ghost" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /本来就不在台账里/);
+  assert.equal(h.calls.length, 0);
+});
+
+/**
+ * 对自己创建的 session 解除追踪是一扇单向门：再次收养会以 createdByUs:false 记账，
+ * 从此 asd_kill 永远拒绝它（那道闸门认的是台账里的标记，不是历史）。这个后果必须
+ * 在返回文案里说清楚，并指向更合适的工具。
+ */
+test("对自己创建的 session 解除追踪时，要警告 kill 权会永久失去", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })] });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  const r = await h.tools.unadopt({ session: "pi-a" });
+  assert.equal(r.details?.wasCreatedByUs, true);
+  assert.match(r.text, /asd_kill 永远拒绝/);
+  assert.match(r.text, /persistent/, "要指向真正合适的那个工具");
+});
+
+test("对指名交过任务的 session 解除追踪，不发那条警告 —— 它本来就不能 kill", async () => {
+  const h = adoptedHarness();
+  await h.tools.spawn({ task: "查一下", session: "mem", watch: false });
+  const r = await h.tools.unadopt({ session: "mem" });
+  assert.equal(r.details?.wasCreatedByUs, false);
+  assert.doesNotMatch(r.text, /asd_kill 永远拒绝/);
 });

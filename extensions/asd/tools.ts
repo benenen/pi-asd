@@ -486,6 +486,7 @@ export interface Tools {
   follow(p: { session: string; mode?: "settle" | "end"; timeout?: string }): Promise<ToolResult>;
   steer(p: { session: string; message: string }): Promise<ToolResult>;
   nav(p: { session: string; keys: unknown }): Promise<ToolResult>;
+  unadopt(p: { session: string }): Promise<ToolResult>;
   kill(p: { session: string }): Promise<ToolResult>;
 }
 
@@ -1062,6 +1063,50 @@ export function createTools(deps: ToolDeps): Tools {
           `${watching ? "watcher 已重挂。" : ""}\n` +
           `--- 按键之后的屏幕 ---\n${screen}`,
         details: { session: p.session, keys: sent, watching },
+      };
+    },
+
+    /**
+     * 把一个 session 从台账里摘掉 —— **只是不再管它，不结束它**。
+     *
+     * 和 `kill` 的分界：
+     *   kill    结束进程。只能结束 pi-asd 自己创建的（`createdByUs`）。
+     *   unadopt 进程照跑，只是 pi-asd 不再追踪：不挂 watcher、不出现在
+     *           asd_agents、Reaper 也不再考虑它（那两处都读台账，摘掉即生效）。
+     *
+     * 摘掉之后还能再被 `asd_spawn(task, session:)` 指名交给 —— 那会重新收养。
+     *
+     * **对自己创建的 session 摘除是一扇单向门**，所以要在结果里说清楚：再次收养
+     * 会以 `createdByUs: false` 记账，从此 `asd_kill` 永远拒绝它（那道闸门认的是
+     * 台账里的标记，不是历史）。只是不想被自动回收的话，用 `persistent` 更合适 ——
+     * 那个保留 kill 权。
+     */
+    async unadopt(p) {
+      const rec = registry.get(p.session);
+      if (rec === undefined) {
+        const known = registry.names();
+        return err(
+          `"${p.session}" 本来就不在台账里，没什么可解除的。` +
+            `当前台账：${known.length > 0 ? known.join(" / ") : "（空）"}`,
+        );
+      }
+
+      // 先停 watcher 再摘记录：反过来的话，watcher 收尾时拿不到记录，
+      // 它那条"已停下"的通知会指向一个 pi-asd 已经不认识的 session。
+      watchers.stop(p.session);
+      registry.remove(p.session);
+
+      const wasOurs = rec.createdByUs === true;
+      return {
+        text:
+          `已解除对 "${p.session}" 的追踪。**session 本身没有被结束，还在跑。**` +
+          `它不再出现在 asd_agents 里，watcher 已停，空闲回收器也不会再动它。` +
+          (wasOurs
+            ? `\n注意：这个 session 本来是 pi-asd 自己创建的。再次指名交给它会以` +
+              `"不是自己创建的"重新记账，从此 asd_kill 永远拒绝结束它 —— ` +
+              `如果只是不想被自动回收，用 asd_spawn 的 persistent 参数更合适。`
+            : ""),
+        details: { session: p.session, wasCreatedByUs: wasOurs, task: rec.task },
       };
     },
 
