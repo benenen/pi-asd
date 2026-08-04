@@ -392,7 +392,13 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "asd_agents",
     label: "List agents",
-    description: "列出本次 spawn 出来的 agent 和它们的实时状态（running / idle）。",
+    description: [
+      "列出在监视的 agent 和它们的实时状态，外加每个的屏幕最后一行当凭据。",
+      "**它回答「在不在动」，不回答「干成了没有」** —— 「安静」只表示终端没动静，",
+      "可能做完了、可能在沉默地想、也可能卡住了。",
+      "**不要因为看着安静就断定失败去重发任务。** 要判断结果用 asd_peek 看屏幕。",
+      "卡在对话框上的会被标出来，那种用 asd_nav 作答，重发没用。",
+    ].join("\n"),
     parameters: Type.Object({}),
     async execute() {
       return toolResult(await tools.agents());

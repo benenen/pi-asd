@@ -8,7 +8,28 @@
 import path from "node:path";
 import type { Asd, SessionInfo } from "./cli.ts";
 import type { Registry } from "./registry.ts";
+import { detectDialog } from "./dialog.ts";
 import { formatDuration, type WatcherPool } from "./watcher.ts";
+
+/**
+ * 屏幕上最后一行有内容的文字，用作"它最后在干什么"的凭据。
+ *
+ * 跳过纯装饰行和状态栏 —— agent 的 TUI 底部常年挂着 token 计数、模型名之类，
+ * 那些每一屏都一样，当凭据没有任何信息量。
+ */
+const STATUS_BAR = /^\s*[\d.]+%\/|tokens?|ctx used|bypass permissions|shift\+tab/i;
+const DECOR_ONLY = /^[\s─━=—\-_·☐☑✓╭╰│┌└├┤┬┴┼>❯»]*$/;
+
+export function lastMeaningfulLine(screen: string | null, max = 100): string | undefined {
+  if (screen === null) return undefined;
+  const lines = screen.split("\n").map((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i]!;
+    if (l.length === 0 || DECOR_ONLY.test(l) || STATUS_BAR.test(l)) continue;
+    return l.length <= max ? l : `${l.slice(0, max)}…`;
+  }
+  return undefined;
+}
 
 /**
  * 一个 session 至少要**连续安静**这么久，才当它是"停下来等输入"而不是"正在干活"。
@@ -866,17 +887,40 @@ export function createTools(deps: ToolDeps): Tools {
       }
     },
 
+    /**
+     * 列出在监视的 agent 和它们的实时状态。
+     *
+     * **这个工具回答"它在不在动"，不回答"它干成了没有"。** 后者它拿不到 ——
+     * asd 只看得见终端字节。以前每行只有一个 `idle 3m`，boss 会把"安静"读成
+     * "完成"，判断不了成败就反复重发任务。所以这里做三件事：
+     *
+     * 1. 用"安静 3m"而不是"idle" —— 后者带"闲着=没事干=做完了"的暗示
+     * 2. 顺手 peek 一屏，给出**最后一行有内容的输出**当凭据，并认出卡在对话框上的
+     * 3. 底下明写"这不是成败信号，别据此重发任务"，并指出该走哪一步
+     */
     async agents() {
-      if (registry.size === 0) return { text: "没有 spawn 出来的 agent。", details: { count: 0 } };
+      if (registry.size === 0) return { text: "没有在监视的 agent。", details: { count: 0 } };
 
       const live = await asd.list();
       const liveMap = new Map(live.map((s) => [s.session, s]));
       const gone = registry.reconcile(new Set(liveMap.keys()));
       for (const g of gone) watchers.stop(g.session);
 
-      const lines = registry.list().map((r) => {
+      const records = registry.list();
+      // 并行 peek。数量由台账规模决定（本来就不该多），本地调用很快。
+      // 单个失败退回 null，不让一次 peek 出错搞掉整张表。
+      const screens = await Promise.all(
+        records.map((r) => asd.peek(r.session).catch(() => null)),
+      );
+      let blocked = 0;
+
+      const lines = records.map((r, i) => {
         const info = liveMap.get(r.session)!;
-        const state = info.running ? "running" : `idle ${formatDuration(info.idle_ms)}`;
+        const screen = screens[i] ?? null;
+        const dialog = detectDialog(screen);
+        if (dialog !== undefined) blocked += 1;
+        // "安静"而不是"idle"：idle 读起来像"闲着 = 做完了"，而它只是终端没动静。
+        const state = info.running ? "在动" : `安静 ${formatDuration(info.idle_ms)}`;
         // 台账里不记 watching —— WatcherPool 才是唯一真相，读它，不读一份会
         // 漂移的影子状态（watcher 自然超时收尾不会回写台账，之前就是这么
         // 撒谎的：早就没人在等了，这里还在说"watcher 已挂"）。
@@ -884,14 +928,33 @@ export function createTools(deps: ToolDeps): Tools {
         // 标出长期员工：boss 需要知道谁不会被空闲回收掉，否则会对"这个怎么一直在"
         // 产生误解，或者反过来以为某个临时 agent 能一直留着。
         const p = r.persistent === true ? " persistent" : "";
-        return `${r.session} [${state}${w}${p}] (${r.agent}, ${r.cwd}): ${preview(r.task)}`;
+        const head = `${r.session} [${state}${w}${p}] (${r.agent}, ${r.cwd}): ${preview(r.task)}`;
+
+        if (dialog !== undefined) {
+          return (
+            `${head}\n  ⚠️ 卡在对话框上等人作答（**不是失败，重发任务没用**）：` +
+            `${dialog.options.join(" | ")}\n     用 asd_nav("${r.session}", [...]) 作答`
+          );
+        }
+        const last = lastMeaningfulLine(screen);
+        return last === undefined ? head : `${head}\n  屏幕最后一行：${last}`;
       });
       const goneLine =
         gone.length > 0 ? `\n已结束：${gone.map((g) => g.session).join(" / ")}` : "";
+      const caveat =
+        lines.length > 0
+          ? `\n\n（"安静"只表示终端没动静，**不代表任务做成了** —— 也可能它在沉默地想。` +
+            `要判断结果就 asd_peek 看屏幕、或 asd_follow 等它真停下。` +
+            `**不要因为看着安静就重发任务。**` +
+            (blocked > 0
+              ? `当前有 ${blocked} 个卡在对话框上，那种要用 asd_nav 作答，重发没用。`
+              : "") +
+            `）`
+          : "";
 
       return {
-        text: (lines.length > 0 ? lines.join("\n") : "没有存活的 agent。") + goneLine,
-        details: { count: lines.length, ended: gone.map((g) => g.session) },
+        text: (lines.length > 0 ? lines.join("\n") : "没有存活的 agent。") + goneLine + caveat,
+        details: { count: lines.length, blocked, ended: gone.map((g) => g.session) },
       };
     },
 

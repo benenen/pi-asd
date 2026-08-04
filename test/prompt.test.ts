@@ -188,3 +188,30 @@ test("默认 agent 换一个，提示词跟着换", () => {
   assert.match(p, /默认用 codex/);
   assert.doesNotMatch(p, /默认用 pi/);
 });
+
+/**
+ * 用户实测：boss 看到 asd_agents 里的「安静」就判断不了成败，于是**反复重发任务**。
+ * 光让工具输出变准还不够 —— 提示词里必须直说"别据此重发"，并指出真凭据在哪。
+ */
+test("提示词明说 asd_agents 判断不了成败、不许据此重发任务", () => {
+  const p = bossModePrompt({
+    enabled: true,
+    defaultAgent: "pi",
+    agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
+  });
+  assert.match(p, /在不在动.*不是.*干成了没有/s, "要把这个工具的能力边界说清");
+  assert.match(p, /绝不要因为它看着[\s\S]*安静就断定失败/, "点名这个具体误判");
+  assert.match(p, /重发/, "要提到重发这个具体后果");
+  assert.match(p, /asd_peek/, "要指出真凭据在哪");
+});
+
+test("提示词说明「卡在对话框」不是失败、重发无用", () => {
+  const p = bossModePrompt({
+    enabled: true,
+    defaultAgent: "pi",
+    agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
+  });
+  assert.match(p, /卡在对话框/);
+  assert.match(p, /asd_nav/);
+  assert.match(p, /不是失败/);
+});

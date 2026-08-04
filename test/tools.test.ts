@@ -88,6 +88,8 @@ function harness(
     startupScreens?: string[];
     /** 屏幕永远停在信任对话框上 —— 模拟"送了键也过不去"。 */
     stuckOnDialog?: boolean;
+    /** peek 直接抛错 —— 验证单个失败不会搞掉整张表。 */
+    peekThrows?: boolean;
     /** 透传给子 agent 的环境变量。 */
     spawnEnv?: Record<string, string>;
     /** 覆盖预设表（测别名映射用）。 */
@@ -114,7 +116,8 @@ function harness(
         // 避重/改写），回显一个跟请求不同的名字。
         return ok(`${o.newEchoes ?? args[1]}\n`);
       case "peek": {
-        if (o.stuckOnDialog) return ok("❯ 1. Yes, I trust this folder\n  2. No, exit");
+        if (o.peekThrows) throw new Error("peek 炸了");
+        if (o.stuckOnDialog) return ok("❯ 1. Yes, I trust this folder\n  2. No, exit\n Enter to confirm");
         const startup = o.startupScreens ?? [];
         if (peeks < startup.length) return ok(startup[peeks++]!);
         peeks += 1;
@@ -483,7 +486,9 @@ test("agents 列出存活的并摘掉已经没了的", async () => {
   }
   const r = await h.tools.agents();
   assert.match(r.text, /pi-a/);
-  assert.match(r.text, /running/);
+  // 状态词从 running/idle 改成了 在动/安静：idle 读起来像"闲着=做完了"，
+  // 而它只是终端没动静 —— boss 据此断定成败正是"无限重发任务"的来源。
+  assert.match(r.text, /在动/);
   assert.match(r.text, /已结束.*pi-b/s);
   assert.deepEqual(h.registry.names(), ["pi-a"]);
 });
@@ -1810,4 +1815,58 @@ test("对指名交过任务的 session 停止监视，不发那条警告 —— 
   const r = await h.tools.unmonitor({ session: "mem" });
   assert.equal(r.details?.wasCreatedByUs, false);
   assert.doesNotMatch(r.text, /asd_kill 永远拒绝/);
+});
+
+
+// --- agents 不能让人误以为它能判断成败 ---
+//
+// 用户实测：boss 看到 `idle 3m` 就当作"做完了/失败了"，判断不了就**反复重发任务**。
+// 根子是这个工具只有终端活动元数据，却用 `idle` 这个词暗示了完成度。
+
+test("状态词用「安静」而不是「idle」—— 后者暗示「闲着=做完了」", async () => {
+  const h = harness({ live: [info("pi-a", { running: false, idle_ms: 180_000 })] });
+  h.registry.add({ session: "pi-a", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true });
+  const r = await h.tools.agents();
+  assert.match(r.text, /安静 3m/);
+  assert.doesNotMatch(r.text, /\bidle\b/);
+});
+
+test("每个 agent 带上屏幕最后一行当凭据 —— 那才是「它到底干了什么」", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })] });
+  h.registry.add({ session: "pi-a", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true });
+  const r = await h.tools.agents();
+  assert.match(r.text, /屏幕最后一行/);
+});
+
+test("明说「安静不代表做成了、别据此重发任务」", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })] });
+  h.registry.add({ session: "pi-a", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true });
+  const r = await h.tools.agents();
+  assert.match(r.text, /不代表任务做成了/);
+  assert.match(r.text, /不要因为看着安静就重发任务/);
+  assert.match(r.text, /asd_peek/, "要指出该走哪一步才拿得到真凭据");
+});
+
+/**
+ * 卡在对话框上是**最容易被误判成失败**的状态：终端静止、任务没进展。
+ * 而重发任务对它完全无用 —— 对话框会把重发的文本一起吃掉。必须单独标出来。
+ */
+test("卡在对话框上的单独标出来，并说明重发没用", async () => {
+  const dialog = " ❯ 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm · Esc to cancel";
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })], stuckOnDialog: true });
+  h.registry.add({ session: "pi-a", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true });
+  void dialog;
+  const r = await h.tools.agents();
+  assert.match(r.text, /卡在对话框上/);
+  assert.match(r.text, /重发任务没用|重发没用/);
+  assert.match(r.text, /asd_nav/);
+  assert.equal(r.details?.blocked, 1);
+});
+
+test("一个 peek 失败不该搞掉整张表", async () => {
+  const h = harness({ live: [info("pi-a", { idle_ms: 60_000 })], peekThrows: true });
+  h.registry.add({ session: "pi-a", task: "t", cwd: "/w", agent: "pi", createdAt: 0, createdByUs: true });
+  const r = await h.tools.agents();
+  assert.equal(r.isError, undefined);
+  assert.match(r.text, /pi-a/, "拿不到屏幕也要把这一行列出来");
 });
