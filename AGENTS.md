@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，279 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，280 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
