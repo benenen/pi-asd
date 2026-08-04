@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，280 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，284 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -267,21 +267,26 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 **通用教训：一个工具如果给不出某个结论，它的输出就不能长得像给出了。** 措辞、字段
 选择都会被调用方当成信号。
 
-### 10. settle 之后要复核一次，才分得出「思考中」和「真停下」
+### 10. settle 之后要连续复核，才分得出「思考中」和「真停下」
 
 `asd follow` 的 settle 只代表"终端安静约 2 秒"。watcher 在报"停下"之前会隔
-`SETTLE_CONFIRM_MS`(1.2s) 再 peek 一屏：**两屏不一样 = agent 还在重绘 = 还在干活**，
-安静重挂，不打扰 boss。这是目前唯一能把两者分开的判据 —— asd 自己给不出。
+`SETTLE_CONFIRM_MS`(1.2s) 连续复核两次：baseline 加两次复核必须**三屏一致**；任一屏
+变化都表示 agent 还在重绘，整轮作废、安静重挂并从零累计。全部通过后再单独 peek
+最终屏幕，用它做对话框识别和通知内容，不能拿确认前的旧画面冒充执行结果；final peek
+若与上一屏不同，它本身就是新的活动信号，同样整轮作废重挂，绝不能报停下。
 
-复核之后屏幕仍静止，再用 `dialog.ts` 的 `detectDialog()` 分「等决策」和「真停下」，
+连续变化达到 `MAX_QUIET_REARMS` 上限时只能报「未确认停下」，**绝不能绕过复核谎报
+已停下**。这是目前唯一能把两者分开的判据 —— asd 自己给不出。
+
+最终 peek 之后，再用 `dialog.ts` 的 `detectDialog()` 分「等决策」和「真停下」，
 两种通知的措辞完全不同：前者必须有人按键、不处理就永远卡着，后者是去读结果。
 
 `detectDialog` 的取舍是**宁可漏认、不可错认**，所以要求「编号选项」和「底部按键
 提示」同时出现。漏认只是退回"已停下"（屏幕照样带上）；错认会把 boss 引去对一屏
 正常输出按键。
 
-写测试注意：watcher 的夹具默认 `settleConfirmMs: 0`（跳过整段复核，含那次 peek）——
-这一组用例大多按 follow/peek 的调用序列断言，多一次 peek 会全部错位。要测复核本身
+写测试注意：watcher 的夹具默认 `settleConfirmMs: 0`（跳过整段连续复核和 final peek）——
+这一组用例大多按 follow/peek 的调用序列断言，多三次 peek 会全部错位。要测复核本身
 就显式传一个很小的非零值。
 
 ### 11. watcher 的冷启动止损要真的等时间

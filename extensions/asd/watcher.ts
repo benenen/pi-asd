@@ -85,15 +85,19 @@ const EARLY_RETRY_DELAY_MS = 1_000;
  *
  * `asd follow` 的 settle 只代表"终端安静了约 2 秒"，它分不出**在思考**和**真停下**。
  * 但这两者在屏幕上是能分开的：还在干活的 agent 会持续重绘（转圈指示器、逐字输出），
- * 静止的则不会。所以 settle 之后隔一会儿再看一眼 —— **两屏不一样就说明它还在动**，
- * 那不是停下，安静重挂即可，不打扰 boss。
+ * 静止的则不会。所以 settle 之后以 1.2 秒为间隔连续复核两次：baseline 加两次复核
+ * 必须三屏一致，任一屏变化都说明它还在动。全部确认后再单独 peek 最终屏幕用于通知，
+ * 不能拿确认前的旧画面冒充执行结果；final peek 若又变化，同样整轮作废重挂。
  *
  * 这是目前唯一能把"思考中"和"停下了"分开的判据：asd 自己给不出（`running` 恒等于
  * `idle_ms < 2s`，`status` 只是它的字符串版）。
  */
 const SETTLE_CONFIRM_MS = 1_200;
 
-/** 复核后仍在变化时，最多安静重挂多少次，避免一个永远滚动的屏幕把 watcher 钉死。 */
+/** baseline 之后还要连续稳定这么多次，才把 settle 当成真的停下。 */
+const SETTLE_CONFIRMATIONS = 2;
+
+/** 复核后仍在变化时，最多安静重挂多少次；到顶只报未确认，不得谎报已停下。 */
 const MAX_QUIET_REARMS = 40;
 
 export class WatcherPool {
@@ -217,23 +221,52 @@ export class WatcherPool {
         return;
       }
 
-      // 复核：隔一会儿再看一眼。两屏不一样 = agent 还在产出，settle 是误判，
-      // 安静重挂，不打扰 boss。见 SETTLE_CONFIRM_MS。
+      // 复核：隔一会儿连续看两次。任一屏变化 = agent 还在产出，settle 是误判，
+      // 整轮作废、安静重挂，从零重新累计，不打扰 boss。全部稳定之后再单独 peek
+      // 最终屏幕用于通知 —— 不能拿确认之前的旧 baseline 冒充执行结果；final peek
+      // 若又变化，它本身就是新的活动信号，同样不能报停下。
       const confirmMs = this.#deps.settleConfirmMs ?? SETTLE_CONFIRM_MS;
       const quiet = this.#quiet.get(session) ?? 0;
       // confirmMs 为 0 时整段跳过（含那次复核 peek）—— 测试注入 0 就是要"不复核"，
       // 多打一次 peek 会让所有按调用序列断言的用例错位。
+      let finalScreen = screen;
+      if (confirmMs > 0 && screen !== null && quiet >= MAX_QUIET_REARMS) {
+        this.#quiet.delete(session);
+        this.#early.delete(session);
+        this.#finish(session, ctrl);
+        this.#notify(
+          `[pi-asd] agent "${session}" 连续 ${MAX_QUIET_REARMS} 轮复核仍有活动，` +
+            `未确认停下，也没有读取最终结果。要继续盯就调 asd_follow("${session}")。`,
+        );
+        return;
+      }
       if (confirmMs > 0 && screen !== null && quiet < MAX_QUIET_REARMS) {
-        await this.#sleep(confirmMs, ctrl.signal);
-        if (ctrl.signal.aborted) return;
-        const again = await this.#deps.asd.peek(session);
-        if (ctrl.signal.aborted) return;
-        if (again !== null && again !== screen) {
-          this.#quiet.set(session, quiet + 1);
-          // #finish 和 watch() 之间没有 await，外部观察不到"没在挂"的空档。
-          this.#finish(session, ctrl);
-          this.watch(session);
-          return;
+        let previous = screen;
+        let disappeared = false;
+        for (let i = 0; i < SETTLE_CONFIRMATIONS; i += 1) {
+          await this.#sleep(confirmMs, ctrl.signal);
+          if (ctrl.signal.aborted) return;
+          const again = await this.#deps.asd.peek(session);
+          if (ctrl.signal.aborted) return;
+          if (again === null) {
+            disappeared = true;
+            break;
+          }
+          if (again !== previous) {
+            this.#rearmAfterActivity(session, ctrl, quiet);
+            return;
+          }
+          previous = again;
+        }
+        if (!disappeared) {
+          finalScreen = await this.#deps.asd.peek(session);
+          if (ctrl.signal.aborted) return;
+          if (finalScreen !== null && finalScreen !== previous) {
+            this.#rearmAfterActivity(session, ctrl, quiet);
+            return;
+          }
+        } else {
+          finalScreen = null;
         }
       }
       this.#quiet.delete(session);
@@ -245,22 +278,22 @@ export class WatcherPool {
       this.#early.delete(session);
       // 这里**没有** onGone —— settle 只是"安静下来了"，session 还活着。
       // 见 WatcherDeps.onGone 的注释。
-      // 静止的这一屏是"等决策"还是"干完了"？对 boss 来说是两个完全不同的动作：
+      // final peek 的这一屏是"等决策"还是"干完了"？对 boss 来说是两个完全不同的动作：
       // 前者必须有人按键，不处理就永远卡着；后者是去读结果。
-      const dialog = detectDialog(screen);
+      const dialog = detectDialog(finalScreen);
       if (dialog !== undefined) {
         this.#notify(
           `[pi-asd] ⚠️ agent "${session}" 需要用户决策（已等待 ${took}）。\n` +
             `${dialog.summary}\n` +
             `用 asd_nav("${session}", [...]) 按键作答；` +
             `作答之后 watcher 会自动重挂，不用重新 spawn。\n` +
-            `--- 当前屏幕 ---\n${screen ?? ""}`,
+            `--- 当前屏幕 ---\n${finalScreen ?? ""}`,
         );
         return;
       }
       this.#notify(
         `[pi-asd] agent "${session}" 已停下（历时 ${took}）。\n` +
-          `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,
+          `--- 最后一屏 ---\n${finalScreen ?? "(session 已消失)"}`,
       );
     } catch (e) {
       if (ctrl.signal.aborted) return;
@@ -280,6 +313,14 @@ export class WatcherPool {
    */
   #finish(session: string, ctrl: AbortController): void {
     if (this.#running.get(session) === ctrl) this.#running.delete(session);
+  }
+
+  /** 发现终端仍有活动：累计一次，并原子地摘掉当前代、挂上下一代。 */
+  #rearmAfterActivity(session: string, ctrl: AbortController, quiet: number): void {
+    this.#quiet.set(session, quiet + 1);
+    // #finish 和 watch() 之间没有任何 await，外部观察不到"没在挂"的空档。
+    this.#finish(session, ctrl);
+    this.watch(session);
   }
 
   /**

@@ -145,6 +145,15 @@ async function waitFor(predicate: () => boolean, tries = 200): Promise<void> {
   throw new Error(`waitFor：条件在 ${tries} 个微任务内都没满足`);
 }
 
+/** 复核会走真实的短定时器；这组检查需要同时让出 timer 和微任务。 */
+async function waitForWithTimers(predicate: () => boolean, tries = 100): Promise<void> {
+  for (let i = 0; i < tries; i += 1) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  throw new Error(`waitForWithTimers：条件在 ${tries} 次计时后仍没满足`);
+}
+
 /** 纯粹排空 N 个微任务，用来等一条我们确认无法通过 predicate 观察的异步链路跑完。 */
 async function flushMicrotasks(n = 30): Promise<void> {
   for (let i = 0; i < n; i++) await Promise.resolve();
@@ -588,8 +597,9 @@ test("watcher 出错时不触发 onGone —— 不知道 session 状态就不要
 //
 // `asd follow` 的 settle 只代表"终端安静了约 2 秒"，分不出在思考还是干完了。
 // 但屏幕能分：还在干活的 agent 会持续重绘（转圈、逐字输出），静止的不会。
-// 所以 settle 之后隔一会儿再看一眼，两屏不一样就说明它还在动 —— 安静重挂，
-// 不打扰 boss。这是目前唯一能把两者分开的判据（asd 自己给不出）。
+// 所以 settle 之后要连续复核两次，baseline 加两次复核必须三屏一致；任一屏变化
+// 都说明它还在动，要安静重挂、从零累计。全部确认后再 final peek 最终执行内容。
+// 这是目前唯一能把两者分开的判据（asd 自己给不出）。
 
 /** 每次 peek 依次吐出预设的屏幕，用完之后一直吐最后一屏。 */
 function screenSeq(screens: string[]) {
@@ -601,6 +611,7 @@ function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
   const next = screenSeq(o.screens);
   const notes: string[] = [];
   const followCalls: string[] = [];
+  let peekCalls = 0;
   const asd = {
     async create() {
       throw new Error("用不到");
@@ -612,6 +623,7 @@ function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
       return [];
     },
     async peek() {
+      peekCalls += 1;
       return next();
     },
     async send() {
@@ -642,8 +654,63 @@ function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
     earlyRetryDelayMs: 0,
     settleConfirmMs: 1, // 真的复核，但不用真等
   });
-  return { pool, notes, followCalls };
+  return {
+    pool,
+    notes,
+    followCalls,
+    get peekCalls() {
+      return peekCalls;
+    },
+  };
 }
+
+test("连续两次复核都稳定后，才 final peek 并用最终屏幕通知", async () => {
+  const h = confirmHarness({ screens: ["最终命令行内容", "最终命令行内容", "最终命令行内容"] });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.equal(h.followCalls.length, 1);
+  assert.equal(h.peekCalls, 4, "baseline + 两次稳定复核 + 完成后的 final peek");
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0]!, /最终命令行内容/, "通知必须使用完成后重新 peek 的屏幕");
+});
+
+test("连续复核中途变化会整轮作废，下一轮从零重新累计", async () => {
+  const h = confirmHarness({
+    screens: ["A", "A", "B", "FINAL 命令行内容", "FINAL 命令行内容", "FINAL 命令行内容"],
+  });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.equal(h.followCalls.length, 2, "第一轮第二次复核变化后必须重挂");
+  assert.equal(h.peekCalls, 7);
+  assert.equal(h.notes.length, 1, "作废的第一轮不能通知完成");
+  assert.match(h.notes[0]!, /FINAL 命令行内容/);
+  assert.doesNotMatch(h.notes[0]!, /--- 最后一屏 ---\nA$/);
+});
+
+test("final peek 又发生变化时不能报停下，必须重挂并重新确认", async () => {
+  const h = confirmHarness({ screens: ["A", "A", "A", "B", "B", "B", "B", "B"] });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.equal(h.followCalls.length, 2, "final peek 的变化也是活动信号");
+  assert.equal(h.peekCalls, 8);
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0]!, /--- 最后一屏 ---\nB$/);
+});
+
+test("连续复核总在变化直到上限，也不能绕过确认谎报已停下", async () => {
+  const screens = Array.from({ length: 100 }, (_, i) => `帧${i}`);
+  const h = confirmHarness({ screens });
+  h.pool.watch("pi-a");
+  await h.pool.idle();
+
+  assert.equal(h.notes.length, 1);
+  assert.match(h.notes[0]!, /未确认停下/);
+  assert.doesNotMatch(h.notes[0]!, /已停下/);
+  assert.doesNotMatch(h.notes[0]!, /--- 最后一屏 ---/, "没确认完成就不能读取并宣称最终结果");
+});
 
 test("回归：复核时屏幕还在变 → 判定为还在干活，安静重挂，不通知", async () => {
   // 三次 peek 各不相同 = 一直在重绘；第 4 次起稳定
@@ -685,10 +752,27 @@ test("静止且是对话框 → 报「需要用户决策」，带上摘要和下
   assert.doesNotMatch(n, /已停下/, "别再说成「已停下」——那会把 boss 引去读结果");
 });
 
-test("复核期间被 stop 掉：不通知、也不再重挂", async () => {
-  const h = confirmHarness({ screens: ["帧1", "帧2", "帧3"] });
+test("连续确认通过但 final peek 还悬着时被 stop：不通知、也不再重挂", async () => {
+  const h = harness({
+    instantFollow: { kind: "settled", text: "" },
+    pausePeek: true,
+    settleConfirmMs: 1,
+  });
   h.pool.watch("pi-a");
+
+  await waitFor(() => h.peekCalls.length === 1);
+  h.settlePeek("pi-a", "稳定"); // baseline
+  await waitForWithTimers(() => h.peekCalls.length === 2);
+  h.settlePeek("pi-a", "稳定"); // 第一次复核
+  await waitForWithTimers(() => h.peekCalls.length === 3);
+  h.settlePeek("pi-a", "稳定"); // 第二次复核
+  await waitFor(() => h.peekCalls.length === 4); // final peek 已发出，故意悬住
+
   h.pool.stopAll();
+  h.settlePeek("pi-a", "稳定");
   await h.pool.idle();
+
   assert.deepEqual(h.notes, []);
+  assert.equal(h.followCalls.length, 1, "stop 后不能再重挂下一代");
+  assert.equal(h.pool.isWatching("pi-a"), false);
 });
