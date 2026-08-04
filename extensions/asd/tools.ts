@@ -508,6 +508,7 @@ export interface Tools {
   steer(p: { session: string; message: string }): Promise<ToolResult>;
   nav(p: { session: string; keys: unknown }): Promise<ToolResult>;
   unmonitor(p: { session: string }): Promise<ToolResult>;
+  rename(p: { session: string; newName: string }): Promise<ToolResult>;
   kill(p: { session: string }): Promise<ToolResult>;
 }
 
@@ -1148,6 +1149,63 @@ export function createTools(deps: ToolDeps): Tools {
      * 认的是台账里的标记，不是历史）。只是不想被自动回收的话用 `persistent` 更
      * 合适 —— 那个保留 kill 权。
      */
+    /**
+     * 给 session 改名。**进程和屏幕都不动** —— 这正是它比"杀掉重建"值钱的地方。
+     *
+     * 典型用途：`asd_spawn` 自动加了前缀，想要 `nvr` 结果成了 `pi-nvr`。
+     * （新建时直接传 `prefix: ""` 更省事，这个是给已经建出来的补救。）
+     *
+     * 台账是按名字索引的，所以改完必须把记录和 watcher 一起搬过去，否则 pi-asd
+     * 会跟丢：asd_agents 显示一个不存在的旧名字，kill / Reaper 全部对不上。
+     *
+     * 顺序是**先改 asd、成功了再动台账**。反过来的话 asd 那边失败了，台账已经
+     * 指向一个不存在的名字，比不改还糟。
+     */
+    async rename(p) {
+      const newName = typeof p.newName === "string" ? p.newName.trim() : "";
+      if (newName.length === 0) return err("新名字不能为空。");
+
+      const rec = registry.get(p.session);
+      if (rec === undefined) {
+        const known = registry.names();
+        return err(
+          `"${p.session}" 不在监视列表里，不会碰它。` +
+            `当前监视中：${known.length > 0 ? known.join(" / ") : "（空）"}`,
+        );
+      }
+      // 台账里已经有这个名字：先拦下来。让 asd 改成功、这边却搬不过去，会让
+      // 另一条记录被覆盖、那个 agent 凭空消失。
+      if (p.session !== newName && registry.get(newName) !== undefined) {
+        return err(`监视列表里已经有 "${newName}" 了，换一个名字。`);
+      }
+
+      const wasWatching = watchers.isWatching(p.session);
+      const out = await asd.rename(p.session, newName);
+      if (out.kind === "gone") {
+        registry.remove(p.session);
+        watchers.stop(p.session);
+        return err(`"${p.session}" 的 session 已经不在了，已从监视列表移除。`);
+      }
+      if (out.kind === "unsupported") {
+        return err(
+          `装的 asd 不支持 rename 子命令 —— 需要升级 asd（协议和 daemon 早就支持，` +
+            `只是 CLI 是后加的）。在那之前可以用 asd ui 里选中 session 按 r 手动改名。`,
+        );
+      }
+      if (out.kind === "failed") return err(`改名失败：${out.message}`);
+
+      // asd 改成功了，把这边搬过去。
+      watchers.stop(p.session);
+      registry.rename(p.session, newName);
+      const watching = wasWatching ? watchers.watch(newName) : false;
+      return {
+        text:
+          `已把 "${p.session}" 改名为 "${newName}"。**进程和屏幕都没动。**` +
+          (watching ? `watcher 已跟着挂到新名字上。` : ""),
+        details: { from: p.session, to: newName, watching },
+      };
+    },
+
     async unmonitor(p) {
       const rec = registry.get(p.session);
       if (rec === undefined) {

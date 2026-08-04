@@ -68,6 +68,13 @@ export interface CardInfo {
   docs: string[];
 }
 
+/** `asd rename` 的结果。`failed` 带上 asd 自己的说明（重名 / 名字非法等）。 */
+export type RenameOutcome =
+  | { kind: "ok" }
+  | { kind: "gone" }
+  | { kind: "unsupported" }
+  | { kind: "failed"; message: string };
+
 export type FollowOutcome =
   | { kind: "settled"; text: string }
   | { kind: "timeout"; text: string }
@@ -110,6 +117,11 @@ export interface Asd {
   ): Promise<FollowOutcome>;
   /** session 本来就不存在时返回 false。 */
   kill(name: string): Promise<boolean>;
+  /**
+   * 改名。session 不存在返回 `"gone"`；装的 asd 太老、没有这个子命令返回
+   * `"unsupported"`（别把它当成普通失败 —— 用户需要知道是去升级 asd，不是名字有问题）。
+   */
+  rename(name: string, newName: string): Promise<RenameOutcome>;
 }
 
 const NO_SESSION = 3;
@@ -293,6 +305,19 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
       if (r.code === TIMEOUT) return { kind: "timeout", text: parseFollowOutput(r.stdout) };
       if (r.code !== 0) fail(r, "follow");
       return { kind: "settled", text: parseFollowOutput(r.stdout) };
+    },
+
+    async rename(name, newName) {
+      const r = await run(["rename", name, newName]);
+      if (r.code === 0) return { kind: "ok" };
+      if (r.code === NO_SESSION) return { kind: "gone" };
+      // clap 对认不出的子命令用退出码 2。装的 asd 太老时就是这条 —— 单独认出来，
+      // 否则用户会拿着"改名失败"去查名字，而真正要做的是升级 asd。
+      const out = `${r.stderr}${r.stdout}`;
+      if (r.code === 2 || /unrecognized subcommand|unexpected argument/i.test(out)) {
+        return { kind: "unsupported" };
+      }
+      return { kind: "failed", message: out.trim() || `退出码 ${r.code}` };
     },
 
     async kill(name) {

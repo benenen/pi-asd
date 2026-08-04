@@ -78,6 +78,9 @@ function harness(
     async key() {
       return true;
     },
+    async rename() {
+      return { kind: "ok" as const };
+    },
     async follow(name: string) {
       followCalls.push(name);
       if (o.instantFollow !== undefined) return o.instantFollow;
@@ -462,6 +465,9 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
     async key() {
       return true;
     },
+    async rename() {
+      return { kind: "ok" as const };
+    },
     async follow(): Promise<FollowOutcome> {
       return { kind: "settled", text: "" };
     },
@@ -616,6 +622,9 @@ function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
     },
     async key() {
       return true;
+    },
+    async rename() {
+      return { kind: "ok" as const };
     },
     async follow(name: string): Promise<FollowOutcome> {
       followCalls.push(name);

@@ -494,6 +494,24 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "asd_rename",
+    label: "Rename agent session",
+    description: [
+      "给一个 session 改名。**进程和屏幕都不动** —— 比杀掉重建强的地方就在这。",
+      "典型用途：spawn 时自动加了前缀，想要 nvr 结果成了 pi-nvr。",
+      "（新建时直接传 prefix: \"\" 更省事，这个是给已经建出来的补救。）",
+      "改完 pi-asd 的监视列表和 watcher 会一起跟过去。",
+    ].join("\n"),
+    parameters: Type.Object({
+      session: Type.String({ description: "当前 session 名" }),
+      newName: Type.String({ description: "新名字，[A-Za-z0-9_-]{1,64}" }),
+    }),
+    async execute(_id, params) {
+      return toolResult(await tools.rename(params));
+    },
+  });
+
+  pi.registerTool({
     name: "asd_unmonitor",
     label: "Stop monitoring agent",
     description: [

@@ -90,6 +90,8 @@ function harness(
     stuckOnDialog?: boolean;
     /** peek 直接抛错 —— 验证单个失败不会搞掉整张表。 */
     peekThrows?: boolean;
+    /** asd rename 的结果。 */
+    renameOutcome?: "ok" | "gone" | "unsupported" | "failed";
     /** 透传给子 agent 的环境变量。 */
     spawnEnv?: Record<string, string>;
     /** 覆盖预设表（测别名映射用）。 */
@@ -129,6 +131,14 @@ function harness(
       case "send":
         if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
+      case "rename": {
+        if (o.renameOutcome === "gone") return { stdout: "", stderr: "no such session", code: 3 };
+        if (o.renameOutcome === "unsupported")
+          return { stdout: "", stderr: "error: unrecognized subcommand 'rename'", code: 2 };
+        if (o.renameOutcome === "failed")
+          return { stdout: "", stderr: "session 'x' already exists", code: 1 };
+        return ok(`${args[2]}\n`);
+      }
       case "kill":
         return ok();
       case "follow":
@@ -235,6 +245,8 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
       case "send":
         if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
+      case "rename":
+        return ok(`${args[2]}\n`);
       case "kill":
         return ok();
       case "follow":
@@ -1029,6 +1041,8 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
       case "send":
         if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
+      case "rename":
+        return ok(`${args[2]}\n`);
       case "kill":
         return ok();
       case "follow":
@@ -1869,4 +1883,118 @@ test("一个 peek 失败不该搞掉整张表", async () => {
   const r = await h.tools.agents();
   assert.equal(r.isError, undefined);
   assert.match(r.text, /pi-a/, "拿不到屏幕也要把这一行列出来");
+});
+
+// --- asd_rename：改名，进程和屏幕都不动 ---
+//
+// 台账是按名字索引的，所以改完必须把记录和 watcher 一起搬过去，否则 pi-asd 跟丢：
+// asd_agents 显示一个不存在的旧名字，kill / Reaper 全部对不上。
+
+function renameHarness(o: { renameOutcome?: "ok" | "gone" | "unsupported" | "failed" } = {}) {
+  const h = harness({ live: [info("pi-nvr", { idle_ms: 60_000 })], ...o });
+  h.registry.add({
+    session: "pi-nvr",
+    task: "长期负责 NVR",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  return h;
+}
+
+test("rename 改完把台账记录搬到新名字下", async () => {
+  const h = renameHarness();
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(h.registry.get("pi-nvr"), undefined, "旧名字不该还在");
+  assert.equal(h.registry.get("nvr")?.task, "长期负责 NVR", "记录内容要跟过去");
+  assert.equal(h.registry.get("nvr")?.session, "nvr", "记录里的 session 字段也要更新");
+  h.watchers.stopAll();
+});
+
+test("rename 会把 watcher 跟着挂到新名字上", async () => {
+  const h = renameHarness();
+  h.watchers.watch("pi-nvr");
+  assert.equal(h.watchers.isWatching("pi-nvr"), true);
+
+  await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(h.watchers.isWatching("pi-nvr"), false, "旧名字上不该还挂着");
+  assert.equal(h.watchers.isWatching("nvr"), true, "要挂到新名字上");
+  h.watchers.stopAll();
+});
+
+test("原本没挂 watcher 的，改名后也不会凭空挂上", async () => {
+  const h = renameHarness();
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(h.watchers.isWatching("nvr"), false);
+  assert.equal(r.details?.watching, false);
+});
+
+/**
+ * 先改 asd、成功了再动台账。反过来的话 asd 那边失败了、台账已经指向一个不存在的
+ * 名字，比不改还糟。
+ */
+test("asd 那边失败时台账一动不动", async () => {
+  const h = renameHarness({ renameOutcome: "failed" });
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /改名失败/);
+  assert.ok(h.registry.get("pi-nvr") !== undefined, "旧记录必须原样保留");
+  assert.equal(h.registry.get("nvr"), undefined);
+});
+
+/**
+ * 装的 asd 太老没有 rename 子命令时，要说"去升级 asd"，而不是让用户以为名字有问题。
+ * clap 对认不出的子命令用退出码 2。
+ */
+test("asd 太老没有 rename 子命令时，报错要指向升级而不是名字", async () => {
+  const h = renameHarness({ renameOutcome: "unsupported" });
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /不支持 rename 子命令/);
+  assert.match(r.text, /升级 asd/);
+  assert.match(r.text, /asd ui.*按 r/, "要给出当下就能用的替代办法");
+  assert.ok(h.registry.get("pi-nvr") !== undefined);
+});
+
+test("session 已经不在了：清掉记录并如实说", async () => {
+  const h = renameHarness({ renameOutcome: "gone" });
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /已经不在了/);
+  assert.equal(h.registry.get("pi-nvr"), undefined);
+});
+
+/**
+ * 台账里已经有新名字时必须先拦下来：让 asd 改成功、这边却搬不过去，会覆盖掉
+ * 另一条记录，那个 agent 就凭空从监视列表里消失了。
+ */
+test("新名字在监视列表里已被占用 → 拦下来，一次 asd 调用都不发", async () => {
+  const h = renameHarness();
+  h.registry.add({
+    session: "nvr",
+    task: "别人",
+    cwd: "/w2",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  const before = h.calls.length;
+  const r = await h.tools.rename({ session: "pi-nvr", newName: "nvr" });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /已经有/);
+  assert.equal(h.calls.length, before, "拦下的路径上不该碰 asd");
+  assert.equal(h.registry.get("nvr")?.task, "别人", "另一条记录必须原封不动");
+});
+
+test("rename 拒绝监视列表外的名字和空新名", async () => {
+  const h = renameHarness();
+  const a = await h.tools.rename({ session: "ghost", newName: "x" });
+  assert.equal(a.isError, true);
+  assert.match(a.text, /不在监视列表里/);
+
+  const b = await h.tools.rename({ session: "pi-nvr", newName: "   " });
+  assert.equal(b.isError, true);
+  assert.match(b.text, /不能为空/);
 });

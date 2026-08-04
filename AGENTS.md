@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，269 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，277 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -51,13 +51,13 @@ e2e 在 `asd` 不在 PATH 上时自动跳过。
 
 ```
 index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sendMessage 适配成 notify，
-                  读 process.env，注册 9 个工具和 2 个斜杠命令。只接线，不放逻辑。
+                  读 process.env，注册 10 个工具和 2 个斜杠命令。只接线，不放逻辑。
   ├── cli.ts       asd 命令行的薄封装（注入 exec）
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
   ├── dialog.ts    从一屏文字里认出「agent 弹了对话框在等决策」。纯函数
-  ├── tools.ts     9 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
+  ├── tools.ts     10 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
 ```
@@ -106,7 +106,13 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 `Reaper` 都读台账，所以摘掉即生效 —— 那两处**不需要**为它加任何判断（有用例把这个
 隐含依赖钉住了，免得以后给 Reaper 换数据源时悄悄破坏）。
 
-三者放一起看：`kill` 结束进程 / `persistent` 留着且不自动收 / `unmonitor` 留着但不管。
+`rename` 是第四个相关操作：它**改名字，不动进程**。台账是按名字索引的，所以顺序很
+要紧 —— **先改 asd、成功了再动台账**（反过来的话 asd 失败了台账已经指向不存在的名字，
+比不改还糟），而且要把 watcher 一起搬过去，否则 pi-asd 跟丢。新名字在台账里已被占用
+时必须先拦下来：让 asd 改成功而这边搬不过去，会覆盖掉另一条记录、那个 agent 凭空消失。
+
+四者放一起看：`kill` 结束进程 / `persistent` 留着且不自动收 / `unmonitor` 留着但不管
+/ `rename` 换个名字接着管。
 **对自己创建的 session 用 `unmonitor` 是单向门**：重新纳入会记成 `createdByUs: false`，
 从此 kill 不掉 —— 工具返回里必须提醒这一点。
 

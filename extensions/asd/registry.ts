@@ -127,6 +127,26 @@ export class Registry {
     return [...this.#records.keys()];
   }
 
+  /**
+   * 把一条记录换个名字：挪 map 的 key，并同步记录里的 `session` 字段。
+   *
+   * 台账是按名字索引的，`asd rename` 之后如果不跟着改，pi-asd 就跟丢了 ——
+   * `asd_agents` 会显示一个已经不存在的旧名字，watcher / kill / Reaper 全部对不上。
+   *
+   * 新名字已被占用时返回 false 且什么都不改 —— 覆盖掉另一条记录会让那个 agent
+   * 凭空从台账里消失。
+   */
+  rename(from: string, to: string): boolean {
+    const rec = this.#records.get(from);
+    if (rec === undefined) return false;
+    if (from === to) return true;
+    if (this.#records.has(to)) return false;
+    this.#records.delete(from);
+    rec.session = to;
+    this.#records.set(to, rec);
+    return true;
+  }
+
   remove(session: string): AgentRecord | undefined {
     const rec = this.#records.get(session);
     if (rec) this.#records.delete(session);

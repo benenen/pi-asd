@@ -52,6 +52,7 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 | `asd_follow` | 阻塞到 agent 停下来，返回过程输出 + 最后一屏 |
 | `asd_steer` | 往 agent 会话里打一条消息，然后重挂 watcher |
 | `asd_nav` | 往 agent 会话里按键，用来操作它弹出的对话框 |
+| `asd_rename` | 给 session 改名 —— **进程和屏幕都不动** |
 | `asd_unmonitor` | 不再监视某个 session —— 只是不管它了，**不结束它** |
 | `asd_kill` | 结束 session —— **只能结束本扩展自己新建的** |
 
@@ -82,8 +83,18 @@ asd_spawn(task: "…", name: "nvr")               → pi-nvr
 前缀纯粹是命名约定，**没有任何安全判断依赖它** —— 能不能 kill、能不能自动复用，
 看的都是台账里的 `createdByUs`，不是名字长什么样。
 
-已经建出来的 session 想改名：`asd ui` 里选中它按 `r`（pi-asd 这边没有改名工具，
-原因见下）。
+已经建出来的 session 想改名：
+
+```
+asd_rename("pi-nvr", "nvr")
+```
+
+**进程和屏幕都不动** —— 这正是它比"杀掉重建"值钱的地方。pi-asd 的监视列表和
+watcher 会一起跟过去。
+
+> 需要 asd 带 `rename` 子命令。协议（v7 的 `Frame::Rename`）和 daemon 一直支持，
+> `asd ui` 里按 `r` 也早就能改，但 CLI 是后加的 —— 装的 asd 太老时工具会明确告诉你
+> 去升级，而不是让你以为名字有问题。
 
 ### 长期员工：persistent
 
