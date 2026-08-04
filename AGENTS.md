@@ -291,6 +291,28 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 `#finish()` 用**身份比较**摘 controller（`this.#running.get(session) === ctrl`），不是按 key
 无脑删 —— 一个迟到收尾的旧 watcher 绝不能带走下一代的记录。
 
+### 12. `asd list` 的 `command` 前面会顶着前缀，认 agent 不能只看第一个 token
+
+`agentOfCommand` 是「能不能把任务交给这个 session」那道闸门。它拿到的字符串**不是**
+干净的 `<agent> <args>`，实测有两层前缀，两层都不是用户干的：
+
+| 前缀 | 真实样例 | 老实现取到的 |
+|---|---|---|
+| 解释器（agent 装成脚本时） | `node /root/.nvm/…/bin/codex` | `node` |
+| 环境变量赋值 | `HTTPS_PROXY='http://h:31172' … codex '任务'` | `31172'`（basename 切到了端口号） |
+
+第二条是自伤：`asd new --cmd` 交给 `sh -c` 跑，带赋值前缀时 dash 不 exec 自己，前台进程
+一直是那个 wrapper，asd 剥掉 `sh -c ` 后报的就是整条命令行 —— 而那个前缀正是 `withEnv`
+和 pi 预设的 `PI_SPAWNED=1` 拼的。于是 pi-asd 把**自己 spawn 出来的 agent** 当成了裸 shell。
+
+症状偏偏只打中一半：claude 的启动器是原生 binary，报的就是 `claude …`，一路正常；codex
+是 node 脚本，`asd_candidates` 里一个都不出现，`asd_spawn` 指名交给它也被拒。所以很容易
+误诊成「codex 特有的毛病」，实际是认 agent 这一处的解析太窄。
+
+修法只放宽**位置**，不放宽判据：从左边剥掉赋值前缀、再至多剥**一层**解释器，剥完那个
+token 必须自己就是预设名。不许改成"在命令行里搜有没有预设名"—— 那样 `sh -c 'echo codex'`、
+`vim codex.ts` 全会被认成 agent，正是这道闸门要挡的东西。切词要认引号（`A='x y' codex`）。
+
 ## 配置
 
 优先级统一为 **环境变量 > asd.json > 内置默认值**，两个 asd.json 后面的覆盖前面的：

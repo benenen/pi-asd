@@ -708,6 +708,41 @@ test("agentOfCommand 从前台进程认出 agent，认不出裸 shell", () => {
   assert.equal(agentOfCommand("", p), undefined);
 });
 
+// 回归：codex 全军漏出 asd_candidates / 交不了任务。两条真实的前缀，实测数据：
+//
+//   token（用户手起的 codex）：node /root/.nvm/versions/node/v24.16.0/bin/codex
+//   review（pi-asd 自己 spawn 的 codex）：
+//     HTTPS_PROXY='…' IS_SANDBOX='1' … codex '长期 codex 员工…'
+//
+// 只看第一个 token 的老实现分别拿到 "node" 和 "31172'"（`HTTPS_PROXY='http://…:31172'`
+// 被 `split("/").pop()` 切成了这样），两个都不在 PRESETS 里 → 一律当裸 shell 拒掉。
+test("agentOfCommand 跳过环境变量前缀", () => {
+  const p = { codex: { command: (t: string) => `codex ${t}`, piChild: false } };
+  assert.equal(agentOfCommand("IS_SANDBOX='1' codex '干活'", p), "codex");
+  // 值里带 `/` —— 老实现正是栽在这里（basename 取到了端口号）
+  assert.equal(agentOfCommand("HTTPS_PROXY='http://h:31172' codex", p), "codex");
+  // 值里带空格：按空白切会把它切成两半，必须认引号
+  assert.equal(agentOfCommand("A='x y' B=2 codex", p), "codex");
+  // pi 预设自己就会拼出 PI_SPAWNED= 前缀
+  assert.equal(agentOfCommand("PI_SPAWNED=1 PI_PARENT_SESSION='s' codex", p), "codex");
+  // 剥掉前缀之后还是裸 shell 的，照旧拒绝
+  assert.equal(agentOfCommand("IS_SANDBOX='1' bash", p), undefined);
+  assert.equal(agentOfCommand("A=1 B=2", p), undefined);
+});
+
+test("agentOfCommand 认得出解释器起的 agent", () => {
+  const p = { codex: { command: (t: string) => `codex ${t}`, piChild: false } };
+  assert.equal(agentOfCommand("node /root/.nvm/versions/node/v24.16.0/bin/codex", p), "codex");
+  assert.equal(agentOfCommand("node --enable-source-maps /usr/lib/codex", p), "codex");
+  assert.equal(agentOfCommand("node /opt/codex.mjs --resume", p), "codex");
+  assert.equal(agentOfCommand("IS_SANDBOX='1' node /usr/lib/codex", p), "codex");
+  // 解释器跑的不是认识的 agent —— 还是不认
+  assert.equal(agentOfCommand("node /usr/lib/webpack", p), undefined);
+  assert.equal(agentOfCommand("node", p), undefined);
+  // 只剥一层：解释器后面又是个 shell，绝不能顺着往下找
+  assert.equal(agentOfCommand("node /usr/lib/foo codex", p), undefined);
+});
+
 test("candidates 只留空闲、能认出 agent、且有 card 的", async () => {
   const h = harness({
     live: [

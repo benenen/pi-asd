@@ -250,18 +250,102 @@ export function shellEscape(s: string): string {
 }
 
 /**
+ * 会被跳过的解释器 —— agent 装成脚本时，前台进程报的是**解释器**，真名在后面。
+ *
+ * 实测（nvm 装的 codex）：`asd list` 报 `node /root/.nvm/versions/node/v24.16.0/bin/codex`。
+ * claude 报的是 `claude …`，因为它的启动器是原生 binary，不是脚本 —— 所以这个坑
+ * 只有一半的 agent 会踩，另一半正常，最容易被当成"codex 特有的毛病"。
+ */
+const INTERPRETERS = new Set(["node", "nodejs", "bun", "deno", "python", "python3"]);
+
+/** 脚本扩展名：`node /opt/codex.mjs` 里的真名是 codex。 */
+const SCRIPT_EXT = /\.(m|c)?js$|\.py$/;
+
+/**
+ * 按 shell 的引号规则切词。
+ *
+ * 不能直接 `split(/\s+/)`：环境变量前缀的值是 `shellEscape` 出来的，里面可以有
+ * 空格（`A='x y' codex`），按空白切会把一个 token 切成两半，后面的判断全错位。
+ */
+function tokenize(command: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | undefined;
+  let started = false;
+  for (const ch of command) {
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      else cur += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started) out.push(cur);
+      cur = "";
+      started = false;
+      continue;
+    }
+    cur += ch;
+    started = true;
+  }
+  if (started) out.push(cur);
+  return out;
+}
+
+/** argv[0] 那种带路径的写法取最后一段，再去掉脚本扩展名。 */
+function commandBase(token: string): string {
+  return (token.split("/").pop() ?? "").replace(SCRIPT_EXT, "");
+}
+
+/**
  * 从 `asd list --json` 的 `command`（pty 的前台进程）认出它跑的是哪个 agent 预设。
  *
  * 认不出来就返回 undefined。**这是个安全判断，不是便利判断**：认不出多半意味着
  * 那是个裸 shell，把任务描述 `send` 进去会被当成命令执行。宁可拒绝也不猜。
+ *
+ * 但"只看第一个 token"太窄了，真实的 command 前面可能顶着两层前缀，两层都不是
+ * 用户干的、也都不代表这不是个 agent：
+ *
+ * 1. **环境变量前缀。** `asd new --cmd` 是交给 `sh -c` 跑的，而 `sh -c 'A=1 cmd'`
+ *    里 sh 不会 exec 掉自己（带赋值前缀时 dash 会 fork），于是前台进程一直是那个
+ *    wrapper，asd 剥掉 `sh -c ` 之后报出来的就是**整条带赋值的命令行**。这个前缀
+ *    正是 pi-asd 自己拼的（`withEnv`、以及 pi 预设的 `PI_SPAWNED=1`）—— 也就是说
+ *    它把自己 spawn 出来的 agent 认成了裸 shell。
+ * 2. **解释器前缀。** 见 `INTERPRETERS`。
+ *
+ * 跳过归跳过，位置判断一条不松：只从左边剥掉赋值前缀、以及**至多一层**解释器，
+ * 剥完的那个 token 必须自己就是预设名。不去命令行里到处搜 —— 那样
+ * `sh -c 'echo codex'`、`vim codex.ts` 都会被认成 agent，正是这道闸门要挡的。
  */
 export function agentOfCommand(
   command: string,
   presets: Record<string, AgentPreset>,
 ): string | undefined {
-  const first = command.trim().split(/\s+/)[0] ?? "";
-  const base = first.split("/").pop() ?? "";
-  return base.length > 0 && Object.hasOwn(presets, base) ? base : undefined;
+  const tokens = tokenize(command);
+  let i = 0;
+  // `NAME=` 开头才算赋值前缀；`--opt=v` 之类不会命中（不是合法变量名）。
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i]!)) i++;
+
+  const first = tokens[i];
+  if (first === undefined) return undefined;
+  const base = commandBase(first);
+  if (base.length > 0 && Object.hasOwn(presets, base)) return base;
+  if (!INTERPRETERS.has(base)) return undefined;
+
+  // 解释器的第一个非选项参数就是脚本。这里不解析"哪些选项带值"（`node -e '…'`
+  // 之类会把代码本身当脚本名）—— 代价只是把某个不是 agent 的东西认成 agent 名，
+  // 而真正危险的那类（shell）永远不叫 node/python，够不着这条路径。
+  for (let j = i + 1; j < tokens.length; j++) {
+    const t = tokens[j]!;
+    if (t.startsWith("-")) continue;
+    const b = commandBase(t);
+    return b.length > 0 && Object.hasOwn(presets, b) ? b : undefined;
+  }
+  return undefined;
 }
 
 export type AgentArg = { ok: true; agent: string } | { ok: false; message: string };
