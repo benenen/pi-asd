@@ -585,6 +585,10 @@ export interface SpawnParams {
 
 export interface Tools {
   spawn(p: SpawnParams): Promise<ToolResult>;
+  /**
+   * **没有注册成工具**，boss 调不到它 —— 留着是为了方便将来改主意。
+   * 为什么摘掉见 `index.ts` 里原来那段注册的位置（一句话：它成了轮询工具）。
+   */
   agents(): Promise<ToolResult>;
   candidates(p: { cwd?: string }): Promise<ToolResult>;
   peek(p: { session: string; scrollback?: number }): Promise<ToolResult>;
@@ -1217,8 +1221,9 @@ export function createTools(deps: ToolDeps): Tools {
     /**
      * 不再监视某个 session —— **只是不管它了，不结束它**。
      *
-     * 用户视角就是一句"不监视 nvr 了"：从此它不出现在 asd_agents、不挂 watcher、
-     * Reaper 也不再考虑它（那两处都读台账，把记录摘掉即生效）。进程照常活着。
+     * 用户视角就是一句"不监视 nvr 了"：从此它不出现在提示词的「当前 agent」清单里、
+     * 不挂 watcher、Reaper 也不再考虑它（那两处都读台账，把记录摘掉即生效）。
+     * 进程照常活着。
      *
      * 名字没叫 `unwatch`：`asd_spawn` 已经有个 `watch` 参数，那个窄得多 ——
      * 只是"这次挂不挂 watcher"，session 仍然进台账、仍然被 Reaper 管。两者混起来
@@ -1240,7 +1245,8 @@ export function createTools(deps: ToolDeps): Tools {
      * （新建时直接传 `prefix: ""` 更省事，这个是给已经建出来的补救。）
      *
      * 台账是按名字索引的，所以改完必须把记录和 watcher 一起搬过去，否则 pi-asd
-     * 会跟丢：asd_agents 显示一个不存在的旧名字，kill / Reaper 全部对不上。
+     * 会跟丢：提示词的「当前 agent」清单显示一个不存在的旧名字，kill / Reaper
+     * 全部对不上。
      *
      * 顺序是**先改 asd、成功了再动台账**。反过来的话 asd 那边失败了，台账已经
      * 指向一个不存在的名字，比不改还糟。
@@ -1309,7 +1315,7 @@ export function createTools(deps: ToolDeps): Tools {
       return {
         text:
           `已停止监视 "${p.session}"。**session 本身没有被结束，还在跑。**` +
-          `它不再出现在 asd_agents 里，watcher 已停，空闲回收器也不会再动它。` +
+          `它不再出现在监视列表里，watcher 已停，空闲回收器也不会再动它。` +
           (wasOurs
             ? `\n注意：这个 session 是 pi-asd 自己创建的。以后重新纳入监视时会以` +
               `"不是自己创建的"记账，从此 asd_kill 永远拒绝结束它 —— ` +

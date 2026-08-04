@@ -163,7 +163,7 @@ export default function (pi: ExtensionAPI): void {
     now: () => Date.now(),
     notify,
     // session 在 asd 里真的没了 —— 台账里那条已经是幽灵记录，清掉它，
-    // 免得 asd_agents 和 pickReusable 还拿它当活的。
+    // 免得提示词里的「当前 agent」清单和 pickReusable 还拿它当活的。
     //
     // 这里只清台账、不 kill：都没了，没什么可 kill 的。真正的"干完活之后回收"
     // 交给下面的 Reaper，它按 idle_ms 判断，不碰 settle 这个不可靠信号 ——
@@ -389,21 +389,19 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerTool({
-    name: "asd_agents",
-    label: "List agents",
-    description: [
-      "列出在监视的 agent 和它们的实时状态，外加每个的屏幕最后一行当凭据。",
-      "**它回答「在不在动」，不回答「干成了没有」** —— 「安静」只表示终端没动静，",
-      "可能做完了、可能在沉默地想、也可能卡住了。",
-      "**不要因为看着安静就断定失败去重发任务。** 要判断结果用 asd_peek 看屏幕。",
-      "卡在对话框上的会被标出来，那种用 asd_nav 作答，重发没用。",
-    ].join("\n"),
-    parameters: Type.Object({}),
-    async execute() {
-      return toolResult(await tools.agents());
-    },
-  });
+  // asd_agents 故意**不注册** —— `tools.agents()` 的实现还在，但不再暴露给 boss。
+  //
+  // 它是个只读的状态列表，看着人畜无害，实际是这个扩展里唯一能被"连着调"的东西：
+  // 便宜、无副作用、每次都返回点什么，模型于是拿它当 sleep 用。用户实测反馈是 boss
+  // 陷在连续调用它的循环里。前面试过两轮软办法都没根治：先改措辞（idle → 安静，
+  // 06a790a），再把禁令从"别用 bash sleep"改成按行为写的"别反复调同一个工具"
+  // （6b427e9）—— 提示词里怎么写，都挡不住一个随手可得的轮询工具。
+  //
+  // 拿掉它不损失信息：每一轮的系统提示词里都有「当前 agent」清单（`bossModePrompt`
+  // 从台账 + WatcherPool 现算，见 before_agent_start），而"这个 agent 干得怎么样"
+  // 本来就得 asd_peek / asd_follow 才答得了 —— asd_agents 从来就答不了。
+  //
+  // 要恢复的话：把下面这段注释换回一个 registerTool 就行，实现没动。
 
   pi.registerTool({
     name: "asd_candidates",
@@ -516,7 +514,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Stop monitoring agent",
     description: [
       "不再监视某个 session —— 用户说「不监视 xxx 了」就用这个。",
-      "**只是不管它了，不结束它**：进程照常跑，只是不再出现在 asd_agents、",
+      "**只是不管它了，不结束它**：进程照常跑，只是不再出现在监视列表里、",
       "不再挂 watcher、空闲回收器也不动它。",
       "之后还能用 asd_spawn(task, session: \"…\") 再次指名交给它，那会重新纳入监视。",
       "要结束进程用 asd_kill；只是不想被自动回收用 asd_spawn 的 persistent 参数。",

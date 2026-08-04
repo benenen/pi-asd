@@ -66,6 +66,9 @@ test("有 agent 时告诉 boss 补充信息用 asd_steer，而不是再 spawn �
  * 回归：原来的禁令只写了"不要用 bash sleep 轮询"，模型找到了空子 —— 改成连着调
  * asd_agents 看有没有变化，技术上不是 bash sleep，但本质就是轮询。实测见过 boss
  * 连调四次 asd_agents 干等。所以禁令要按**行为**写，不是按工具写。
+ *
+ * （asd_agents 后来被彻底摘掉了，见下一条。禁令仍然按行为写 —— 剩下的工具照样
+ * 能被连着调，尤其 asd_peek。）
  */
 test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
   const p = bossModePrompt({
@@ -73,19 +76,25 @@ test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
     defaultAgent: "pi",
     agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
   });
-  assert.match(p, /反复调 asd_agents/, "要点名这种绕法");
-  assert.match(p, /连着调同一个工具看有没有变化，就是轮询/, "要给出判定标准，不是列举工具");
+  assert.match(p, /反复调任何一个\s*工具看有没有变化/s, "禁令要盖住所有工具，不是列举");
+  assert.match(p, /连着调.*就是轮询/s, "要给出判定标准，不是列举工具");
   assert.match(p, /等待只有两种正确做法/, "禁完要给出正确做法");
   assert.match(p, /asd_follow/);
 });
 
-test("asd_agents 的说明要写明它是「看一眼」不是「等」", () => {
+/**
+ * 回归：asd_agents 这个工具已经**不再注册**（见 index.ts 那段注释）。提示词里但凡
+ * 还留着它的名字，boss 就会去调一个不存在的工具 —— 而且原文正是"想看状态就调它"，
+ * 等于把用户反馈的那个循环重新指使一遍。
+ */
+test("提示词不再提 asd_agents，改为指向内置的当前 agent 清单", () => {
   const p = bossModePrompt({
     enabled: true,
     defaultAgent: "pi",
     agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
   });
-  assert.match(p, /看一眼.*不是等|别拿它当轮询/);
+  assert.doesNotMatch(p, /asd_agents/, "这个工具已经不存在了");
+  assert.match(p, /上面这份清单每一轮都会重新算/, "要告诉它状态从哪来");
 });
 
 test("有 agent 时明确禁止 sleep 轮询", () => {
@@ -95,7 +104,6 @@ test("有 agent 时明确禁止 sleep 轮询", () => {
     agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
   });
   assert.match(p, /绝对不要.*bash sleep/);
-  assert.match(p, /asd_agents/);
 });
 
 test("bossSession 给了就写进提示词，没给就不写", () => {
@@ -192,15 +200,18 @@ test("默认 agent 换一个，提示词跟着换", () => {
 /**
  * 用户实测：boss 看到 asd_agents 里的「安静」就判断不了成败，于是**反复重发任务**。
  * 光让工具输出变准还不够 —— 提示词里必须直说"别据此重发"，并指出真凭据在哪。
+ *
+ * asd_agents 摘掉之后这条**更要守**：清单还在（提示词自己带的），能造成同一个误判
+ * 的那个空隙也还在 —— 它同样只说"派了什么"，不说"干成了没有"。
  */
-test("提示词明说 asd_agents 判断不了成败、不许据此重发任务", () => {
+test("提示词明说清单判断不了成败、不许据此重发任务", () => {
   const p = bossModePrompt({
     enabled: true,
     defaultAgent: "pi",
     agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
   });
-  assert.match(p, /在不在动.*不是.*干成了没有/s, "要把这个工具的能力边界说清");
-  assert.match(p, /绝不要因为它看着[\s\S]*安静就断定失败/, "点名这个具体误判");
+  assert.match(p, /派了什么.*不是.*干成了没有/s, "要把这份清单的能力边界说清");
+  assert.match(p, /绝不要因为一个 agent 半天没动静就断定它失败/, "点名这个具体误判");
   assert.match(p, /重发/, "要提到重发这个具体后果");
   assert.match(p, /asd_peek/, "要指出真凭据在哪");
 });

@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，277 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，279 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -51,13 +51,14 @@ e2e 在 `asd` 不在 PATH 上时自动跳过。
 
 ```
 index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sendMessage 适配成 notify，
-                  读 process.env，注册 10 个工具和 2 个斜杠命令。只接线，不放逻辑。
+                  读 process.env，注册 9 个工具和 2 个斜杠命令。只接线，不放逻辑。
   ├── cli.ts       asd 命令行的薄封装（注入 exec）
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
   ├── dialog.ts    从一屏文字里认出「agent 弹了对话框在等决策」。纯函数
-  ├── tools.ts     10 个工具的逻辑（注入 asd / registry / watchers / config / mkdirp / now）
+  ├── tools.ts     工具逻辑（注入 asd / registry / watchers / config / mkdirp / now）。
+                   比注册出去的多一个：`agents()` 留着但故意不注册，见不变量 13
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
 ```
@@ -102,9 +103,9 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 `persistent` 只挡 `Reaper` 那条自动路径，**不影响 `canKill`** —— 否则设了 persistent
 的 agent 就再也关不掉了。缺省（undefined）按 false 处理，老记录不会突然变成不可回收。
 
-第三个容易混的是 `unmonitor`：它把记录从监视列表里**摘掉**，进程不动。`asd_agents` 和
-`Reaper` 都读台账，所以摘掉即生效 —— 那两处**不需要**为它加任何判断（有用例把这个
-隐含依赖钉住了，免得以后给 Reaper 换数据源时悄悄破坏）。
+第三个容易混的是 `unmonitor`：它把记录从监视列表里**摘掉**，进程不动。提示词里的
+「当前 agent」清单和 `Reaper` 都读台账，所以摘掉即生效 —— 那两处**不需要**为它加任何
+判断（有用例把这个隐含依赖钉住了，免得以后给 Reaper 换数据源时悄悄破坏）。
 
 `rename` 是第四个相关操作：它**改名字，不动进程**。台账是按名字索引的，所以顺序很
 要紧 —— **先改 asd、成功了再动台账**（反过来的话 asd 失败了台账已经指向不存在的名字，
@@ -248,6 +249,9 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 
 ### 9. 别让工具输出暗示它给不出的结论
 
+（这一条的由来是 `asd_agents`，那个工具后来被整个摘掉了 —— 见不变量 13。教训本身
+对每个工具都成立，`asd_candidates` / `asd_peek` 的措辞同样受它管，所以留着。）
+
 `asd_agents` 只有终端活动元数据 —— 它**回答不了"任务干成了没有"**。但它以前每行
 只写一个 `idle 3m`，boss 就把"安静"读成"完成/失败"，判断不了就**反复重发任务**
 （实测踩到过）。
@@ -313,6 +317,34 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 token 必须自己就是预设名。不许改成"在命令行里搜有没有预设名"—— 那样 `sh -c 'echo codex'`、
 `vim codex.ts` 全会被认成 agent，正是这道闸门要挡的东西。切词要认引号（`A='x y' codex`）。
 
+### 13. 别给模型一个便宜的只读状态工具 —— 它会拿来当 sleep
+
+`asd_agents` 已经**不再注册**（`tools.agents()` 的实现还在，只是没接出去；恢复的话把
+`index.ts` 里那段注释换回 `registerTool` 即可）。
+
+它是只读的、没有副作用、每次都返回点东西 —— 正因为如此，它成了这个扩展里唯一一个
+能被"连着调"的东西，模型于是拿它当 sleep 使。用户实测反馈：boss 陷在连续调用它的
+循环里出不来。
+
+**软办法试过两轮，都没根治：**
+
+1. 改措辞（`idle` → `安静`，不变量 9）—— 治的是误判成败，治不了循环本身
+2. 把轮询禁令从"别用 bash sleep"改成按行为写的"连着调同一个工具就是轮询"
+   （commit 6b427e9）—— 模型照样调
+
+**结论：提示词约束不住一个随手可得的轮询工具，只能把工具拿掉。** 这也是为什么
+不变量 9 那三条对策要留着 —— 它们对剩下的工具仍然有效，只是对这一个不够。
+
+拿掉不损失信息，这是能拿掉的前提：
+
+- "有哪些 agent、watcher 挂没挂" —— 每一轮系统提示词里的「当前 agent」清单都有，
+  `bossModePrompt` 从台账 + `WatcherPool` 现算
+- "它干得怎么样" —— `asd_agents` 从来就答不了（不变量 9 说的就是这个），得 `asd_peek`
+- "该等一等" —— `asd_follow`，或者什么都不做等 watcher 推
+
+改提示词时注意：**里面一次都不能再出现 `asd_agents`**，否则等于指使 boss 去调一个
+不存在的工具，而且原文恰好就是"想看状态就调它"。有用例钉着这一条。
+
 ## 配置
 
 优先级统一为 **环境变量 > asd.json > 内置默认值**，两个 asd.json 后面的覆盖前面的：
@@ -336,7 +368,8 @@ token 必须自己就是预设名。不许改成"在命令行里搜有没有预�
 `asd attach <名字>` 接管，这是 asd 相对 tmux pane 真正多出来的能力。退出前会跟 `asd list`
 对一次账，只报告真正还存活的。
 
-台账只活在进程内存里：主 agent 重启后 `asd_agents` 是空的，但 session 仍在 `asd list` 里。
+台账只活在进程内存里：主 agent 重启后台账是空的（提示词里的「当前 agent」清单也就空了），
+但 session 仍在 `asd list` 里 —— 用 `asd_candidates` 能看到，指名交给它就重新纳入监视。
 
 `/asd:boss-stop` 不杀 agent、不停 watcher，只停止注入提示词。
 

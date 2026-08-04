@@ -131,7 +131,8 @@ export class Registry {
    * 把一条记录换个名字：挪 map 的 key，并同步记录里的 `session` 字段。
    *
    * 台账是按名字索引的，`asd rename` 之后如果不跟着改，pi-asd 就跟丢了 ——
-   * `asd_agents` 会显示一个已经不存在的旧名字，watcher / kill / Reaper 全部对不上。
+   * boss mode 提示词里的「当前 agent」清单会显示一个已经不存在的旧名字，
+   * watcher / kill / Reaper 全部对不上。
    *
    * 新名字已被占用时返回 false 且什么都不改 —— 覆盖掉另一条记录会让那个 agent
    * 凭空从台账里消失。
