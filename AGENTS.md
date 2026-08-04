@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，260 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，262 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -102,13 +102,16 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 `persistent` 只挡 `Reaper` 那条自动路径，**不影响 `canKill`** —— 否则设了 persistent
 的 agent 就再也关不掉了。缺省（undefined）按 false 处理，老记录不会突然变成不可回收。
 
-第三个容易混的是 `unadopt`：它把记录从台账里**摘掉**，进程不动。`asd_agents` 和
+第三个容易混的是 `unmonitor`：它把记录从监视列表里**摘掉**，进程不动。`asd_agents` 和
 `Reaper` 都读台账，所以摘掉即生效 —— 那两处**不需要**为它加任何判断（有用例把这个
 隐含依赖钉住了，免得以后给 Reaper 换数据源时悄悄破坏）。
 
-三者放一起看：`kill` 结束进程 / `persistent` 留着且不自动收 / `unadopt` 留着但不管。
-**对自己创建的 session 用 `unadopt` 是单向门**：再次收养会记成 `createdByUs: false`，
+三者放一起看：`kill` 结束进程 / `persistent` 留着且不自动收 / `unmonitor` 留着但不管。
+**对自己创建的 session 用 `unmonitor` 是单向门**：重新纳入会记成 `createdByUs: false`，
 从此 kill 不掉 —— 工具返回里必须提醒这一点。
+
+命名上没用 `unwatch`：`asd_spawn` 的 `watch` 参数含义窄得多（只是这次挂不挂 watcher，
+session 照样进列表、照样被回收器管），撞名会让人以为两者等价。
 
 session 名前缀纯属命名约定，**没有任何安全判断依赖它**。`SpawnParams.prefix` 可以按次
 覆盖，传 `""` 就是不加前缀 —— 注意这里空串是"真的要空"，和读环境变量时"空串当没设置"

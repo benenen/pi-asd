@@ -52,7 +52,7 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 | `asd_follow` | 阻塞到 agent 停下来，返回过程输出 + 最后一屏 |
 | `asd_steer` | 往 agent 会话里打一条消息，然后重挂 watcher |
 | `asd_nav` | 往 agent 会话里按键，用来操作它弹出的对话框 |
-| `asd_unadopt` | 把 session 从台账里摘掉 —— 只是不再管它，**不结束它** |
+| `asd_unmonitor` | 不再监视某个 session —— 只是不管它了，**不结束它** |
 | `asd_kill` | 结束 session —— **只能结束本扩展自己新建的** |
 
 ### 派任务的三条路
@@ -242,17 +242,21 @@ asd_nav("pi-a", ["ArrowDown", "Enter"])   # 再按
 这个工具**不做投递校验**（按键本就不是往输入框送的），所以调用方要自己先 peek。
 它会把按完之后的屏幕一并返回，省掉一次来回。
 
-### 不想管了：asd_unadopt
+### 不监视了：asd_unmonitor
 
-指名交过任务的 session 会进台账，从此 `asd_agents` 一直追踪它。不想管了就摘掉：
+指名交过任务的 session 会进监视列表，从此 `asd_agents` 一直追踪它。不想监视了：
 
 ```
-asd_unadopt("mem")
+asd_unmonitor("nvr")
 ```
 
-**只是不再管它，不结束它。** 进程照跑，只是不再出现在 `asd_agents`、watcher 停掉、
-空闲回收器也不再考虑它。之后还能用 `asd_spawn(task, session: "mem")` 再次指名交给
-它 —— 重新收养。
+**只是不管它了，不结束它。** 进程照跑，只是不再出现在 `asd_agents`、watcher 停掉、
+空闲回收器也不再考虑它。之后还能用 `asd_spawn(task, session: "nvr")` 再次指名交给
+它 —— 重新纳入监视。
+
+> 名字没叫 `asd_unwatch`：`asd_spawn` 已经有个 `watch` 参数，那个窄得多 —— 只是
+> "这次挂不挂 watcher"，session 仍然在监视列表里、仍然被回收器管。两个混起来会让
+> 人以为 `watch: false` 就等于不监视。
 
 和另外两个工具的分界：
 
@@ -260,9 +264,9 @@ asd_unadopt("mem")
 |---|---|
 | 结束这个进程 | `asd_kill`（只能结束自己创建的） |
 | 留着它但别被空闲回收 | `asd_spawn(..., persistent: true)` |
-| 进程留着，pi-asd 别再管 | `asd_unadopt` |
+| 进程留着，pi-asd 别再管 | `asd_unmonitor` |
 
-> **对自己创建的 session 摘除是单向门。** 再次指名交给它会以"不是自己创建的"重新
+> **对自己创建的 session 停止监视是单向门。** 重新纳入时会以"不是自己创建的"
 > 记账，从此 `asd_kill` 永远拒绝结束它（那道闸门认的是台账里的标记，不是历史）。
 > 只是不想被自动回收的话用 `persistent` —— 那个保留 kill 权。工具返回里会提醒。
 

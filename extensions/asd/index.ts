@@ -488,19 +488,20 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "asd_unadopt",
-    label: "Stop tracking agent",
+    name: "asd_unmonitor",
+    label: "Stop monitoring agent",
     description: [
-      "把一个 session 从 pi-asd 的台账里摘掉 —— **只是不再管它，不结束它**。",
-      "session 进程照常跑，只是不再出现在 asd_agents、不再挂 watcher、空闲回收器也不动它。",
-      "之后还能用 asd_spawn(task, session: \"…\") 再次指名交给它。",
+      "不再监视某个 session —— 用户说「不监视 xxx 了」就用这个。",
+      "**只是不管它了，不结束它**：进程照常跑，只是不再出现在 asd_agents、",
+      "不再挂 watcher、空闲回收器也不动它。",
+      "之后还能用 asd_spawn(task, session: \"…\") 再次指名交给它，那会重新纳入监视。",
       "要结束进程用 asd_kill；只是不想被自动回收用 asd_spawn 的 persistent 参数。",
     ].join("\n"),
     parameters: Type.Object({
       session: Type.String({ description: "session 名" }),
     }),
     async execute(_id, params) {
-      return toolResult(await tools.unadopt(params));
+      return toolResult(await tools.unmonitor(params));
     },
   });
 

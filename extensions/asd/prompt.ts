@@ -93,10 +93,14 @@ export function bossModePrompt(input: PromptInput): string {
         "- **默认什么都不用做。** watcher 已经挂上了，agent 一停下来结果会自动推给你。",
         "  在那之前你可以去干别的、或者回复用户。",
         "- 想主动看一眼状态就调 asd_agents —— running / idle 都是现成的，不用逐个 peek。",
-        "- 要盯死某一个就调 asd_follow，它会阻塞到那个 agent 停下来。",
+        "  但它是**看一眼**，不是等：看完就去做别的，别拿它当轮询。",
+        "- 要盯死某一个就调 asd_follow，它会阻塞到那个 agent 停下来 ——",
+        "  **想等就用它**，它是唯一正确的等待方式。",
         "- 要给某个在跑的 agent 补充信息、或者纠偏，就调 asd_steer(session, message)。",
         "  **不要用 asd_spawn 再发一遍** —— 那是派一个新任务，不是补一句话。",
-        "- **绝对不要用 bash sleep 轮询。** 那是 tmux 时代的做法，在这里纯属浪费。",
+        "- **绝对不要轮询。** 不管用什么方式：bash sleep、反复调 asd_agents、",
+        "  反复 asd_peek —— 都算。连着调同一个工具看有没有变化，就是轮询。",
+        "  等待只有两种正确做法：什么都不做（watcher 会推给你），或者 asd_follow。",
       ].join("\n"),
     );
   }

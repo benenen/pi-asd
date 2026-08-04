@@ -62,6 +62,32 @@ test("有 agent 时告诉 boss 补充信息用 asd_steer，而不是再 spawn �
   assert.doesNotMatch(empty, /asd_steer/);
 });
 
+/**
+ * 回归：原来的禁令只写了"不要用 bash sleep 轮询"，模型找到了空子 —— 改成连着调
+ * asd_agents 看有没有变化，技术上不是 bash sleep，但本质就是轮询。实测见过 boss
+ * 连调四次 asd_agents 干等。所以禁令要按**行为**写，不是按工具写。
+ */
+test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
+  const p = bossModePrompt({
+    enabled: true,
+    defaultAgent: "pi",
+    agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
+  });
+  assert.match(p, /反复调 asd_agents/, "要点名这种绕法");
+  assert.match(p, /连着调同一个工具看有没有变化，就是轮询/, "要给出判定标准，不是列举工具");
+  assert.match(p, /等待只有两种正确做法/, "禁完要给出正确做法");
+  assert.match(p, /asd_follow/);
+});
+
+test("asd_agents 的说明要写明它是「看一眼」不是「等」", () => {
+  const p = bossModePrompt({
+    enabled: true,
+    defaultAgent: "pi",
+    agents: [{ session: "pi-a", task: "t", agent: "pi", watching: true }],
+  });
+  assert.match(p, /看一眼.*不是等|别拿它当轮询/);
+});
+
 test("有 agent 时明确禁止 sleep 轮询", () => {
   const p = bossModePrompt({
     enabled: true,
