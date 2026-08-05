@@ -17,6 +17,19 @@ test("定义段写明 boss 只分配不执行、通过 candidates 选 session", 
   assert.match(p, /不读文件.*不跑命令.*不做调研/);
 });
 
+test("用户问点名员工状态时必须 peek 具体屏幕，不能停在表面清单", () => {
+  // 这条是用户明确指定的 boss 行为，而且手工 session 不一定在 pi-asd 台账里，
+  // 所以即使当前 agent 清单为空也必须出现在恒定的定义段。
+  const p = bossModePrompt({ enabled: true, defaultAgent: "pi", agents: [] });
+
+  assert.match(p, /用户明确指定.*问.*状态.*asd_peek/s);
+  assert.match(p, /asd_list.*asd_candidates.*不能.*状态汇报/s);
+  assert.match(p, /屏幕.*正在执行.*已经执行完/s);
+  assert.match(p, /peek.*读不到.*说明.*原因.*asd_list/s);
+  assert.match(p, /本轮已经查过.*已有清单.*不能再调第二次/s);
+  assert.match(p, /只 peek 一次|不要反复 peek/, "查一次状态不能退化成轮询");
+});
+
 test("有 agent 时列出清单，任务被截断到 80 字", () => {
   const long = "任".repeat(200);
   const p = bossModePrompt({
@@ -85,10 +98,10 @@ test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
 });
 
 /**
- * `asd_agents` 仍然不存在；新增的 `asd_list` 只解决用户明确要看**全部 asd session**
- * 的需求，不能退化成新的等待/完成度工具。提示词要把这两件事同时说清。
+ * `asd_agents` 仍然不存在；`asd_list` 只允许查全部 session，或在点名状态的单次
+ * peek 失败后兜底，不能退化成新的等待/完成度工具。提示词要把这些边界同时说清。
  */
-test("提示词只把 asd_list 用作全部 session 清单，不恢复 asd_agents", () => {
+test("提示词把 asd_list 收窄到全部清单或 peek 失败兜底，不恢复 asd_agents", () => {
   const p = bossModePrompt({
     enabled: true,
     defaultAgent: "pi",
@@ -96,7 +109,8 @@ test("提示词只把 asd_list 用作全部 session 清单，不恢复 asd_agent
   });
   assert.doesNotMatch(p, /asd_agents/, "这个工具已经不存在了");
   assert.match(p, /上面这份清单每一轮都会重新算/, "要告诉它状态从哪来");
-  assert.match(p, /用户明确要看.*全部.*session.*asd_list/s, "只在明确查全部 session 时使用");
+  assert.match(p, /asd_list 只有两种用途.*全部.*session.*asd_peek 读不到/s);
+  assert.match(p, /两种用途共享每轮最多一次/);
   assert.match(p, /asd_list.*不.*任务成败/s, "不能把 session 活动误当成任务完成度");
   assert.match(
     p,

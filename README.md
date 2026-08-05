@@ -210,15 +210,25 @@ agent 的那套判断不受影响。
 Reaper 管它。要发送输入并纳入台账，仍然用 `asd_spawn(task, session: "<名字>")` 指名交给它；
 `asd_kill` 仍只能结束 pi-asd 自己创建的。只想停掉这个外部 watcher 时用 `asd_unmonitor`。
 
-它只适合用户明确要看**全部 session**时调用一次。它不是选空闲 agent 的入口（那是
-`asd_candidates`），不是判断任务结果的入口（那是 `asd_peek`），也不是等待方式（用
-watcher 或 `asd_follow`）。代码层也会强制每轮 agent 执行只查询一次；同一轮再次调用会
-直接拒绝，不会再碰 daemon。新的用户/飞书消息或 watcher 推送开启下一轮后才重新放行。
+#### 用户问点名 session 的状态时必须读屏
+
+这是用户明确指定的 boss 行为：用户问「`lnny` 状态」「看下 `mem`」这类点名问题时，
+`asd_list` / `asd_candidates` 只能用来找名字或确认 session 存在，**不能拿表面状态直接作答**。
+boss 必须接着对该 session 调一次 `asd_peek`，根据屏幕汇报它正在执行或已经执行完的具体内容。
+
+如果 `asd_peek` 读不到，先如实说明原因，再用本轮唯一一次 `asd_list` 确认 session 是否还存在；
+本轮已经查过清单就复用已有结果。这里只 peek 一次，不能为了等变化反复 peek 退化成轮询。
+
+它只有两个合法入口：用户明确要看**全部 session**；或者点名状态查询的单次 `asd_peek`
+读不到，需要兜底确认 session 是否仍存在。它不是选空闲 agent 的入口（那是
+`asd_candidates`），不是判断任务结果的入口（那是 `asd_peek`），也不是等待方式（用 watcher
+或 `asd_follow`）。两个入口共享每轮一次额度；同一轮再次调用会直接拒绝，不会再碰 daemon。
+新的用户/飞书消息或 watcher 推送开启下一轮后才重新放行。
 
 早先另有一个 `asd_agents`，只列 pi-asd 台账里的 agent。它仍然**没有注册**：这个只读工具
 曾让 boss 陷进连续调用的循环里。它和 `asd_list` 不是别名，也不要把它接回来：
 
-- **daemon 里有哪些 session** —— 用户明确要求时调用一次 `asd_list`
+- **daemon 里有哪些 session** —— 用户明确要求时，或点名状态的 peek 失败兜底时，调用一次 `asd_list`
 - **pi-asd 派了什么、watcher 挂没挂** —— boss mode 每轮自带的「当前 agent」清单
 - **它干得怎么样** —— `asd_peek`
 - **想等** —— 已有 watcher 就什么都不做；没有就调一次 `asd_follow` 注册后台监视，然后继续干别的
