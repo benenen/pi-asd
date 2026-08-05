@@ -92,6 +92,8 @@ function harness(
     peekThrows?: boolean;
     /** asd rename 的结果。 */
     renameOutcome?: "ok" | "gone" | "unsupported" | "failed";
+    /** 显式 follow 工具的结果；不传时保持挂起，供后台 watcher 测试使用。 */
+    followResult?: ExecResult;
     /** 透传给子 agent 的环境变量。 */
     spawnEnv?: Record<string, string>;
     /** 覆盖预设表（测别名映射用）。 */
@@ -142,7 +144,7 @@ function harness(
       case "kill":
         return ok();
       case "follow":
-        return new Promise<ExecResult>(() => {});
+        return o.followResult ?? new Promise<ExecResult>(() => {});
       default:
         throw new Error(`没准备好的子命令：${args.join(" ")}`);
     }
@@ -676,16 +678,93 @@ test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状�
   watchers.stopAll();
 });
 
-test("steer / peek / follow 对台账外的名字直接拒绝，不碰 asd", async () => {
+test("follow 返回后 session 在 final peek 前消失：只报结束，原 watcher 不重挂", async () => {
+  let followCalls = 0;
+  const exec: Exec = async (_cmd, args) => {
+    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
+    if (args[0] === "follow") {
+      followCalls += 1;
+      // 1：原后台 watcher；2：工具自己的 follow；3：错误重挂时才会出现。
+      if (followCalls === 2) return ok();
+      return new Promise<ExecResult>(() => {});
+    }
+    if (args[0] === "peek") return { stdout: "", stderr: "no such session", code: 3 };
+    throw new Error(`没准备好的子命令：${args.join(" ")}`);
+  };
+  const asd = createAsd(exec, { enterDelayMs: 0 });
+  const registry = new Registry("pi-");
+  registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
+  const tools = createTools({
+    asd,
+    registry,
+    watchers,
+    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m" },
+    mkdirp: async () => {},
+    now: () => 0,
+  });
+  watchers.watch("pi-a");
+
+  const r = await tools.follow({ session: "pi-a" });
+
+  assert.equal(r.text, '"pi-a" 的 session 已结束，已从监视列表移除。');
+  assert.equal(watchers.isWatching("pi-a"), false);
+  assert.equal(followCalls, 2, "session 已消失后不能重挂第三个 follow");
+});
+
+test("steer 对台账外的名字直接拒绝，不碰 asd", async () => {
   const h = harness();
-  for (const r of [
-    await h.tools.steer({ session: "mem", message: "x" }),
-    await h.tools.peek({ session: "mem" }),
-    await h.tools.follow({ session: "mem" }),
-  ]) {
-    assert.equal(r.isError, true);
-  }
+  const r = await h.tools.steer({ session: "mem", message: "x" });
+  assert.equal(r.isError, true);
   assert.deepEqual(h.calls, []);
+});
+
+test("peek 允许读取台账外、由用户显式点名的 session", async () => {
+  const h = harness({ live: [info("mem")] });
+
+  const r = await h.tools.peek({ session: "mem" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.match(r.text, /^SCREEN:mem/);
+  assert.deepEqual(subcommands(h), ["peek"]);
+});
+
+test("follow 允许跟踪台账外、由用户显式点名的 session", async () => {
+  const h = harness({
+    live: [info("mem")],
+    followResult: {
+      stdout: '{"event":"output","text":"done\\n"}\n',
+      stderr: "",
+      code: 0,
+    },
+  });
+
+  const r = await h.tools.follow({ session: "mem" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.match(r.text, /"mem" 已停下/);
+  assert.match(r.text, /done/);
+  assert.match(r.text, /SCREEN:mem/);
+  assert.deepEqual(subcommands(h), ["follow", "peek"]);
+});
+
+test("follow 点名的台账外 session 已消失时，不谎称从台账移除了记录", async () => {
+  const h = harness({
+    followResult: { stdout: "", stderr: "no such session", code: 3 },
+  });
+
+  const r = await h.tools.follow({ session: "ghost" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(r.text, '"ghost" 的 session 已结束。');
+  assert.deepEqual(subcommands(h), ["follow"]);
 });
 
 test("peek 返回屏幕内容", async () => {
@@ -1730,11 +1809,11 @@ test("nav 认不出按键时一个都不送，也不碰 asd", async () => {
   assert.equal(h.calls.length, before, "校验不过的路径上一次 asd 调用都不该有");
 });
 
-test("nav 拒绝台账外的 session —— 和 steer / peek 同一道闸门", async () => {
+test("nav 拒绝台账外的 session —— 发送按键仍要求先纳入监视", async () => {
   const h = harness({ live: [info("someone-else", { idle_ms: 60_000 })] });
   const r = await h.tools.nav({ session: "someone-else", keys: ["Enter"] });
   assert.equal(r.isError, true);
-  assert.match(r.text, /不是本次 spawn 出来的/);
+  assert.match(r.text, /不在 pi-asd 监视列表里/);
   assert.equal(h.calls.length, 0);
 });
 

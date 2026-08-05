@@ -48,8 +48,8 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 | `asd_spawn` | 派任务。指名交给 → 台账内复用 → 新建，按这个顺序 |
 | `asd_list` | 列出 daemon 当前的全部 session（含未被 pi-asd 监视的） |
 | `asd_candidates` | 列出所有空闲、能接活的 session（含不是本扩展建的），供挑选 |
-| `asd_peek` | 读一个 agent 当前的屏幕，不阻塞 |
-| `asd_follow` | 阻塞到 agent 停下来，返回过程输出 + 最后一屏 |
+| `asd_peek` | 读任意显式点名的现存 session 屏幕，不要求由 pi-asd 创建或监视 |
+| `asd_follow` | 跟踪任意显式点名的现存 session，返回过程输出 + 最后一屏 |
 | `asd_steer` | 往 agent 会话里打一条消息，然后重挂 watcher |
 | `asd_nav` | 往 agent 会话里按键，用来操作它弹出的对话框 |
 | `asd_rename` | 给 session 改名 —— **进程和屏幕都不动** |
@@ -202,8 +202,12 @@ agent 的那套判断不受影响。
 
 `asd_list` 直接从 `asd list --json` 取成员，所以用户手建、尚未被 pi-asd 监视的 session
 也会出现。输出只列 session 名，不逐个读取屏幕，也不显示 `running` / `idle_ms` / title。
-这是刻意的：`asd_peek` 会拒绝读取台账外 session，清单工具不能绕过那道边界、把用户手工
-会话的内容暴露给 boss。
+这是刻意的：`asd_peek` / `asd_follow` 可以**显式点名**任意现存 session，但清单工具不能
+借着「补状态」自动把所有用户手工会话的屏幕批量读出来。
+
+显式读取和等待不等于纳入监视列表：对台账外 session 调一次 `asd_peek` / `asd_follow`
+不会让 Reaper 管它，也不会给它挂长期后台 watcher。要发送输入并纳入监视，仍然用
+`asd_spawn(task, session: "<名字>")` 指名交给它；`asd_kill` 仍只能结束 pi-asd 自己创建的。
 
 它只适合用户明确要看**全部 session**时调用一次。它不是选空闲 agent 的入口（那是
 `asd_candidates`），不是判断任务结果的入口（那是 `asd_peek`），也不是等待方式（用
@@ -437,7 +441,8 @@ agent（退出时不会补扫一轮回收）。子 agent 照跑，你可以 `asd
 进去接管 —— 这是 asd 相对 tmux pane 真正多出来的能力。
 
 台账只活在进程内存里：主 agent 重启后监视列表是空的，但 session 仍在 `asd list`
-里 —— `asd_candidates` 看得到，指名交给它就重新纳入监视。
+里。此时可以直接 `asd_peek` / `asd_follow` 显式查看或等待；需要发送输入、挂后台 watcher
+时，再用 `asd_candidates` 确认后指名交给它，重新纳入监视。
 
 ## 已知限制
 

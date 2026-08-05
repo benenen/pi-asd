@@ -96,6 +96,11 @@ test("提示词只把 asd_list 用作全部 session 清单，不恢复 asd_agent
   assert.match(p, /上面这份清单每一轮都会重新算/, "要告诉它状态从哪来");
   assert.match(p, /用户明确要看.*全部.*session.*asd_list/s, "只在明确查全部 session 时使用");
   assert.match(p, /asd_list.*不.*任务成败/s, "不能把 session 活动误当成任务完成度");
+  assert.match(
+    p,
+    /asd_peek.*asd_follow.*任意现存.*不要求.*spawn/s,
+    "显式查看或等待台账外 session 不需要先 spawn",
+  );
 });
 
 test("有 agent 时明确禁止 sleep 轮询", () => {

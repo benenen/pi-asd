@@ -595,7 +595,9 @@ export interface Tools {
    */
   agents(): Promise<ToolResult>;
   candidates(p: { cwd?: string }): Promise<ToolResult>;
+  /** 显式读取任意现存 asd session；不要求先进入 pi-asd 台账。 */
   peek(p: { session: string; scrollback?: number }): Promise<ToolResult>;
+  /** 显式等待任意现存 asd session；不要求先进入 pi-asd 台账。 */
   follow(p: { session: string; mode?: "settle" | "end"; timeout?: string }): Promise<ToolResult>;
   steer(p: { session: string; message: string }): Promise<ToolResult>;
   nav(p: { session: string; keys: unknown }): Promise<ToolResult>;
@@ -720,21 +722,27 @@ export function createTools(deps: ToolDeps): Tools {
     return { ok: false, reason: `"${session}" 在 ${STARTUP_TIMEOUT_MS / 1000}s 内没有就绪` };
   }
 
-  /** 台账里没有就拒绝 —— peek / follow / steer 共用。 */
-  function requireKnown(session: string): ToolResult | undefined {
+  /** 发送文字/按键会修改 session，只允许已经明确纳入监视列表的目标。 */
+  function requireMonitoredForInput(session: string): ToolResult | undefined {
     if (registry.get(session) !== undefined) return undefined;
     const known = registry.names();
     return err(
-      `"${session}" 不是本次 spawn 出来的 agent，不会碰它。` +
-        `当前台账：${known.length > 0 ? known.join(" / ") : "（空）"}`,
+      `"${session}" 不在 pi-asd 监视列表里，不会向它发送输入。` +
+        `当前监视列表：${known.length > 0 ? known.join(" / ") : "（空）"}。` +
+        `读取屏幕或等待可以直接用 asd_peek / asd_follow；` +
+        `要发送输入，先用 asd_spawn(task, session: "${session}") 指名交给它。`,
     );
   }
 
-  /** session 在 asd 里没了：清台账、停 watcher，返回一句说明。 */
+  /** session 在 asd 里没了：如果原本受监视就清记录，停 watcher，返回准确说明。 */
   function dropGone(session: string): ToolResult {
-    registry.remove(session);
+    const monitored = registry.remove(session) !== undefined;
     watchers.stop(session);
-    return { text: `"${session}" 的 session 已结束，已从台账移除。` };
+    return {
+      text: monitored
+        ? `"${session}" 的 session 已结束，已从监视列表移除。`
+        : `"${session}" 的 session 已结束。`,
+    };
   }
 
   function rewatch(session: string, want: boolean): boolean {
@@ -991,9 +999,9 @@ export function createTools(deps: ToolDeps): Tools {
      * 集合的唯一数据源是 `asd list --json`，所以用户手工创建、尚未纳入监视的
      * session 也必须出现。
      *
-     * **这里只返回名字，不顺手 peek。** `asd_peek` 对台账外 session 有明确的读取
-     * 闸门；如果这个工具为了补状态去 peek 全部 session，就会绕过那道边界、把用户
-     * 手工会话的屏幕内容暴露给 boss。用户要的是 session 清单，不是屏幕转储。
+     * **这里只返回名字，不顺手 peek。** `asd_peek` 可以显式读取任意现存 session，
+     * 但 list 不能借着「补状态」自动把所有用户手工会话的屏幕批量读出来。用户要的
+     * 是 session 清单，不是屏幕转储。
      */
     async list() {
       if (!listAllowed) {
@@ -1156,16 +1164,12 @@ export function createTools(deps: ToolDeps): Tools {
     },
 
     async peek(p) {
-      const bad = requireKnown(p.session);
-      if (bad) return bad;
       const screen = await asd.peek(p.session, p.scrollback);
       if (screen === null) return dropGone(p.session);
       return { text: screen, details: { session: p.session } };
     },
 
     async follow(p) {
-      const bad = requireKnown(p.session);
-      if (bad) return bad;
       // 这个工具自己也会在 p.session 上跑一个 `asd follow`，跟后台 watcher
       // 抢同一个 session 的 follow 流 —— 不停掉的话两边都在等，同一次停下会
       // 被通知两遍（一遍是这次工具调用的返回值，一遍是 watcher 的 notify）。
@@ -1184,6 +1188,13 @@ export function createTools(deps: ToolDeps): Tools {
         }
 
         const screen = await asd.peek(p.session);
+        if (screen === null) {
+          // follow 返回和 final peek 之间 session 仍可能刚好退出。不能一边说
+          // “已停下/还在忙”、一边又打印“已消失”，更不能在 finally 里把
+          // 已经不存在的 session 重新挂上 watcher。
+          stillAlive = false;
+          return dropGone(p.session);
+        }
         const head =
           outcome.kind === "timeout"
             ? `"${p.session}" 还在忙（follow 超时）。`
@@ -1191,7 +1202,7 @@ export function createTools(deps: ToolDeps): Tools {
         return {
           text:
             `${head}\n--- 过程输出 ---\n${outcome.text}\n` +
-            `--- 最后一屏 ---\n${screen ?? "(session 已消失)"}`,
+            `--- 最后一屏 ---\n${screen}`,
           details: { session: p.session, outcome: outcome.kind },
         };
       } finally {
@@ -1200,7 +1211,7 @@ export function createTools(deps: ToolDeps): Tools {
     },
 
     async steer(p) {
-      const bad = requireKnown(p.session);
+      const bad = requireMonitoredForInput(p.session);
       if (bad) return bad;
       const sent = await deliver(p.session, p.message);
       if (!sent.ok) {
@@ -1228,7 +1239,7 @@ export function createTools(deps: ToolDeps): Tools {
      * 返回值里直接带上操作后的屏幕，省掉一次来回。
      */
     async nav(p) {
-      const bad = requireKnown(p.session);
+      const bad = requireMonitoredForInput(p.session);
       if (bad) return bad;
 
       const parsed = resolveNavKeys(p.keys);

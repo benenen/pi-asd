@@ -99,6 +99,7 @@ export function bossModePrompt(input: PromptInput): string {
         "- **但这份清单说的是「派了什么」，不是「它干成了没有」。** 谁也没告诉你哪个做完了。",
         "  **绝不要因为一个 agent 半天没动静就断定它失败、然后重发任务** —— 重发只会让它",
         "  从头再来一遍，或者两份任务同时在跑。要判断结果就 asd_peek 看屏幕，那才有真凭据。",
+        "  asd_peek / asd_follow 可以显式点名任意现存 asd session，不要求它先由 pi-asd spawn 或纳入台账。",
         "- 看到「卡在对话框上」就用 asd_nav 作答。那不是失败，**重发任务对它没有任何",
         "  用处** —— 对话框会把你重发的文本一起吃掉。",
         "- 要盯死某一个就调 asd_follow，它会阻塞到那个 agent 停下来 ——",

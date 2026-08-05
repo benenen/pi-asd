@@ -437,9 +437,10 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "asd_peek",
     label: "Peek agent",
-    description: "读一个 agent 当前的屏幕，不阻塞。",
+    description:
+      "读显式点名的任意现存 asd session 当前屏幕，不阻塞；不要求它由 pi-asd 创建或监视。",
     parameters: Type.Object({
-      session: Type.String({ description: "session 名" }),
+      session: Type.String({ description: "任意现存 asd session 名" }),
       scrollback: Type.Optional(Type.Number({ description: "额外带上屏幕以上多少行历史" })),
     }),
     async execute(_id, params) {
@@ -451,11 +452,12 @@ export default function (pi: ExtensionAPI): void {
     name: "asd_follow",
     label: "Follow agent",
     description: [
-      "阻塞到 agent 停下来，返回期间的输出和最后一屏。",
+      "阻塞到显式点名的任意现存 asd session 停下来，返回期间的输出和最后一屏。",
+      "不要求它由 pi-asd 创建或监视；这次调用不会把外部 session 纳入台账。",
       "watcher 已经在替你等了，一般不需要主动调 —— 只在要盯死某一个时用。",
     ].join("\n"),
     parameters: Type.Object({
-      session: Type.String({ description: "session 名" }),
+      session: Type.String({ description: "任意现存 asd session 名" }),
       mode: Type.Optional(
         StringEnum(["settle", "end"] as const, {
           description: "settle：静默即返回（默认）；end：等到 session 真正结束",

@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，289 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，293 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -79,7 +79,7 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 
 改这个仓库时下面几条会真的咬人，动相关代码前先读懂：
 
-### 1. `createdByUs` —— 用户手建的 session 碰不得
+### 1. `createdByUs` —— 用户手建的 session 不能被自动复用或结束
 
 台账里混着两种记录：pi-asd 自己创建的（`asd new` 出来的，`createdByUs: true`），和被指名
 交过任务、因此也进了台账的用户 session（`createdByUs: false`）。**「在台账里」不等于
@@ -92,6 +92,11 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 
 自动复用**永远不碰台账外的 session**；台账外的只能由主 agent 看过 `asd_candidates` 之后
 指名交给它。
+
+**显式只读/等待是正交的，不走这道所有权判断。** `asd_peek` / `asd_follow` 可以点名任意
+现存 asd session，不要求它先由 pi-asd spawn 或进入台账；两者不发送输入、不 kill、不让
+Reaper 接管，也不会把外部 session 纳入监视列表。`steer` / `nav` 仍会发送输入，所以只允许
+台账内目标；要操作外部 session，先用 `asd_spawn(task, session: "<名字>")` 指名交给它。
 
 **`persistent` 是另一条正交的判断，别和 `createdByUs` 混起来。** 空闲回收要两条都过：
 
@@ -329,8 +334,8 @@ pi-asd 台账里的 agent，曾被模型拿来当 sleep：连续调用、看同�
 
 现在公开的 `asd_list` 是另一条明确需求：**列出 daemon 里的全部 session**，包括用户手建、
 没进 pi-asd 台账的。它的成员集合只来自 `asd list --json`，不能悄悄退回 `registry.list()`；
-输出只取 session 名，**绝不逐个 peek**。`asd_peek` 对台账外会话有读取闸门，list 不能借着
-「补状态」绕过它，把用户手工会话的屏幕内容暴露给 boss。
+输出只取 session 名，**绝不逐个 peek**。`asd_peek` / `asd_follow` 可以显式点名台账外会话，
+但 list 不能借着「补状态」自动把用户手工会话的屏幕批量读出来。
 
 这仍然是只读工具，轮询风险没有凭空消失，所以公开它必须同时守住五道边界：
 

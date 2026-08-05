@@ -63,7 +63,7 @@ const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   },
 };
 
-test("e2e：spawn → list → agents → peek → steer → kill 走一遍真 asd", { timeout: 60_000 }, async (t) => {
+test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { timeout: 60_000 }, async (t) => {
   if (!(await hasAsd())) {
     t.skip("asd 不在 PATH 上，跳过");
     return;
@@ -123,6 +123,20 @@ test("e2e：spawn → list → agents → peek → steer → kill 走一遍真 a
     const sessionNames = allSessions.details?.sessions;
     assert.ok(Array.isArray(sessionNames), "asd_list 应该返回结构化 session 名数组");
     assert.ok(sessionNames.includes(session), "结构化结果也应该包含刚创建的 session");
+
+    // 绕过 tools.spawn 直接建一个 session，模拟用户手工创建的长期员工。它没有
+    // registry 记录，但显式点名时 peek / follow 都应该可用，且不会因此被纳入监视。
+    const manual = await asd.create({ name: "manual", cwd: root, cmd: "sh -c 'echo MANUAL; sleep 30'" });
+    const manualPeek = await tools.peek({ session: manual });
+    assert.equal(manualPeek.isError, undefined, manualPeek.text);
+    assert.match(manualPeek.text, /MANUAL/);
+
+    const manualFollow = await tools.follow({ session: manual, timeout: "5s" });
+    assert.equal(manualFollow.isError, undefined, manualFollow.text);
+    assert.match(manualFollow.text, /MANUAL/);
+    assert.equal(registry.get(manual), undefined, "只读/等待不能把手工 session 纳入台账");
+    assert.equal(watchers.isWatching(manual), false, "显式 follow 结束后不能留下后台 watcher");
+    await asd.kill(manual);
 
     const steered = await tools.steer({ session, message: "ping" });
     assert.equal(steered.isError, undefined, steered.text);
