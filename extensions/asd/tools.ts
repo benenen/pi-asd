@@ -585,6 +585,10 @@ export interface SpawnParams {
 
 export interface Tools {
   spawn(p: SpawnParams): Promise<ToolResult>;
+  /** 列出 asd daemon 当前知道的全部 session，不受 pi-asd 内存台账限制。 */
+  list(): Promise<ToolResult>;
+  /** 新一轮 agent 执行开始时，重置 `list()` 的单次调用额度。 */
+  resetListAllowance(): void;
   /**
    * **没有注册成工具**，boss 调不到它 —— 留着是为了方便将来改主意。
    * 为什么摘掉见 `index.ts` 里原来那段注册的位置（一句话：它成了轮询工具）。
@@ -615,6 +619,10 @@ export function createTools(deps: ToolDeps): Tools {
   const { asd, registry, watchers, config, mkdirp, now } = deps;
   const presets = config.presets ?? PRESETS;
   const minIdleMs = config.reuseMinIdleMs ?? REUSE_MIN_IDLE_MS;
+  // asd_list 是只读工具，若每次都真的查 daemon，模型会拿它当 sleep 连续轮询。
+  // 每轮 agent 执行只给一次额度；index.ts 在下一次 before_agent_start 时重置。
+  // 这个布尔值必须在 list() 的第一个 await 之前同步关掉，挡住并发工具调用。
+  let listAllowed = true;
 
   /**
    * 并发 spawn 之间的临界区屏障：正在处理中、还没落盘到 registry 的 session
@@ -974,6 +982,45 @@ export function createTools(deps: ToolDeps): Tools {
       } finally {
         for (const n of heldNames) reserved.delete(n);
       }
+    },
+
+    /**
+     * 列出 asd daemon 里的全部 session。
+     *
+     * 这不是 `agents()` 的公开别名：后者只看 pi-asd 内存台账；这里 session 成员
+     * 集合的唯一数据源是 `asd list --json`，所以用户手工创建、尚未纳入监视的
+     * session 也必须出现。
+     *
+     * **这里只返回名字，不顺手 peek。** `asd_peek` 对台账外 session 有明确的读取
+     * 闸门；如果这个工具为了补状态去 peek 全部 session，就会绕过那道边界、把用户
+     * 手工会话的屏幕内容暴露给 boss。用户要的是 session 清单，不是屏幕转储。
+     */
+    async list() {
+      if (!listAllowed) {
+        return err(
+          "每轮 agent 执行只能调用一次 asd_list；本轮已经列过了。" +
+            "不要轮询；需要等待就用 asd_follow，或等 watcher 自动推送。",
+        );
+      }
+      listAllowed = false;
+      const sessions = await asd.list();
+      if (sessions.length === 0) {
+        return { text: "当前没有 asd session。", details: { count: 0, sessions: [] } };
+      }
+
+      const names = sessions.map((s) => s.session);
+
+      return {
+        text:
+          names.map((name) => `- ${name}`).join("\n") +
+          `\n\n（这是全部 asd session 的名字清单，不读取屏幕，也不提供活动或任务成败状态。` +
+          `不要连续调用 asd_list 轮询。）`,
+        details: { count: names.length, sessions: names },
+      };
+    },
+
+    resetListAllowance() {
+      listAllowed = true;
     },
 
     /**

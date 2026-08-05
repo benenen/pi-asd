@@ -2,7 +2,7 @@
  * pi-asd —— 把任务派给跑在独立 asd session 里的子 agent。
  *
  * 这是唯一接触 pi 的文件：把 pi.exec 适配成注入的 exec、pi.sendMessage 适配成
- * 注入的 notify，再把 tools.ts 的七个函数包成 pi 工具。逻辑全在别处，这里只接线。
+ * 注入的 notify，再把 tools.ts 的公开能力包成 pi 工具。逻辑全在别处，这里只接线。
  */
 
 import { mkdir } from "node:fs/promises";
@@ -284,25 +284,31 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("before_agent_start", async (event) => ({
-    systemPrompt:
-      event.systemPrompt +
-      bossModePrompt({
-        enabled: bossMode,
-        defaultAgent: bossAgent,
-        bossSession,
-        agents: registry.list().map((r) => ({
-          session: r.session,
-          task: r.task,
-          agent: r.agent,
-          // 台账不记 watching —— WatcherPool 才是唯一真相（同一条理由见
-          // tools.ts 的 agents()）。提示词里"watcher 已挂/未挂"这句必须跟着
-          // 真实状态走，不然 watcher 超时收尾之后提示词还在说"已挂"，boss
-          // 会照着这句假话继续什么都不做。
-          watching: watchers.isWatching(r.session),
-        })),
-      }),
-  }));
+  pi.on("before_agent_start", async (event) => {
+    // 一轮 agent 执行里只允许 asd_list 真查一次。工具结果不会重新触发
+    // before_agent_start，所以同一轮内连续调用不会误充值；新的用户消息、飞书消息
+    // 或 watcher followUp 开启下一轮时才重新放行。
+    tools.resetListAllowance();
+    return {
+      systemPrompt:
+        event.systemPrompt +
+        bossModePrompt({
+          enabled: bossMode,
+          defaultAgent: bossAgent,
+          bossSession,
+          agents: registry.list().map((r) => ({
+            session: r.session,
+            task: r.task,
+            agent: r.agent,
+            // 台账不记 watching —— WatcherPool 才是唯一真相（同一条理由见
+            // tools.ts 的 agents()）。提示词里"watcher 已挂/未挂"这句必须跟着
+            // 真实状态走，不然 watcher 超时收尾之后提示词还在说"已挂"，boss
+            // 会照着这句假话继续什么都不做。
+            watching: watchers.isWatching(r.session),
+          })),
+        }),
+    };
+  });
 
   // 只掐 watcher，绝不杀 session —— 子 agent 照跑，用户可以 asd attach 接管。
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -389,19 +395,28 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  // asd_agents 故意**不注册** —— `tools.agents()` 的实现还在，但不再暴露给 boss。
+  pi.registerTool({
+    name: "asd_list",
+    label: "List all sessions",
+    description: [
+      "列出 asd daemon 当前的全部 session，包括不是 pi-asd 创建或监视的。",
+      "只返回 session 名，不读取屏幕，也不提供活动或任务成败状态。",
+      "每轮 agent 执行只允许查询一次；需要等待用 asd_follow，或等 watcher 自动推送。",
+    ].join("\n"),
+    parameters: Type.Object({}),
+    async execute() {
+      return toolResult(await tools.list());
+    },
+  });
+
+  // asd_agents 仍然故意**不注册** —— `tools.agents()` 的实现还在，但不暴露给 boss。
   //
-  // 它是个只读的状态列表，看着人畜无害，实际是这个扩展里唯一能被"连着调"的东西：
-  // 便宜、无副作用、每次都返回点什么，模型于是拿它当 sleep 用。用户实测反馈是 boss
-  // 陷在连续调用它的循环里。前面试过两轮软办法都没根治：先改措辞（idle → 安静，
-  // 06a790a），再把禁令从"别用 bash sleep"改成按行为写的"别反复调同一个工具"
-  // （6b427e9）—— 提示词里怎么写，都挡不住一个随手可得的轮询工具。
+  // 它只看 pi-asd 台账，曾让 boss 陷进连续调用的轮询循环。上面的 asd_list 不是把它
+  // 换名接回来：asd_list 的成员集合来自 daemon 的全部 session，但只返回名字、不读取
+  // 任一屏幕；只在用户明确要清单时调一次，不能拿它等待或判断任务成败。
   //
-  // 拿掉它不损失信息：每一轮的系统提示词里都有「当前 agent」清单（`bossModePrompt`
-  // 从台账 + WatcherPool 现算，见 before_agent_start），而"这个 agent 干得怎么样"
-  // 本来就得 asd_peek / asd_follow 才答得了 —— asd_agents 从来就答不了。
-  //
-  // 要恢复的话：把下面这段注释换回一个 registerTool 就行，实现没动。
+  // 「pi-asd 派了什么、watcher 挂没挂」仍由每轮系统提示词里的「当前 agent」清单
+  // 回答；任务结果仍然只能看 asd_peek / asd_follow。不要再注册 asd_agents。
 
   pi.registerTool({
     name: "asd_candidates",

@@ -17,7 +17,7 @@ pi-asd 是 [pi](https://github.com/earendil-works/pi) 的扩展：把任务派�
 
 ```bash
 npm install
-npm test              # node:test，284 个用例，含一个对着真 asd 跑的 e2e
+npm test              # node:test，289 个用例，含一个对着真 asd 跑的 e2e
 npm run typecheck     # tsc --noEmit
 ```
 
@@ -51,14 +51,14 @@ e2e 在 `asd` 不在 PATH 上时自动跳过。
 
 ```
 index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sendMessage 适配成 notify，
-                  读 process.env，注册 9 个工具和 2 个斜杠命令。只接线，不放逻辑。
+                  读 process.env，注册 10 个工具和 2 个斜杠命令。只接线，不放逻辑。
   ├── cli.ts       asd 命令行的薄封装（注入 exec）
   ├── registry.ts  台账：本次 spawn 出来的 agent。纯逻辑，不碰 IO
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
   ├── dialog.ts    从一屏文字里认出「agent 弹了对话框在等决策」。纯函数
   ├── tools.ts     工具逻辑（注入 asd / registry / watchers / config / mkdirp / now）。
-                   比注册出去的多一个：`agents()` 留着但故意不注册，见不变量 13
+                   另有两个内部入口：`agents()` 故意不注册；`resetListAllowance()` 由生命周期调用
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
 ```
@@ -249,8 +249,8 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 
 ### 9. 别让工具输出暗示它给不出的结论
 
-（这一条的由来是 `asd_agents`，那个工具后来被整个摘掉了 —— 见不变量 13。教训本身
-对每个工具都成立，`asd_candidates` / `asd_peek` 的措辞同样受它管，所以留着。）
+（这一条的由来是后来被摘掉的 `asd_agents` —— 见不变量 13。现在的 `asd_list` 为了
+避开这个坑只列名字、不展示状态；`asd_candidates` / `asd_peek` 仍受这条约束。）
 
 `asd_agents` 只有终端活动元数据 —— 它**回答不了"任务干成了没有"**。但它以前每行
 只写一个 `idle 3m`，boss 就把"安静"读成"完成/失败"，判断不了就**反复重发任务**
@@ -322,33 +322,32 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 token 必须自己就是预设名。不许改成"在命令行里搜有没有预设名"—— 那样 `sh -c 'echo codex'`、
 `vim codex.ts` 全会被认成 agent，正是这道闸门要挡的东西。切词要认引号（`A='x y' codex`）。
 
-### 13. 别给模型一个便宜的只读状态工具 —— 它会拿来当 sleep
+### 13. `asd_list` 只查全部 session，绝不能拿来当 sleep
 
-`asd_agents` 已经**不再注册**（`tools.agents()` 的实现还在，只是没接出去；恢复的话把
-`index.ts` 里那段注释换回 `registerTool` 即可）。
+旧的 `asd_agents` 仍然**不注册**（`tools.agents()` 的实现还在，只是没接出去）。它只列
+pi-asd 台账里的 agent，曾被模型拿来当 sleep：连续调用、看同一份输出、永远不退出。
 
-它是只读的、没有副作用、每次都返回点东西 —— 正因为如此，它成了这个扩展里唯一一个
-能被"连着调"的东西，模型于是拿它当 sleep 使。用户实测反馈：boss 陷在连续调用它的
-循环里出不来。
+现在公开的 `asd_list` 是另一条明确需求：**列出 daemon 里的全部 session**，包括用户手建、
+没进 pi-asd 台账的。它的成员集合只来自 `asd list --json`，不能悄悄退回 `registry.list()`；
+输出只取 session 名，**绝不逐个 peek**。`asd_peek` 对台账外会话有读取闸门，list 不能借着
+「补状态」绕过它，把用户手工会话的屏幕内容暴露给 boss。
 
-**软办法试过两轮，都没根治：**
+这仍然是只读工具，轮询风险没有凭空消失，所以公开它必须同时守住五道边界：
 
-1. 改措辞（`idle` → `安静`，不变量 9）—— 治的是误判成败，治不了循环本身
-2. 把轮询禁令从"别用 bash sleep"改成按行为写的"连着调同一个工具就是轮询"
-   （commit 6b427e9）—— 模型照样调
+1. **用途收窄**：只有用户明确要看全部 asd session 时才调用一次；挑能接活的仍用
+   `asd_candidates`，看结果仍用 `asd_peek`，等待仍用 watcher / `asd_follow`
+2. **只列名字**：不输出 `running` / `idle_ms` / title，不读屏幕，不给调用方猜成败的材料
+3. **输出和 description 都明说边界**：这是名字清单，不是状态或等待信号
+4. **代码层单次额度**：`createTools` 在第一次 `await` 前同步耗掉额度，挡住并发调用；同一轮
+   agent 执行里的后续调用直接拒绝且不再碰 daemon
+5. **只在新一轮重置**：`index.ts` 的 `before_agent_start` 调 `resetListAllowance()`；同一轮里的
+   工具结果不会重触发它。新的用户/飞书消息或 watcher followUp 开启下一轮才重新放行
 
-**结论：提示词约束不住一个随手可得的轮询工具，只能把工具拿掉。** 这也是为什么
-不变量 9 那三条对策要留着 —— 它们对剩下的工具仍然有效，只是对这一个不够。
+别把两个工具混成一回事：`asd_list` 回答「asd 里当前有哪些 session」；内置的「当前
+agent」清单回答「这一轮 pi-asd 派了什么、watcher 挂没挂」；两者都回答不了任务成败。
 
-拿掉不损失信息，这是能拿掉的前提：
-
-- "有哪些 agent、watcher 挂没挂" —— 每一轮系统提示词里的「当前 agent」清单都有，
-  `bossModePrompt` 从台账 + `WatcherPool` 现算
-- "它干得怎么样" —— `asd_agents` 从来就答不了（不变量 9 说的就是这个），得 `asd_peek`
-- "该等一等" —— `asd_follow`，或者什么都不做等 watcher 推
-
-改提示词时注意：**里面一次都不能再出现 `asd_agents`**，否则等于指使 boss 去调一个
-不存在的工具，而且原文恰好就是"想看状态就调它"。有用例钉着这一条。
+改提示词时仍然**一次都不能出现 `asd_agents`**；提 `asd_list` 时必须和「用户明确要看
+全部 session」「只调一次」「不是成败/等待信号」放在一起。有用例钉着这些边界。
 
 ## 配置
 

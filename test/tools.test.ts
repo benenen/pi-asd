@@ -484,6 +484,60 @@ test("agents 台账为空时不打 asd", async () => {
   assert.deepEqual(h.calls, []);
 });
 
+test("list 直接列出 asd 里的全部 session，台账为空也不漏", async () => {
+  const h = harness({
+    live: [
+      info("user-shell", { title: "手工会话" }),
+      info("pi-a", { title: "子 agent" }),
+    ],
+  });
+
+  const r = await h.tools.list();
+
+  assert.match(r.text, /user-shell/);
+  assert.match(r.text, /pi-a/);
+  assert.equal(r.details?.count, 2);
+  assert.deepEqual(r.details?.sessions, ["user-shell", "pi-a"]);
+  assert.deepEqual(subcommands(h), ["list"], "清单不能顺手读取用户 session 的屏幕");
+  assert.doesNotMatch(r.text, /手工会话|子 agent|SCREEN:/, "只展示 session 名，不暴露标题或屏幕内容");
+});
+
+test("list 没有 session 时返回明确的空清单", async () => {
+  const h = harness();
+  const r = await h.tools.list();
+
+  assert.match(r.text, /没有 asd session/);
+  assert.deepEqual(r.details, { count: 0, sessions: [] });
+  assert.deepEqual(subcommands(h), ["list"]);
+});
+
+test("同一轮 agent 执行里 list 只查询一次；下一轮才重新放行", async () => {
+  const h = harness({ live: [info("one")] });
+
+  const first = await h.tools.list();
+  const repeated = await h.tools.list();
+
+  assert.equal(first.isError, undefined);
+  assert.equal(repeated.isError, true);
+  assert.match(repeated.text, /每轮 agent 执行只能调用一次/);
+  assert.equal(subcommands(h).filter((c) => c === "list").length, 1, "拒绝路径不能再查询 daemon");
+
+  h.tools.resetListAllowance();
+  const nextTurn = await h.tools.list();
+  assert.equal(nextTurn.isError, undefined);
+  assert.equal(subcommands(h).filter((c) => c === "list").length, 2);
+});
+
+test("同一轮并发调用 list 也只有一个能碰 daemon", async () => {
+  const h = harness({ live: [info("one")] });
+
+  const results = await Promise.all([h.tools.list(), h.tools.list()]);
+
+  assert.equal(results.filter((r) => r.isError !== true).length, 1);
+  assert.equal(results.filter((r) => r.isError === true).length, 1);
+  assert.equal(subcommands(h).filter((c) => c === "list").length, 1);
+});
+
 test("agents 列出存活的并摘掉已经没了的", async () => {
   const h = harness({ live: [info("pi-a", { running: true })] });
   for (const s of ["pi-a", "pi-b"]) {

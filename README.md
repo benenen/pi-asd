@@ -39,13 +39,14 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 要结束 agent 就显式用 `asd_kill`（且只对本扩展自己建的有效）。
 
 下面这些工具在关闭状态下**仍然可用**。关的是提示词，不是能力：没开 boss mode 也可能想用
-`asd_candidates` 看看有哪些空闲会话。
+`asd_list` 看全部会话，或用 `asd_candidates` 看看有哪些空闲会话。
 
 ## 工具
 
 | 工具 | 做什么 |
 |---|---|
 | `asd_spawn` | 派任务。指名交给 → 台账内复用 → 新建，按这个顺序 |
+| `asd_list` | 列出 daemon 当前的全部 session（含未被 pi-asd 监视的） |
 | `asd_candidates` | 列出所有空闲、能接活的 session（含不是本扩展建的），供挑选 |
 | `asd_peek` | 读一个 agent 当前的屏幕，不阻塞 |
 | `asd_follow` | 阻塞到 agent 停下来，返回过程输出 + 最后一屏 |
@@ -197,20 +198,25 @@ agent 的那套判断不受影响。
 > agent 可以安静几分钟。真正承重的是另一条：自动复用池只收本扩展自己创建的
 > session，所以最坏情况是把两个任务叠进自己的 agent，绝不会叠进你的会话。
 
-### 没有「列出所有 agent」这个工具，这是有意的
+### `asd_list` 是全部 session 清单，不是等待工具
 
-早先有个 `asd_agents`，列出在监视的 agent 和各自状态。它被**整个拿掉了**。
+`asd_list` 直接从 `asd list --json` 取成员，所以用户手建、尚未被 pi-asd 监视的 session
+也会出现。输出只列 session 名，不逐个读取屏幕，也不显示 `running` / `idle_ms` / title。
+这是刻意的：`asd_peek` 会拒绝读取台账外 session，清单工具不能绕过那道边界、把用户手工
+会话的内容暴露给 boss。
 
-它只读、没副作用、每次都返回点东西 —— 于是成了唯一一个能被"连着调"的工具，主
-agent 拿它当 sleep 使，实测会陷在连续调用它的循环里出不来。软办法试过两轮（先改
-措辞、再把轮询禁令从"别用 bash sleep"改成按行为写的"连着调同一个工具就是轮询"），
-都没根治：**提示词约束不住一个随手可得的轮询工具。**
+它只适合用户明确要看**全部 session**时调用一次。它不是选空闲 agent 的入口（那是
+`asd_candidates`），不是判断任务结果的入口（那是 `asd_peek`），也不是等待方式（用
+watcher 或 `asd_follow`）。代码层也会强制每轮 agent 执行只查询一次；同一轮再次调用会
+直接拒绝，不会再碰 daemon。新的用户/飞书消息或 watcher 推送开启下一轮后才重新放行。
 
-拿掉不损失信息：
+早先另有一个 `asd_agents`，只列 pi-asd 台账里的 agent。它仍然**没有注册**：这个只读工具
+曾让 boss 陷进连续调用的循环里。它和 `asd_list` 不是别名，也不要把它接回来：
 
-- **有哪些 agent、watcher 挂没挂** —— boss mode 每一轮的系统提示词里都带这份清单
-- **它干得怎么样** —— `asd_agents` 本来就答不了（它只有终端活动元数据），得 `asd_peek`
-- **想等** —— `asd_follow`，或者什么都不做，等 watcher 推给你
+- **daemon 里有哪些 session** —— 用户明确要求时调用一次 `asd_list`
+- **pi-asd 派了什么、watcher 挂没挂** —— boss mode 每轮自带的「当前 agent」清单
+- **它干得怎么样** —— `asd_peek`
+- **想等** —— `asd_follow`，或者什么都不做等 watcher 推送
 
 > 顺带一提这条更一般的教训，剩下的工具仍然照它设计：**一个工具如果给不出某个结论，
 > 它的输出就不能长得像给出了。** 所以状态词是「安静 / 在动」而不是 idle / running ——

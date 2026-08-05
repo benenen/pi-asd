@@ -83,11 +83,10 @@ test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
 });
 
 /**
- * 回归：asd_agents 这个工具已经**不再注册**（见 index.ts 那段注释）。提示词里但凡
- * 还留着它的名字，boss 就会去调一个不存在的工具 —— 而且原文正是"想看状态就调它"，
- * 等于把用户反馈的那个循环重新指使一遍。
+ * `asd_agents` 仍然不存在；新增的 `asd_list` 只解决用户明确要看**全部 asd session**
+ * 的需求，不能退化成新的等待/完成度工具。提示词要把这两件事同时说清。
  */
-test("提示词不再提 asd_agents，改为指向内置的当前 agent 清单", () => {
+test("提示词只把 asd_list 用作全部 session 清单，不恢复 asd_agents", () => {
   const p = bossModePrompt({
     enabled: true,
     defaultAgent: "pi",
@@ -95,6 +94,8 @@ test("提示词不再提 asd_agents，改为指向内置的当前 agent 清单",
   });
   assert.doesNotMatch(p, /asd_agents/, "这个工具已经不存在了");
   assert.match(p, /上面这份清单每一轮都会重新算/, "要告诉它状态从哪来");
+  assert.match(p, /用户明确要看.*全部.*session.*asd_list/s, "只在明确查全部 session 时使用");
+  assert.match(p, /asd_list.*不.*任务成败/s, "不能把 session 活动误当成任务完成度");
 });
 
 test("有 agent 时明确禁止 sleep 轮询", () => {

@@ -63,7 +63,7 @@ const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   },
 };
 
-test("e2e：spawn → agents → peek → steer → kill 走一遍真 asd", { timeout: 60_000 }, async (t) => {
+test("e2e：spawn → list → agents → peek → steer → kill 走一遍真 asd", { timeout: 60_000 }, async (t) => {
   if (!(await hasAsd())) {
     t.skip("asd 不在 PATH 上，跳过");
     return;
@@ -117,6 +117,12 @@ test("e2e：spawn → agents → peek → steer → kill 走一遍真 asd", { ti
 
     const listed = await tools.agents();
     assert.match(listed.text, new RegExp(session));
+
+    const allSessions = await tools.list();
+    assert.match(allSessions.text, new RegExp(session));
+    const sessionNames = allSessions.details?.sessions;
+    assert.ok(Array.isArray(sessionNames), "asd_list 应该返回结构化 session 名数组");
+    assert.ok(sessionNames.includes(session), "结构化结果也应该包含刚创建的 session");
 
     const steered = await tools.steer({ session, message: "ping" });
     assert.equal(steered.isError, undefined, steered.text);
