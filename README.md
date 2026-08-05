@@ -49,7 +49,7 @@ agent 照跑，停下时结果照样推给主 agent —— 关掉 boss mode 不�
 | `asd_list` | 列出 daemon 当前的全部 session（含未被 pi-asd 监视的） |
 | `asd_candidates` | 列出所有空闲、能接活的 session（含不是本扩展建的），供挑选 |
 | `asd_peek` | 读任意显式点名的现存 session 屏幕，不要求由 pi-asd 创建或监视 |
-| `asd_follow` | 跟踪任意显式点名的现存 session，返回过程输出 + 最后一屏 |
+| `asd_follow` | 给任意显式点名的现存 session 挂后台 watcher，立即返回；停下后自动推送 |
 | `asd_steer` | 往 agent 会话里打一条消息，然后重挂 watcher |
 | `asd_nav` | 往 agent 会话里按键，用来操作它弹出的对话框 |
 | `asd_rename` | 给 session 改名 —— **进程和屏幕都不动** |
@@ -205,9 +205,10 @@ agent 的那套判断不受影响。
 这是刻意的：`asd_peek` / `asd_follow` 可以**显式点名**任意现存 session，但清单工具不能
 借着「补状态」自动把所有用户手工会话的屏幕批量读出来。
 
-显式读取和等待不等于纳入监视列表：对台账外 session 调一次 `asd_peek` / `asd_follow`
-不会让 Reaper 管它，也不会给它挂长期后台 watcher。要发送输入并纳入监视，仍然用
-`asd_spawn(task, session: "<名字>")` 指名交给它；`asd_kill` 仍只能结束 pi-asd 自己创建的。
+显式读取和后台监视不等于纳入复用/回收台账：对台账外 session 调 `asd_peek` 只读一屏；
+调一次 `asd_follow` 会挂后台 watcher 并立即返回，停下后自动把最终屏幕推回来，但不会让
+Reaper 管它。要发送输入并纳入台账，仍然用 `asd_spawn(task, session: "<名字>")` 指名交给它；
+`asd_kill` 仍只能结束 pi-asd 自己创建的。只想停掉这个外部 watcher 时用 `asd_unmonitor`。
 
 它只适合用户明确要看**全部 session**时调用一次。它不是选空闲 agent 的入口（那是
 `asd_candidates`），不是判断任务结果的入口（那是 `asd_peek`），也不是等待方式（用
@@ -220,7 +221,7 @@ watcher 或 `asd_follow`）。代码层也会强制每轮 agent 执行只查询�
 - **daemon 里有哪些 session** —— 用户明确要求时调用一次 `asd_list`
 - **pi-asd 派了什么、watcher 挂没挂** —— boss mode 每轮自带的「当前 agent」清单
 - **它干得怎么样** —— `asd_peek`
-- **想等** —— `asd_follow`，或者什么都不做等 watcher 推送
+- **想等** —— 已有 watcher 就什么都不做；没有就调一次 `asd_follow` 注册后台监视，然后继续干别的
 
 > 顺带一提这条更一般的教训，剩下的工具仍然照它设计：**一个工具如果给不出某个结论，
 > 它的输出就不能长得像给出了。** 所以状态词是「安静 / 在动」而不是 idle / running ——
@@ -257,6 +258,10 @@ watcher 或 `asd_follow`）。代码层也会强制每轮 agent 执行只查询�
 **作答之后 watcher 自动重挂** —— `asd_nav` 和 `asd_steer` 都会重挂，不需要重新
 `asd_spawn`。
 
+上例适用于已经在 pi-asd 台账里的 session。`asd_follow` 单独监视的台账外 session 仍受
+写操作边界保护，`asd_nav` 不会碰它；这时通知会改为提示运行 `asd attach <session>` 手动
+作答，处理完再调一次 `asd_follow` 重新挂后台监视。
+
 识别对话框是启发式，取舍是**宁可漏认、不可错认**：漏认退回"已停下"的通知（屏幕
 照样带上，你自己也看得出来），错认会给一屏正常输出扣上"需要决策"的帽子、把 boss
 引去按键。所以要求「编号选项」和「底部按键提示」同时出现才算数。
@@ -267,7 +272,7 @@ agent 有时会弹**模态对话框**（选择框、确认框）。它会把输�
 `asd_steer` 的投递校验会失败并**拒绝按回车** —— 那是对的：那一下回车会去确认
 对话框当前选中的项（claude 信任对话框的第二项是 `2. No, exit`）。
 
-要操作对话框就用 `asd_nav`：
+台账内 session 要操作对话框就用 `asd_nav`：
 
 ```
 asd_peek("pi-a")                          # 先看清楚是什么界面、选中的是哪一项
@@ -287,15 +292,16 @@ asd_nav("pi-a", ["ArrowDown", "Enter"])   # 再按
 ### 不监视了：asd_unmonitor
 
 指名交过任务的 session 会进监视列表，从此一直被追踪（watcher 挂着、回收器管着、
-boss mode 的提示词里也列着它）。不想监视了：
+boss mode 的提示词里也列着它）。`asd_follow` 也可以只给台账外 session 挂 watcher。
+不想监视了：
 
 ```
 asd_unmonitor("nvr")
 ```
 
-**只是不管它了，不结束它。** 进程照跑，只是不再出现在监视列表里、watcher 停掉、
-空闲回收器也不再考虑它。之后还能用 `asd_spawn(task, session: "nvr")` 再次指名交给
-它 —— 重新纳入监视。
+**只是不管它了，不结束它。** 进程照跑，watcher 停掉；如果它原本在台账里，也会从
+监视列表摘掉，空闲回收器不再考虑它。之后还能用 `asd_spawn(task, session: "nvr")`
+再次指名交给它 —— 重新纳入监视。
 
 > 名字没叫 `asd_unwatch`：`asd_spawn` 已经有个 `watch` 参数，那个窄得多 —— 只是
 > "这次挂不挂 watcher"，session 仍然在监视列表里、仍然被回收器管。两个混起来会让
@@ -441,8 +447,8 @@ agent（退出时不会补扫一轮回收）。子 agent 照跑，你可以 `asd
 进去接管 —— 这是 asd 相对 tmux pane 真正多出来的能力。
 
 台账只活在进程内存里：主 agent 重启后监视列表是空的，但 session 仍在 `asd list`
-里。此时可以直接 `asd_peek` / `asd_follow` 显式查看或等待；需要发送输入、挂后台 watcher
-时，再用 `asd_candidates` 确认后指名交给它，重新纳入监视。
+里。此时可以直接 `asd_peek` 显式查看，或调一次 `asd_follow` 挂后台 watcher；需要发送输入、
+纳入复用/回收台账时，再用 `asd_candidates` 确认后指名交给它。
 
 ## 已知限制
 

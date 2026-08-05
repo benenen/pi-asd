@@ -14,6 +14,8 @@ import { detectDialog } from "./dialog.ts";
 export interface WatcherDeps {
   asd: Asd;
   notify: (text: string) => void;
+  /** 这个 session 是否允许用 asd_nav 发送按键；台账外 watcher 必须返回 false。 */
+  canNavigate?: (session: string) => boolean;
   /** 传给 `asd follow --timeout` 的时长串，例如 "30m"。 */
   timeout: string;
   now: () => number;
@@ -182,7 +184,7 @@ export class WatcherPool {
         this.#finish(session, ctrl);
         this.#notify(
           `[pi-asd] agent "${session}" 的 watcher 等了 ${this.#deps.timeout} 还没等到它停下，它仍在跑。` +
-            `要继续盯就调 asd_follow("${session}")。`,
+            `要继续盯就再调一次 asd_follow("${session}") 挂后台监视。`,
         );
         return;
       }
@@ -236,7 +238,7 @@ export class WatcherPool {
         this.#finish(session, ctrl);
         this.#notify(
           `[pi-asd] agent "${session}" 连续 ${MAX_QUIET_REARMS} 轮复核仍有活动，` +
-            `未确认停下，也没有读取最终结果。要继续盯就调 asd_follow("${session}")。`,
+            `未确认停下，也没有读取最终结果。要继续盯就再调一次 asd_follow("${session}") 挂后台监视。`,
         );
         return;
       }
@@ -282,11 +284,17 @@ export class WatcherPool {
       // 前者必须有人按键，不处理就永远卡着；后者是去读结果。
       const dialog = detectDialog(finalScreen);
       if (dialog !== undefined) {
+        const action =
+          this.#deps.canNavigate?.(session) === false
+            ? `这个 session 在台账外，pi-asd 不能替它发送按键。请运行 ` +
+              `asd attach ${session} 手动作答；处理后再调一次 asd_follow("${session}") ` +
+              `重新挂后台监视。`
+            : `用 asd_nav("${session}", [...]) 按键作答；` +
+              `作答之后 watcher 会自动重挂，不用重新 spawn。`;
         this.#notify(
           `[pi-asd] ⚠️ agent "${session}" 需要用户决策（已等待 ${took}）。\n` +
             `${dialog.summary}\n` +
-            `用 asd_nav("${session}", [...]) 按键作答；` +
-            `作答之后 watcher 会自动重挂，不用重新 spawn。\n` +
+            `${action}\n` +
             `--- 当前屏幕 ---\n${finalScreen ?? ""}`,
         );
         return;

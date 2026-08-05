@@ -607,7 +607,11 @@ function screenSeq(screens: string[]) {
   return () => screens[Math.min(i++, screens.length - 1)]!;
 }
 
-function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
+function confirmHarness(o: {
+  screens: string[];
+  goneCalls?: string[];
+  canNavigate?: (session: string) => boolean;
+}) {
   const next = screenSeq(o.screens);
   const notes: string[] = [];
   const followCalls: string[] = [];
@@ -653,6 +657,7 @@ function confirmHarness(o: { screens: string[]; goneCalls?: string[] }) {
     now: () => 0,
     earlyRetryDelayMs: 0,
     settleConfirmMs: 1, // 真的复核，但不用真等
+    canNavigate: o.canNavigate,
   });
   return {
     pool,
@@ -750,6 +755,19 @@ test("静止且是对话框 → 报「需要用户决策」，带上摘要和下
   assert.match(n, /asd_nav/, "要告诉 boss 用什么工具作答");
   assert.match(n, /自动重挂/, "要说明作答后不用重新 spawn");
   assert.doesNotMatch(n, /已停下/, "别再说成「已停下」——那会把 boss 引去读结果");
+});
+
+test("台账外 session 卡在对话框时不推荐必然失败的 asd_nav", async () => {
+  const dialog = " ❯ 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm · Esc to cancel";
+  const h = confirmHarness({ screens: [dialog], canNavigate: () => false });
+  h.pool.watch("mem");
+  await h.pool.idle();
+
+  const n = h.notes[0]!;
+  assert.match(n, /需要用户决策/);
+  assert.doesNotMatch(n, /asd_nav/, "台账外 session 调 asd_nav 会被硬闸门拒绝");
+  assert.match(n, /asd attach mem/, "要给一个能实际执行的恢复路径");
+  assert.match(n, /台账外/, "要解释为什么只能手动处理");
 });
 
 test("连续确认通过但 final peek 还悬着时被 stop：不通知、也不再重挂", async () => {

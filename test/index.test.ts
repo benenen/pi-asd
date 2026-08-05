@@ -21,3 +21,17 @@ test("每轮 agent 执行开始时重置 asd_list 的单次调用额度", () => 
   const source = readFileSync(new URL("../extensions/asd/index.ts", import.meta.url), "utf8");
   assert.match(source, /pi\.on\(\s*["']before_agent_start["'][\s\S]*?tools\.resetListAllowance\(\)/);
 });
+
+test("asd_follow 的公开参数只剩 session，不再暴露阻塞式 mode / timeout", () => {
+  const source = readFileSync(new URL("../extensions/asd/index.ts", import.meta.url), "utf8");
+  const registration = source.match(
+    /name:\s*["']asd_follow["'][\s\S]*?async execute\(_id, params\)/,
+  )?.[0];
+
+  assert.ok(registration, "应该找到 asd_follow 注册块");
+  assert.match(registration, /session:\s*Type\.String/);
+  assert.doesNotMatch(registration, /\bmode\s*:/);
+  assert.doesNotMatch(registration, /\btimeout\s*:/);
+  assert.match(registration, /后台 watcher/);
+  assert.match(registration, /立即返回/);
+});

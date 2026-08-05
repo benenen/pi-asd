@@ -597,8 +597,8 @@ export interface Tools {
   candidates(p: { cwd?: string }): Promise<ToolResult>;
   /** 显式读取任意现存 asd session；不要求先进入 pi-asd 台账。 */
   peek(p: { session: string; scrollback?: number }): Promise<ToolResult>;
-  /** 显式等待任意现存 asd session；不要求先进入 pi-asd 台账。 */
-  follow(p: { session: string; mode?: "settle" | "end"; timeout?: string }): Promise<ToolResult>;
+  /** 给任意现存 asd session 挂后台 watcher；不要求先进入 pi-asd 台账。 */
+  follow(p: { session: string }): Promise<ToolResult>;
   steer(p: { session: string; message: string }): Promise<ToolResult>;
   nav(p: { session: string; keys: unknown }): Promise<ToolResult>;
   unmonitor(p: { session: string }): Promise<ToolResult>;
@@ -1170,44 +1170,29 @@ export function createTools(deps: ToolDeps): Tools {
     },
 
     async follow(p) {
-      // 这个工具自己也会在 p.session 上跑一个 `asd follow`，跟后台 watcher
-      // 抢同一个 session 的 follow 流 —— 不停掉的话两边都在等，同一次停下会
-      // 被通知两遍（一遍是这次工具调用的返回值，一遍是 watcher 的 notify）。
-      // 记住原来挂没挂着，等这次阻塞的 follow 完事再按原状态重挂。
-      const wasWatching = watchers.isWatching(p.session);
-      watchers.stop(p.session);
-      let stillAlive = true;
-      try {
-        const outcome = await asd.follow(p.session, {
-          forever: p.mode === "end",
-          timeout: p.timeout ?? config.followTimeout,
-        });
-        if (outcome.kind === "gone") {
-          stillAlive = false;
-          return dropGone(p.session);
-        }
-
-        const screen = await asd.peek(p.session);
-        if (screen === null) {
-          // follow 返回和 final peek 之间 session 仍可能刚好退出。不能一边说
-          // “已停下/还在忙”、一边又打印“已消失”，更不能在 finally 里把
-          // 已经不存在的 session 重新挂上 watcher。
-          stillAlive = false;
-          return dropGone(p.session);
-        }
-        const head =
-          outcome.kind === "timeout"
-            ? `"${p.session}" 还在忙（follow 超时）。`
-            : `"${p.session}" 已停下。`;
+      // asd follow 本来就是给后台 watcher 用的阻塞原语，公开工具只负责注册，
+      // 不能把那份阻塞传给主 agent。否则 boss 会卡在工具调用里，直到员工停下
+      // 才能继续处理别的消息，跟 pi-asd 的后台监视模型正好相反。
+      if (watchers.isWatching(p.session)) {
         return {
-          text:
-            `${head}\n--- 过程输出 ---\n${outcome.text}\n` +
-            `--- 最后一屏 ---\n${screen}`,
-          details: { session: p.session, outcome: outcome.kind },
+          text: `"${p.session}" 已经在后台监视中；不用重复调用。停下来时结果会自动推送。`,
+          details: { session: p.session, watching: true, alreadyWatching: true },
         };
-      } finally {
-        if (wasWatching && stillAlive) rewatch(p.session, true);
       }
+
+      const live = await asd.list();
+      if (!live.some((info) => info.session === p.session)) {
+        return err(`asd 里没有叫 "${p.session}" 的 session。请先用 asd_list 确认名字。`);
+      }
+
+      const watching = watchers.watch(p.session);
+      const alreadyWatching = !watching;
+      return {
+        text: alreadyWatching
+          ? `"${p.session}" 已经在后台监视中；不用重复调用。停下来时结果会自动推送。`
+          : `已在后台监视 "${p.session}"。本次调用立即返回；它停下来时结果会自动推送，不要轮询。`,
+        details: { session: p.session, watching: true, alreadyWatching },
+      };
     },
 
     async steer(p) {
@@ -1357,11 +1342,18 @@ export function createTools(deps: ToolDeps): Tools {
     async unmonitor(p) {
       const rec = registry.get(p.session);
       if (rec === undefined) {
-        const known = registry.names();
-        return err(
-          `本来就没在监视 "${p.session}"。` +
-            `当前监视中：${known.length > 0 ? known.join(" / ") : "（空）"}`,
-        );
+        // asd_follow 可以只挂 watcher、不把用户手建的 session 放进台账。这样的
+        // 监视也必须能显式取消，否则只能等 session 停下或主进程退出。
+        if (watchers.isWatching(p.session)) {
+          watchers.stop(p.session);
+          return {
+            text:
+              `已停止后台监视 "${p.session}"。**session 本身没有被结束，还在跑。**` +
+              `它原本不在 pi-asd 台账里，空闲回收器从未接管它。`,
+            details: { session: p.session, wasCreatedByUs: false },
+          };
+        }
+        return err(`本来就没在监视 "${p.session}"。`);
       }
 
       // 先停 watcher 再摘记录：反过来的话，watcher 收尾时拿不到记录，

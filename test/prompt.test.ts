@@ -78,8 +78,10 @@ test("轮询禁令覆盖「反复调工具」，不只是 bash sleep", () => {
   });
   assert.match(p, /反复调任何一个\s*工具看有没有变化/s, "禁令要盖住所有工具，不是列举");
   assert.match(p, /连着调.*就是轮询/s, "要给出判定标准，不是列举工具");
-  assert.match(p, /等待只有两种正确做法/, "禁完要给出正确做法");
-  assert.match(p, /asd_follow/);
+  assert.match(p, /等待不需要占住当前轮次/, "禁完要给出正确做法");
+  assert.match(p, /asd_follow.*后台监视/s);
+  assert.match(p, /立即返回/, "follow 不能再暗示会阻塞当前轮次");
+  assert.doesNotMatch(p, /asd_follow.*阻塞到/s);
 });
 
 /**
@@ -99,7 +101,7 @@ test("提示词只把 asd_list 用作全部 session 清单，不恢复 asd_agent
   assert.match(
     p,
     /asd_peek.*asd_follow.*任意现存.*不要求.*spawn/s,
-    "显式查看或等待台账外 session 不需要先 spawn",
+    "显式查看或后台监视台账外 session 不需要先 spawn",
   );
 });
 

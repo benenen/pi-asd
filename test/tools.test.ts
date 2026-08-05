@@ -92,8 +92,6 @@ function harness(
     peekThrows?: boolean;
     /** asd rename 的结果。 */
     renameOutcome?: "ok" | "gone" | "unsupported" | "failed";
-    /** 显式 follow 工具的结果；不传时保持挂起，供后台 watcher 测试使用。 */
-    followResult?: ExecResult;
     /** 透传给子 agent 的环境变量。 */
     spawnEnv?: Record<string, string>;
     /** 覆盖预设表（测别名映射用）。 */
@@ -144,7 +142,7 @@ function harness(
       case "kill":
         return ok();
       case "follow":
-        return o.followResult ?? new Promise<ExecResult>(() => {});
+        return new Promise<ExecResult>(() => {});
       default:
         throw new Error(`没准备好的子命令：${args.join(" ")}`);
     }
@@ -609,114 +607,44 @@ test("steer 送消息并重挂 watcher", async () => {
   h.watchers.stopAll();
 });
 
-// M6：asd_follow 工具自己也会在同一个 session 上跑一个 `asd follow`——如果
-// 不先停掉后台 watcher，两边同时在等同一个 session 的 follow 流，同一次停下
-// 会被通知两遍。这里手动控制"工具自己发起的那次 follow"的解析时机，断言：
-// 阻塞期间后台 watcher 已经被停掉；调用结束后按原来挂着的状态重挂。
-test("follow 工具阻塞期间会先停掉后台 watcher，结束后按原状态重挂", async () => {
-  const calls: string[][] = [];
-  let resolveToolFollow: ((r: ExecResult) => void) | undefined;
-  let followCallCount = 0;
-  /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
-  const typed = new Map<string, string>();
-  const exec: Exec = async (_cmd, args) => {
-    calls.push(args);
-    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
-    switch (args[0]) {
-      case "list":
-        // 空列表：spawn 这次要新建，不能让假 asd 已经"认识"一个同名的
-        // "pi-a"，否则 allocateName 会为了避重把新 session 改叫 "pi-a-2"，
-        // 后面所有对 "pi-a" 的断言都会对不上号。
-        return ok(JSON.stringify([]));
-      case "new":
-        return ok(`${args[1]}\n`);
-      case "peek":
-        return ok("SCREEN");
-      case "send":
-        return ok();
-      case "follow":
-        followCallCount += 1;
-        // 第一次 follow 是 spawn 挂上的后台 watcher —— 永远挂住，只用来让
-        // "watcher 曾经挂着"这件事成立。第二次才是这个工具调用自己发起的，
-        // 由测试手动放行，好卡在"已经发起、还没解析"这个窗口期断言。
-        if (followCallCount === 1) return new Promise<ExecResult>(() => {});
-        return new Promise<ExecResult>((resolve) => {
-          resolveToolFollow = resolve;
-        });
-      default:
-        throw new Error(`没准备好的子命令：${args.join(" ")}`);
-    }
-  };
+test("follow 给现存 session 挂后台 watcher 后立即返回", async () => {
+  const h = harness({ live: [info("mem")] });
 
-  // enterDelayMs: 0 —— send 现在分两次发（正文、Enter），单测不该真睡 300ms
-  const asd = createAsd(exec, { enterDelayMs: 0 });
-  const registry = new Registry("pi-");
-  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
-  const tools = createTools({
-    asd,
-    registry,
-    watchers,
-    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m" },
-    mkdirp: async () => {},
-    now: () => 0,
+  const result = await Promise.race([
+    h.tools.follow({ session: "mem" }),
+    new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100)),
+  ]);
+
+  if (result === "blocked") assert.fail("工具调用不能等后台 asd follow 结束");
+  assert.equal(result.isError, undefined, result.text);
+  assert.match(result.text, /立即返回/);
+  assert.match(result.text, /自动推送/);
+  assert.deepEqual(result.details, {
+    session: "mem",
+    watching: true,
+    alreadyWatching: false,
   });
-
-  await tools.spawn({ task: "t", name: "a" });
-  assert.equal(watchers.isWatching("pi-a"), true);
-
-  const p = tools.follow({ session: "pi-a" });
-  // JS 对 async 函数的语义：调用它会同步跑到第一个真正挂起的 await 为止 ——
-  // follow() 里 watchers.stop() 在任何 await 之前，所以这里不需要等微任务，
-  // 断言已经能成立。
-  assert.equal(resolveToolFollow !== undefined, true, "工具自己的第二次 follow 应该已经发起");
-  assert.equal(watchers.isWatching("pi-a"), false, "工具自己的 follow 在跑的时候，后台 watcher 必须先停掉");
-
-  resolveToolFollow!({ stdout: "", stderr: "", code: 0 });
-  const r = await p;
-  assert.equal(r.isError, undefined, r.text);
-  assert.equal(watchers.isWatching("pi-a"), true, "follow 工具调用结束后，应该按原来挂着的状态重挂");
-  watchers.stopAll();
+  assert.equal(h.watchers.isWatching("mem"), true);
+  assert.equal(h.registry.get("mem"), undefined, "后台监视不能让外部 session 进入复用/回收台账");
+  assert.deepEqual(subcommands(h), ["list", "follow"]);
+  h.watchers.stopAll();
 });
 
-test("follow 返回后 session 在 final peek 前消失：只报结束，原 watcher 不重挂", async () => {
-  let followCalls = 0;
-  const exec: Exec = async (_cmd, args) => {
-    const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
-    if (args[0] === "follow") {
-      followCalls += 1;
-      // 1：原后台 watcher；2：工具自己的 follow；3：错误重挂时才会出现。
-      if (followCalls === 2) return ok();
-      return new Promise<ExecResult>(() => {});
-    }
-    if (args[0] === "peek") return { stdout: "", stderr: "no such session", code: 3 };
-    throw new Error(`没准备好的子命令：${args.join(" ")}`);
-  };
-  const asd = createAsd(exec, { enterDelayMs: 0 });
-  const registry = new Registry("pi-");
-  registry.add({
-    session: "pi-a",
-    task: "t",
-    cwd: "/w",
-    agent: "pi",
-    createdAt: 0,
-    createdByUs: true,
-  });
-  const watchers = new WatcherPool({ asd, notify: () => {}, timeout: "30m", now: () => 0 });
-  const tools = createTools({
-    asd,
-    registry,
-    watchers,
-    config: { defaultAgent: "pi", workspaceBase: "/base", followTimeout: "30m" },
-    mkdirp: async () => {},
-    now: () => 0,
-  });
-  watchers.watch("pi-a");
+test("follow 重复注册同一个 session 时立即返回且不重挂 watcher", async () => {
+  const h = harness({ live: [info("mem")] });
+  h.watchers.watch("mem");
 
-  const r = await tools.follow({ session: "pi-a" });
+  const r = await h.tools.follow({ session: "mem" });
 
-  assert.equal(r.text, '"pi-a" 的 session 已结束，已从监视列表移除。');
-  assert.equal(watchers.isWatching("pi-a"), false);
-  assert.equal(followCalls, 2, "session 已消失后不能重挂第三个 follow");
+  assert.equal(r.isError, undefined, r.text);
+  assert.match(r.text, /已经在后台监视中/);
+  assert.deepEqual(r.details, {
+    session: "mem",
+    watching: true,
+    alreadyWatching: true,
+  });
+  assert.deepEqual(subcommands(h), ["follow"], "重复注册不能再查 daemon 或启动第二个 follow");
+  h.watchers.stopAll();
 });
 
 test("steer 对台账外的名字直接拒绝，不碰 asd", async () => {
@@ -736,35 +664,15 @@ test("peek 允许读取台账外、由用户显式点名的 session", async () =
   assert.deepEqual(subcommands(h), ["peek"]);
 });
 
-test("follow 允许跟踪台账外、由用户显式点名的 session", async () => {
-  const h = harness({
-    live: [info("mem")],
-    followResult: {
-      stdout: '{"event":"output","text":"done\\n"}\n',
-      stderr: "",
-      code: 0,
-    },
-  });
-
-  const r = await h.tools.follow({ session: "mem" });
-
-  assert.equal(r.isError, undefined, r.text);
-  assert.match(r.text, /"mem" 已停下/);
-  assert.match(r.text, /done/);
-  assert.match(r.text, /SCREEN:mem/);
-  assert.deepEqual(subcommands(h), ["follow", "peek"]);
-});
-
-test("follow 点名的台账外 session 已消失时，不谎称从台账移除了记录", async () => {
-  const h = harness({
-    followResult: { stdout: "", stderr: "no such session", code: 3 },
-  });
+test("follow 拒绝不存在的 session，不留下后台 watcher", async () => {
+  const h = harness();
 
   const r = await h.tools.follow({ session: "ghost" });
 
-  assert.equal(r.isError, undefined, r.text);
-  assert.equal(r.text, '"ghost" 的 session 已结束。');
-  assert.deepEqual(subcommands(h), ["follow"]);
+  assert.equal(r.isError, true);
+  assert.match(r.text, /没有叫 "ghost" 的 session/);
+  assert.equal(h.watchers.isWatching("ghost"), false);
+  assert.deepEqual(subcommands(h), ["list"]);
 });
 
 test("peek 返回屏幕内容", async () => {
@@ -1962,12 +1870,39 @@ test("unmonitor 之后还能再次指名交给它 —— 重新收养", async ()
   assert.equal(h.registry.get("mem")?.createdByUs, false);
 });
 
-test("unmonitor 台账里没有的名字 → 报错并列出台账，不碰 asd", async () => {
+test("unmonitor 台账和 watcher 都没有的名字 → 报错且不碰 asd", async () => {
   const h = harness();
   const r = await h.tools.unmonitor({ session: "ghost" });
   assert.equal(r.isError, true);
   assert.match(r.text, /本来就没在监视/);
+  assert.doesNotMatch(r.text, /当前监视中/, "registry 清单会漏掉 watcher-only session，不能冒充完整清单");
   assert.equal(h.calls.length, 0);
+});
+
+test("unmonitor 报错时不拿 registry 冒充完整监视清单", async () => {
+  const h = harness({ live: [info("mem")] });
+  h.watchers.watch("mem");
+
+  const r = await h.tools.unmonitor({ session: "ghost" });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /本来就没在监视 "ghost"/);
+  assert.doesNotMatch(r.text, /当前监视中：.*空/s);
+  h.watchers.stopAll();
+});
+
+test("unmonitor 可以停止 follow 给台账外 session 挂的后台 watcher", async () => {
+  const h = harness({ live: [info("mem")] });
+  h.watchers.watch("mem");
+
+  const r = await h.tools.unmonitor({ session: "mem" });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.match(r.text, /已停止后台监视/);
+  assert.match(r.text, /session 本身没有被结束/);
+  assert.equal(h.watchers.isWatching("mem"), false);
+  assert.equal(h.registry.get("mem"), undefined);
+  assert.deepEqual(subcommands(h), ["follow"], "停止监视不能 kill 或发送输入");
 });
 
 /**

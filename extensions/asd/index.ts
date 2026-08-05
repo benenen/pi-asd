@@ -162,6 +162,9 @@ export default function (pi: ExtensionAPI): void {
     timeout: followTimeout,
     now: () => Date.now(),
     notify,
+    // asd_follow 能给台账外 session 挂只读 watcher，但 asd_nav 会发送按键，
+    // 仍只允许台账内目标。对话框通知必须按这道边界给出可执行的下一步。
+    canNavigate: (session) => registry.get(session) !== undefined,
     // session 在 asd 里真的没了 —— 台账里那条已经是幽灵记录，清掉它，
     // 免得提示词里的「当前 agent」清单和 pickReusable 还拿它当活的。
     //
@@ -450,20 +453,14 @@ export default function (pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "asd_follow",
-    label: "Follow agent",
+    label: "Watch agent",
     description: [
-      "阻塞到显式点名的任意现存 asd session 停下来，返回期间的输出和最后一屏。",
-      "不要求它由 pi-asd 创建或监视；这次调用不会把外部 session 纳入台账。",
-      "watcher 已经在替你等了，一般不需要主动调 —— 只在要盯死某一个时用。",
+      "给显式点名的任意现存 asd session 挂后台 watcher，然后立即返回。",
+      "session 停下来后，watcher 会自动把最终屏幕推送回来；不要阻塞当前轮次，也不要轮询。",
+      "不要求它由 pi-asd 创建或已在台账里；外部 session 不会因此进入复用或回收台账。",
     ].join("\n"),
     parameters: Type.Object({
       session: Type.String({ description: "任意现存 asd session 名" }),
-      mode: Type.Optional(
-        StringEnum(["settle", "end"] as const, {
-          description: "settle：静默即返回（默认）；end：等到 session 真正结束",
-        }),
-      ),
-      timeout: Type.Optional(Type.String({ description: "时长串，例如 5m；默认 30m" })),
     }),
     async execute(_id, params) {
       return toolResult(await tools.follow(params));

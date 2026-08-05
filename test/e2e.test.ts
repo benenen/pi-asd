@@ -125,17 +125,21 @@ test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { time
     assert.ok(sessionNames.includes(session), "结构化结果也应该包含刚创建的 session");
 
     // 绕过 tools.spawn 直接建一个 session，模拟用户手工创建的长期员工。它没有
-    // registry 记录，但显式点名时 peek / follow 都应该可用，且不会因此被纳入监视。
+    // registry 记录，但显式点名时 peek / follow 都应该可用；follow 只挂后台
+    // watcher，不会把它纳入复用/回收台账。
     const manual = await asd.create({ name: "manual", cwd: root, cmd: "sh -c 'echo MANUAL; sleep 30'" });
     const manualPeek = await tools.peek({ session: manual });
     assert.equal(manualPeek.isError, undefined, manualPeek.text);
     assert.match(manualPeek.text, /MANUAL/);
 
-    const manualFollow = await tools.follow({ session: manual, timeout: "5s" });
+    const manualFollow = await tools.follow({ session: manual });
     assert.equal(manualFollow.isError, undefined, manualFollow.text);
-    assert.match(manualFollow.text, /MANUAL/);
-    assert.equal(registry.get(manual), undefined, "只读/等待不能把手工 session 纳入台账");
-    assert.equal(watchers.isWatching(manual), false, "显式 follow 结束后不能留下后台 watcher");
+    assert.match(manualFollow.text, /立即返回/);
+    assert.equal(registry.get(manual), undefined, "后台监视不能把手工 session 纳入台账");
+    assert.equal(watchers.isWatching(manual), true, "显式 follow 应该留下后台 watcher");
+    const manualUnmonitor = await tools.unmonitor({ session: manual });
+    assert.equal(manualUnmonitor.isError, undefined, manualUnmonitor.text);
+    assert.equal(watchers.isWatching(manual), false, "unmonitor 应该停掉外部 session 的 watcher");
     await asd.kill(manual);
 
     const steered = await tools.steer({ session, message: "ping" });

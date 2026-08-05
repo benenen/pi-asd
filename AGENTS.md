@@ -93,10 +93,12 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
 自动复用**永远不碰台账外的 session**；台账外的只能由主 agent 看过 `asd_candidates` 之后
 指名交给它。
 
-**显式只读/等待是正交的，不走这道所有权判断。** `asd_peek` / `asd_follow` 可以点名任意
-现存 asd session，不要求它先由 pi-asd spawn 或进入台账；两者不发送输入、不 kill、不让
-Reaper 接管，也不会把外部 session 纳入监视列表。`steer` / `nav` 仍会发送输入，所以只允许
-台账内目标；要操作外部 session，先用 `asd_spawn(task, session: "<名字>")` 指名交给它。
+**显式只读/后台监视是正交的，不走这道所有权判断。** `asd_peek` / `asd_follow` 可以点名任意
+现存 asd session，不要求它先由 pi-asd spawn 或进入台账；前者只读一屏，后者给它挂后台
+watcher 后立即返回，停下时自动推送。两者不发送输入、不 kill、不让 Reaper 接管，也不会把
+外部 session 纳入复用/回收台账。只由 `asd_follow` 挂上的外部 watcher 可以用 `asd_unmonitor`
+停掉，session 进程不动。`steer` / `nav` 仍会发送输入，所以只允许台账内目标；要操作外部
+session，先用 `asd_spawn(task, session: "<名字>")` 指名交给它。
 
 **`persistent` 是另一条正交的判断，别和 `createdByUs` 混起来。** 空闲回收要两条都过：
 
@@ -286,6 +288,10 @@ pi / codex 保持 `argv`（没有验证过的替代方案就别改它们，见�
 最终 peek 之后，再用 `dialog.ts` 的 `detectDialog()` 分「等决策」和「真停下」，
 两种通知的措辞完全不同：前者必须有人按键、不处理就永远卡着，后者是去读结果。
 
+对话框的下一步还要尊重写操作边界：台账内 session 才能提示 `asd_nav`；只由
+`asd_follow` 挂上的台账外 watcher 必须提示 `asd attach <session>` 手动处理，处理后再调
+一次 `asd_follow` 重挂。不能给一个必然被 `requireMonitoredForInput` 拒绝的操作指令。
+
 `detectDialog` 的取舍是**宁可漏认、不可错认**，所以要求「编号选项」和「底部按键
 提示」同时出现。漏认只是退回"已停下"（屏幕照样带上）；错认会把 boss 引去对一屏
 正常输出按键。
@@ -340,7 +346,8 @@ pi-asd 台账里的 agent，曾被模型拿来当 sleep：连续调用、看同�
 这仍然是只读工具，轮询风险没有凭空消失，所以公开它必须同时守住五道边界：
 
 1. **用途收窄**：只有用户明确要看全部 asd session 时才调用一次；挑能接活的仍用
-   `asd_candidates`，看结果仍用 `asd_peek`，等待仍用 watcher / `asd_follow`
+   `asd_candidates`，看结果仍用 `asd_peek`；等待不占当前轮次，已有 watcher 就等推送，
+   没有就调一次 `asd_follow` 注册后台监视
 2. **只列名字**：不输出 `running` / `idle_ms` / title，不读屏幕，不给调用方猜成败的材料
 3. **输出和 description 都明说边界**：这是名字清单，不是状态或等待信号
 4. **代码层单次额度**：`createTools` 在第一次 `await` 前同步耗掉额度，挡住并发调用；同一轮
