@@ -68,25 +68,38 @@ interface ScreenFixture {
   cols?: number;
 }
 
+interface StyledScreenFixture extends ScreenFixture {
+  faintRanges: { row: number; startCol: number; endCol: number }[];
+}
+
 /** fake `asd peek` 同时支持 raw 和 `--json`；默认光标在最后一个可见字符后。 */
 function peekStdout(
   args: string[],
   screen: string,
   cursor?: { row: number; col: number },
   cols = 181,
+  faintRanges?: StyledScreenFixture["faintRanges"],
 ): string {
   if (!args.includes("--json")) return screen;
   const lines = screen.split("\n");
   // 真 `peek --json` 会省略 raw screen 尾部的空白行，但 cursor 仍指向完整终端行。
   const rendered = screen.replace(/\n+$/, "");
-  return JSON.stringify({
+  const snapshot: Record<string, unknown> = {
     session: args[1],
     title: "",
     rows: lines.length,
     cols,
     cursor: cursor ?? { row: lines.length - 1, col: lines.at(-1)?.length ?? 0 },
     screen: rendered,
-  });
+  };
+  if (args.includes("--styles")) {
+    snapshot.faint_ranges = (faintRanges ?? []).map((range) => ({
+      row: range.row,
+      start_col: range.startCol,
+      end_col: range.endCol,
+    }));
+  }
+  return JSON.stringify(snapshot);
 }
 
 /**
@@ -125,11 +138,14 @@ function harness(
       | "submit"
       | "newline-once"
       | "newline-always"
+      | "ignored-once"
       | "ignored"
       | "mutated"
       | "mutated-prompt"
       | "history"
       | "history-prompt";
+    /** 第一颗 composer Enter 时 session 已消失，asd send 返回退出码 3。 */
+    goneOnEnter?: boolean;
     /** 第一次 Enter 后弹出模态框（已经提交，但绝不能再补 Enter）。 */
     dialogAfterFirstEnter?: boolean;
     /** 正常输入框之前固定显示的历史内容。 */
@@ -138,6 +154,10 @@ function harness(
     screenAfterText?: string | ((text: string) => string);
     /** 光标不在屏幕末行的 TUI（例如 pi 的横线输入框）专用快照。 */
     snapshotBeforeText?: ScreenFixture;
+    /** 同一屏幕的样式快照，只在 `peek --json --styles` 时返回。 */
+    styledSnapshotBeforeText?: StyledScreenFixture;
+    /** 模拟安装的 asd 太老，尚不认识 `peek --styles`。 */
+    stylesUnsupported?: boolean;
     snapshotAfterText?: ScreenFixture | ((text: string) => ScreenFixture);
     /** 屏幕永远停在信任对话框上 —— 模拟"送了键也过不去"。 */
     stuckOnDialog?: boolean;
@@ -183,6 +203,22 @@ function harness(
         return ok(`${o.newEchoes ?? args[1]}\n`);
       case "peek": {
         if (o.peekThrows) throw new Error("peek 炸了");
+        if (args.includes("--styles")) {
+          if (o.stylesUnsupported) {
+            return { stdout: "", stderr: "unexpected argument '--styles'", code: 2 };
+          }
+          const fixture = o.styledSnapshotBeforeText;
+          if (fixture === undefined) throw new Error("没有准备 styled peek 夹具");
+          return ok(
+            peekStdout(
+              args,
+              fixture.screen,
+              fixture.cursor,
+              fixture.cols,
+              fixture.faintRanges,
+            ),
+          );
+        }
         if (o.stuckOnDialog)
           return ok(peekStdout(args, "❯ 1. Yes, I trust this folder\n  2. No, exit\n Enter to confirm"));
         if (dialogSessions.has(args[1]!)) {
@@ -256,6 +292,7 @@ function harness(
         if (args[2] === "--key" && args[3] === "Enter") {
           // 启动期对话框/nav 的 Enter 没有任务正文，不是 composer 提交。
           if (!typed.has(session)) return ok();
+          if (o.goneOnEnter) return { stdout: "", stderr: "no such session", code: 3 };
           const count = (enterCounts.get(session) ?? 0) + 1;
           enterCounts.set(session, count);
           if (o.dialogAfterFirstEnter && count === 1) {
@@ -271,7 +308,7 @@ function harness(
               historySessions.add(session);
             } else if (behavior === "history-prompt") {
               promptHistorySessions.add(session);
-            } else if (behavior === "ignored") {
+            } else if (behavior === "ignored" || (behavior === "ignored-once" && count === 1)) {
               // TUI 尚未处理 Enter，屏幕和输入框都完全没变。
             } else if (behavior === "mutated") {
               // Enter 没提交，外部 attach 反而抢先在 composer 前面插入了字符。
@@ -359,6 +396,10 @@ function deliveries(h: Harness): string[][] {
 /** 补发的回车调用。 */
 function enterKeys(h: Harness): string[][] {
   return h.calls.filter((c) => c[0] === "send" && c.includes("--key"));
+}
+
+function styledPeeks(h: Harness): string[][] {
+  return h.calls.filter((c) => c[0] === "peek" && c.includes("--styles"));
 }
 
 /**
@@ -2053,15 +2094,27 @@ test("回归：投递成功时照常记台账、挂 watcher", async () => {
   h.watchers.stopAll();
 });
 
-for (const placeholder of ["Explain this codebase", "Ask anything"]) {
-  test(`Codex 已验证 placeholder「${placeholder}」不按旧草稿处理`, async () => {
+for (const placeholder of [
+  "Use /skills to list available skills",
+  "Write tests for @filename",
+  "Implement {feature}",
+]) {
+  test(`Codex 动态 faint placeholder「${placeholder}」不按旧草稿处理`, async () => {
+    const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+    const cursor = { row: 1, col: 2 };
     const h = harness({
       live: [info("mem", { command: "codex", idle_ms: 60_000 })],
       cards: [card("mem", "/w/mem")],
       snapshotBeforeText: {
-        screen: `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`,
-        cursor: { row: 1, col: 2 },
+        screen,
+        cursor,
         cols: 181,
+      },
+      styledSnapshotBeforeText: {
+        screen,
+        cursor,
+        cols: 181,
+        faintRanges: [{ row: 1, startCol: 2, endCol: 2 + placeholder.length }],
       },
       snapshotAfterText: (sentText) => {
         const rendered = sentText.replaceAll("\n", "\n  ");
@@ -2076,10 +2129,176 @@ for (const placeholder of ["Explain this codebase", "Ask anything"]) {
 
     const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
     assert.equal(r.isError, undefined, r.text);
+    assert.equal(styledPeeks(h).length, 1, "未知文案必须靠终端样式识别，不能靠固定列表");
     assert.equal(deliveries(h).length, 1);
     assert.equal(enterKeys(h).length, 1);
   });
 }
+
+test("与动态 placeholder 字面相同的普通样式旧草稿仍拒绝投递", async () => {
+  const placeholder = "Use /skills to list available skills";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const cursor = { row: 1, col: 2 };
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor, cols: 181 },
+    styledSnapshotBeforeText: { screen, cursor, cols: 181, faintRanges: [] },
+  });
+
+  const r = await h.tools.spawn({ task: "不能覆盖旧草稿", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(styledPeeks(h).length, 1);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("placeholder 只有部分字符是 faint 时不能当空输入框", async () => {
+  const placeholder = "Use skills safely";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const cursor = { row: 1, col: 2 };
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor, cols: 181 },
+    styledSnapshotBeforeText: {
+      screen,
+      cursor,
+      cols: 181,
+      faintRanges: [{ row: 1, startCol: 2, endCol: 5 }],
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "不能覆盖混合样式草稿", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("中文动态 placeholder 按终端 cell 范围识别", async () => {
+  const placeholder = "解释这个代码库";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const cursor = { row: 1, col: 2 };
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor, cols: 181 },
+    styledSnapshotBeforeText: {
+      screen,
+      cursor,
+      cols: 181,
+      faintRanges: [{ row: 1, startCol: 2, endCol: 2 + [...placeholder].length * 2 }],
+    },
+    snapshotAfterText: (sentText) => {
+      const rendered = sentText.replaceAll("\n", "\n  ");
+      const lines = rendered.split("\n");
+      return {
+        screen: `HISTORY\n› ${rendered}\n\n  gpt-5.6-sol · Context 0% used`,
+        cursor: { row: lines.length, col: 2 + lines.at(-1)!.length },
+        cols: 181,
+      };
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行中文任务", session: "mem", watch: false });
+
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1);
+});
+
+test("styled peek 与发送前纯文本快照不一致时失败闭合", async () => {
+  const placeholder = "Implement {feature}";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const cursor = { row: 1, col: 2 };
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor, cols: 181 },
+    styledSnapshotBeforeText: {
+      screen: screen.replace(placeholder, "REAL-DRAFT"),
+      cursor,
+      cols: 181,
+      faintRanges: [{ row: 1, startCol: 2, endCol: 12 }],
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "不能追着变化写", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("样式复核时出现模态框绝不发送正文或任何按键", async () => {
+  const placeholder = "Implement {feature}";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor: { row: 1, col: 2 }, cols: 181 },
+    styledSnapshotBeforeText: {
+      screen: "❯ 1. Allow this action\n  2. Cancel\n Enter to confirm · Esc to cancel",
+      cursor: { row: 0, col: 0 },
+      cols: 181,
+      faintRanges: [],
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "不能确认模态框", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /对话框/);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("畸形样式范围作为 text 阶段失败处理，不发送正文或按键", async () => {
+  const placeholder = "Implement {feature}";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const cursor = { row: 1, col: 2 };
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor, cols: 181 },
+    styledSnapshotBeforeText: {
+      screen,
+      cursor,
+      cols: 181,
+      faintRanges: [{ row: 1, startCol: 2, endCol: 999 }],
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "不能信任坏 JSON", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.match(r.text, /无法验证/);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("旧 asd 没有样式快照能力时给出升级提示且绝不探测输入框", async () => {
+  const placeholder = "Implement {feature}";
+  const screen = `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`;
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: { screen, cursor: { row: 1, col: 2 }, cols: 181 },
+    stylesUnsupported: true,
+  });
+
+  const r = await h.tools.spawn({ task: "需要新 asd", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.match(r.text, /升级 asd/);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0, "不支持样式时不能用 Space/Backspace/Enter 猜测");
+});
 
 test("正常历史 prompt 上方仍有旧任务时，底部空 composer 仍可接新任务", async () => {
   const h = harness({
@@ -2366,14 +2585,16 @@ test("首次 Enter 后出现模态框时绝不补 Enter", async () => {
   });
 
   const r = await h.tools.spawn({ task: "执行时可能申请权限", session: "mem", watch: false });
-  assert.equal(r.isError, undefined, r.text);
+  assert.equal(r.isError, true, "对话框来源不明时不能谎报本任务已提交");
+  assert.equal(r.details?.phase, "submit");
   const screen = await h.tools.peek({ session: "mem" });
-  assert.match(screen.text, /Allow this action/, "提交后的模态框应保留给用户决定");
+  assert.match(screen.text, /Allow this action/, "模态框应保留给用户决定");
   assert.equal(enterKeys(h).length, 1, "第二颗 Enter 会误确认模态框，绝不能发送");
   assert.equal(deliveries(h).length, 1);
+  assert.equal(h.registry.get("mem")?.createdByUs, false, "仍要保留 peek/nav 控制权");
 });
 
-test("首次 Enter 后屏幕完全未变时不补第二颗，返回 submit 未确认", async () => {
+test("第一颗 Enter 后屏幕不变时停止自动补键，返回可恢复 submit 状态", async () => {
   const h = harness({
     live: [info("mem", { command: "codex", idle_ms: 60_000 })],
     cards: [card("mem", "/w/mem")],
@@ -2383,8 +2604,60 @@ test("首次 Enter 后屏幕完全未变时不补第二颗，返回 submit 未�
   const r = await h.tools.spawn({ task: "等待 TUI 真正处理按键", session: "mem", watch: false });
   assert.equal(r.isError, true);
   assert.equal(r.details?.phase, "submit");
-  assert.equal(enterKeys(h).length, 1, "没有看到换行的正向证据就不能盲补 Enter");
+  assert.equal(r.details?.pendingComposer, true);
+  assert.equal(enterKeys(h).length, 1, "daemon ACK 不能证明消费，完全不变时绝不能自动补键");
   assert.equal(deliveries(h).length, 1);
+});
+
+test("第一颗 Enter 被 TUI 完全吞掉时，保留 nav 权后可显式提交", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "ignored-once",
+  });
+
+  const r = await h.tools.spawn({ task: "commit and push", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.pendingComposer, true);
+  assert.equal(h.registry.get("mem")?.createdByUs, false);
+  assert.equal(enterKeys(h).length, 1, "自动路径只能送第一颗 Enter");
+  const recovered = await h.tools.nav({ session: "mem", keys: ["Enter"] });
+  assert.equal(recovered.isError, undefined, recovered.text);
+  assert.equal(deliveries(h).length, 1, "恢复提交只能补 Enter，不能重发正文");
+  assert.equal(enterKeys(h).length, 2, "第二颗来自显式 nav 决策");
+  const screen = await h.tools.peek({ session: "mem" });
+  assert.match(screen.text, /WORKING/, "显式 Enter 应触发已经在 composer 里的原任务");
+});
+
+test("指名投递第一颗 Enter 无效时仍保留监视和 nav 恢复权", async () => {
+  const h = harness({
+    live: [info("asd", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("asd", "/root/workspace/master/asd")],
+    enterBehavior: "ignored",
+  });
+
+  const spawned = await h.tools.spawn({ task: "commit and push", session: "asd" });
+
+  assert.equal(spawned.isError, true, "第一颗 Enter 未确认时不能谎报成功");
+  assert.equal(spawned.details?.phase, "submit");
+  assert.equal(spawned.details?.pendingComposer, true, "要标出仍能识别本次 proof 的 composer");
+  assert.equal(deliveries(h).length, 1, "失败恢复也不能重复发送正文");
+  assert.equal(enterKeys(h).length, 1, "自动路径不能猜测第一颗已被吞掉");
+  assert.equal(h.registry.get("asd")?.createdByUs, false, "已修改过的外部 session 必须留在台账");
+  assert.equal(h.registry.get("asd")?.task, "commit and push");
+  assert.equal(h.watchers.isWatching("asd"), true, "失败画面也要由 watcher 汇报");
+
+  const steered = await h.tools.steer({ session: "asd", message: "不要改动其他文件" });
+  assert.equal(steered.isError, true);
+  assert.doesNotMatch(steered.text, /不在 pi-asd 监视列表/, "steer 不能再因台账丢失而拒绝");
+  assert.match(steered.text, /已有未提交内容/);
+
+  const navigated = await h.tools.nav({ session: "asd", keys: ["Enter"] });
+  assert.equal(navigated.isError, undefined, navigated.text);
+  assert.equal(enterKeys(h).length, 2, "显式 nav 应能对原正文补 Enter");
+  assert.equal(deliveries(h).length, 1, "nav 只能送按键，不能重发正文");
+  h.watchers.stopAll();
 });
 
 test("首次 Enter 后 composer 被外部改成 X-payload 时，proof 仍在不能冒充已提交", async () => {
@@ -2398,6 +2671,8 @@ test("首次 Enter 后 composer 被外部改成 X-payload 时，proof 仍在不�
   assert.equal(r.isError, true);
   assert.equal(r.details?.phase, "submit");
   assert.match(r.text, /proof 仍在 composer/);
+  assert.equal(r.details?.pendingComposer, false, "变异正文不能标成可恢复的原 composer");
+  assert.doesNotMatch(r.text, /asd_nav/, "变异正文不能引导调用方直接提交");
   assert.equal(deliveries(h).length, 1, "正文只能发送一次");
   assert.equal(enterKeys(h).length, 1, "composer 已变异，不能补第二颗 Enter");
 });
@@ -2485,6 +2760,30 @@ test("两次 Enter 都没提交时标记 submit 失败，不能把同一任务�
   assert.ok(h.registry.get("pi-a") !== undefined, "未确认提交不能把仍存活的 agent 从台账删掉");
 });
 
+test("自己新建的 send 型 session 提交未确认时保留 kill 和 nav 权", async () => {
+  const h = harness({ enterBehavior: "ignored" });
+
+  const r = await h.tools.spawn({
+    task: "检查新目录",
+    agent: "claude",
+    reuse: false,
+  });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  const [session] = h.registry.names();
+  assert.equal(session, "pi-agent1");
+  assert.equal(h.registry.get(session!)?.createdByUs, true, "自己 new 的 session 仍归自己管理");
+  assert.equal(h.watchers.isWatching(session!), true);
+
+  const navigated = await h.tools.nav({ session: session!, keys: ["Enter"] });
+  assert.equal(navigated.isError, undefined, navigated.text);
+  const killed = await h.tools.kill({ session: session! });
+  assert.equal(killed.isError, undefined, killed.text);
+  assert.equal(h.registry.get(session!), undefined);
+  h.watchers.stopAll();
+});
+
 test("自动复用收到 sendText ACK 但没有回显时不能改派新 session", async () => {
   const h = harness({
     live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
@@ -2506,6 +2805,30 @@ test("自动复用收到 sendText ACK 但没有回显时不能改派新 session"
   assert.equal(deliveries(h).length, 1);
   assert.equal(enterKeys(h).length, 0);
   assert.ok(h.registry.get("pi-a") !== undefined);
+});
+
+test("自动复用在 submit 阶段消失时清台账，不能重建幽灵记录", async () => {
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    goneOnEnter: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  h.watchers.watch("pi-a");
+
+  const r = await h.tools.spawn({ task: "新任务", agent: "pi" });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(h.registry.get("pi-a"), undefined, "已消失的 session 不能因 submit 分支复活");
+  assert.equal(h.watchers.isWatching("pi-a"), false);
+  assert.equal(subcommands(h).includes("new"), false, "正文已经发送过，不能改派新 session");
 });
 
 test("历史区已有任务前缀时状态栏变化不能冒充新正文回显", async () => {

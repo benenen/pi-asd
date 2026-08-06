@@ -94,6 +94,17 @@ export interface ScreenSnapshot {
   cols: number;
 }
 
+/** `asd peek --json --styles` 的半开终端 cell 范围（0-based）。 */
+export interface ScreenStyleRange {
+  row: number;
+  startCol: number;
+  endCol: number;
+}
+
+export interface StyledScreenSnapshot extends ScreenSnapshot {
+  faintRanges: ScreenStyleRange[];
+}
+
 export interface Asd {
   /** `asd new`；返回 asd 实际用的名字（它自己会回显到 stdout）。 */
   create(o: { name: string; cwd: string; cmd: string }): Promise<string>;
@@ -104,6 +115,11 @@ export interface Asd {
   peek(name: string, scrollback?: number): Promise<string | null>;
   /** `asd peek --json`：保留光标位置，避免把历史区里的同任务文字误认成输入框回显。 */
   peekSnapshot(name: string): Promise<ScreenSnapshot | null>;
+  /**
+   * 带 SGR faint cell 范围的快照。null 表示 session 不在；undefined 表示 asd
+   * 版本尚不支持 `--styles`。这个读取会临时 attach，但不会向 pty 发送输入。
+   */
+  peekStyledSnapshot(name: string): Promise<StyledScreenSnapshot | null | undefined>;
   /**
    * 送一段文本**并回车**。session 不存在时返回 false。
    *
@@ -152,6 +168,44 @@ function isEnoent(e: unknown): boolean {
 function fail(r: ExecResult, what: string): never {
   const detail = r.stderr.trim() || r.stdout.trim() || "（没有输出）";
   throw new AsdError(r.code, `asd ${what} 失败（退出码 ${r.code}）：${detail}`);
+}
+
+function parseScreenSnapshot(stdout: string, what: string): ScreenSnapshot & Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new AsdError(1, `${what} 的输出不是 JSON：${stdout.slice(0, 200)}`);
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof (parsed as { screen?: unknown }).screen !== "string" ||
+    !Number.isInteger((parsed as { cursor?: { row?: unknown } }).cursor?.row) ||
+    !Number.isInteger((parsed as { cursor?: { col?: unknown } }).cursor?.col) ||
+    !Number.isInteger((parsed as { rows?: unknown }).rows) ||
+    !Number.isInteger((parsed as { cols?: unknown }).cols)
+  ) {
+    throw new AsdError(1, `${what} 缺少 screen、cursor 或终端尺寸`);
+  }
+  const snapshot = parsed as ScreenSnapshot & Record<string, unknown>;
+  if (
+    snapshot.rows <= 0 ||
+    snapshot.cols <= 0 ||
+    snapshot.cursor.row < 0 ||
+    snapshot.cursor.col < 0
+  ) {
+    throw new AsdError(1, `${what} 的 screen、cursor 或终端尺寸越界`);
+  }
+  return snapshot;
+}
+
+function stylesUnsupported(r: ExecResult): boolean {
+  const detail = `${r.stderr}\n${r.stdout}`;
+  return (
+    r.code === 2 &&
+    /(?:unexpected argument|unrecognized option|unknown option)[^\n]*--styles/i.test(detail)
+  );
 }
 
 /**
@@ -285,31 +339,56 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
       const r = await run(["peek", name, "--json"]);
       if (r.code === NO_SESSION) return null;
       if (r.code !== 0) fail(r, "peek --json");
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(r.stdout);
-      } catch {
-        throw new AsdError(1, `asd peek --json 的输出不是 JSON：${r.stdout.slice(0, 200)}`);
-      }
-      if (
-        typeof parsed !== "object" ||
-        parsed === null ||
-        typeof (parsed as { screen?: unknown }).screen !== "string" ||
-        typeof (parsed as { cursor?: { row?: unknown } }).cursor?.row !== "number" ||
-        typeof (parsed as { cursor?: { col?: unknown } }).cursor?.col !== "number" ||
-        !Number.isInteger((parsed as { rows?: unknown }).rows) ||
-        !Number.isInteger((parsed as { cols?: unknown }).cols) ||
-        (parsed as { rows: number }).rows <= 0 ||
-        (parsed as { cols: number }).cols <= 0
-      ) {
-        throw new AsdError(1, "asd peek --json 缺少 screen、cursor 或终端尺寸");
-      }
-      const snapshot = parsed as ScreenSnapshot;
+      const snapshot = parseScreenSnapshot(r.stdout, "asd peek --json");
       return {
         screen: snapshot.screen,
         cursor: snapshot.cursor,
         rows: snapshot.rows,
         cols: snapshot.cols,
+      };
+    },
+
+    async peekStyledSnapshot(name) {
+      const r = await run(["peek", name, "--json", "--styles"]);
+      if (r.code === NO_SESSION) return null;
+      if (stylesUnsupported(r)) return undefined;
+      if (r.code !== 0) fail(r, "peek --json --styles");
+      const snapshot = parseScreenSnapshot(r.stdout, "asd peek --json --styles");
+      if (snapshot.cursor.row >= snapshot.rows || snapshot.cursor.col > snapshot.cols) {
+        throw new AsdError(1, "asd peek --json --styles 的 cursor 超出终端尺寸");
+      }
+      const wireRanges = snapshot.faint_ranges;
+      if (!Array.isArray(wireRanges)) {
+        throw new AsdError(1, "asd peek --json --styles 缺少 faint_ranges");
+      }
+      const faintRanges = wireRanges.map((value) => {
+        const range = value as { row?: unknown; start_col?: unknown; end_col?: unknown };
+        if (
+          typeof value !== "object" ||
+          value === null ||
+          !Number.isInteger(range.row) ||
+          !Number.isInteger(range.start_col) ||
+          !Number.isInteger(range.end_col) ||
+          (range.row as number) < 0 ||
+          (range.row as number) >= snapshot.rows ||
+          (range.start_col as number) < 0 ||
+          (range.start_col as number) >= (range.end_col as number) ||
+          (range.end_col as number) > snapshot.cols
+        ) {
+          throw new AsdError(1, "asd peek --json --styles 的 faint_ranges 格式或范围无效");
+        }
+        return {
+          row: range.row as number,
+          startCol: range.start_col as number,
+          endCol: range.end_col as number,
+        };
+      });
+      return {
+        screen: snapshot.screen,
+        cursor: snapshot.cursor,
+        rows: snapshot.rows,
+        cols: snapshot.cols,
+        faintRanges,
       };
     },
 

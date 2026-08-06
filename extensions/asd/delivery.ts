@@ -1,38 +1,20 @@
 /**
  * 往 agent TUI 投递文本并确认它真的启动了一个 turn。
  *
- * 这里不判断 session 能不能接活，也不碰台账；调用方在 tools.ts 做完所有权和复用
- * 决策后才进来。单独成层是因为「稳定回显 → Enter → 提交确认 → 最多补一次 Enter」
- * 本身已经是一套状态机，不该继续塞在工具编排函数里。
+ * 不判断 session 能不能接活，也不碰台账；调用方先做所有权和复用决策。这里单独
+ * 承担「稳定回显 → Enter → 提交确认 → 最多补一次 Enter」状态机。
  */
 
-import { randomUUID } from "node:crypto";
-import type { Asd, ScreenSnapshot } from "./cli.ts";
+import type { ScreenSnapshot, StyledScreenSnapshot } from "./cli.ts";
 import { detectDialog } from "./dialog.ts";
-
-const SIGNATURE_CHARS = 24;
-const NOISE = /[\s─-╿│█│┃┆┊|>›❯»·]+/g;
-const BORDERS = /[─-╿│█│┃┆┊|>›❯»·]+/g;
-
-/** 长文本经 PTY 进入 TUI 时会逐帧回显；轮询到真正稳定以后才能送 Enter。 */
-export const ECHO_POLL_MS = 100;
-/** 必须连续稳定这么久；高于 Codex paste-burst 的 120ms Enter 抑制窗口。 */
-export const ECHO_STABLE_MS = 250;
-/** 文本始终不出现或一直不稳定时放弃，不能无限卡住工具调用。 */
-export const ECHO_TIMEOUT_MS = 5_000;
-/** Enter 后空白布局变化保持这么久，才判定它只插入了换行、需要补一次。 */
-export const SUBMIT_STABLE_MS = 250;
-
-export type DeliveryPhase = "text" | "submit";
-export type Delivery =
-  | { ok: true }
-  | { ok: false; phase: DeliveryPhase; reason: string; gone?: true };
-
-export interface DeliveryDeps {
-  asd: Asd;
-  sleep(ms: number): Promise<void>;
-}
-
+import { ECHO_POLL_MS, ECHO_STABLE_MS, ECHO_TIMEOUT_MS, SUBMIT_STABLE_MS } from "./delivery-contract.ts";
+import type { Delivery, DeliveryDeps } from "./delivery-contract.ts";
+import {
+  deliveryMarker,
+  screenFingerprint,
+  screenHasProof,
+  screenLayout,
+} from "./delivery-screen.ts";
 type ComposerAnchor =
   | { kind: "prompt"; marker: string; prefix: string }
   | { kind: "framed" };
@@ -46,32 +28,8 @@ interface ComposerView {
 
 type ComposerPayloadState = "present" | "mismatch" | "absent" | "unknown";
 
-function deliveryMarker(): string {
-  return `<!-- pi-asd-delivery:${randomUUID()} -->`;
-}
-
-function screenFingerprint(screen: string): string {
-  return screen.replace(NOISE, "");
-}
-
-function screenLayout(screen: string): string {
-  return screen.replace(BORDERS, "");
-}
-
-/** 结构解析失效时的最后防线：唯一 proof 是否还清楚可见在当前屏幕。 */
-function screenHasProof(screen: string, proof: string): boolean {
-  const needle = screenFingerprint(proof);
-  return needle.length > 0 && screenFingerprint(screen).includes(needle);
-}
-
-export function screenHasText(screen: string, text: string): boolean {
-  const needle = screenFingerprint(text).slice(0, SIGNATURE_CHARS);
-  return needle.length > 0 && screenFingerprint(screen).includes(needle);
-}
-
 const COMPOSER_PROMPT = /^(\s*[│┃|]?\s*)([›❯>])\s?/;
 const CODEX_FOOTER = /(?:\bContext \d+% used\b|\b\d+% context left\b|\btab to queue message\b)/i;
-const CODEX_PLACEHOLDERS = new Set(["Explain this codebase", "Ask anything"]);
 const PI_MORE_FRAME = /^─{3}\s+↑\s+(\d+)\s+more\s+─+$/;
 const GRAPHEMES = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const EMOJI = /\p{Extended_Pictographic}/u;
@@ -139,6 +97,12 @@ function graphemeWidth(grapheme: string, currentCol: number): number {
     isFullwidthCodePoint(first)
     ? 2
     : 1;
+}
+
+function cellWidth(text: string, startCol = 0): number {
+  let col = startCol;
+  for (const { segment } of GRAPHEMES.segment(text)) col += graphemeWidth(segment, col);
+  return col - startCol;
 }
 
 /** 按终端 cell 而不是 JS 索引截断，避免中文让 slice 越过真实光标吃到右侧 proof。 */
@@ -338,11 +302,73 @@ function emptyComposerAnchor(snapshot: ScreenSnapshot): ComposerAnchor | undefin
   const [first = "", ...rest] = view.fullLines;
   const remainingEmpty = rest.every((line) => line.trim().length === 0);
   const genuinelyEmpty = first.trim().length === 0 && remainingEmpty;
-  const knownPlaceholder =
-    snapshot.cursor.col === prompt[0].length &&
-    CODEX_PLACEHOLDERS.has(first.trim()) &&
-    remainingEmpty;
-  return genuinelyEmpty || knownPlaceholder ? anchor : undefined;
+  return genuinelyEmpty ? anchor : undefined;
+}
+
+interface PlaceholderCandidate {
+  anchor: Extract<ComposerAnchor, { kind: "prompt" }>;
+  row: number;
+  startCol: number;
+  text: string;
+}
+
+/**
+ * 纯文本只能把范围缩到“可能是 ghost placeholder”；最终判断必须看 SGR faint。
+ * 条件故意很窄：根 prompt、光标仍在文本起点、单行且没有首尾空白。
+ */
+function placeholderCandidate(snapshot: ScreenSnapshot): PlaceholderCandidate | undefined {
+  const lines = snapshotLines(snapshot);
+  if (lines === undefined) return undefined;
+  const line = lines[snapshot.cursor.row] ?? "";
+  const prompt = COMPOSER_PROMPT.exec(line);
+  if (prompt === null || prompt[1] !== "" || prompt[2] === ">") return undefined;
+  if (snapshot.cursor.col !== cellWidth(prompt[0])) return undefined;
+
+  const anchor = { kind: "prompt", marker: prompt[2]!, prefix: "" } as const;
+  const view = promptComposerView(snapshot, anchor);
+  if (view === undefined || view.rootRow !== snapshot.cursor.row) return undefined;
+  const [first = "", ...rest] = view.fullLines;
+  if (
+    first.length === 0 ||
+    first !== first.trim() ||
+    rest.some((remaining) => remaining.trim().length > 0)
+  ) {
+    return undefined;
+  }
+  return { anchor, row: snapshot.cursor.row, startCol: snapshot.cursor.col, text: first };
+}
+
+function sameSnapshot(a: ScreenSnapshot, b: ScreenSnapshot): boolean {
+  return (
+    a.screen === b.screen &&
+    a.rows === b.rows &&
+    a.cols === b.cols &&
+    a.cursor.row === b.cursor.row &&
+    a.cursor.col === b.cursor.col
+  );
+}
+
+function candidateIsFaint(
+  snapshot: StyledScreenSnapshot,
+  candidate: PlaceholderCandidate,
+): boolean {
+  let col = candidate.startCol;
+  for (const { segment } of GRAPHEMES.segment(candidate.text)) {
+    const width = graphemeWidth(segment, col);
+    if (width === 0) continue;
+    const end = col + width;
+    if (
+      end > snapshot.cols ||
+      !snapshot.faintRanges.some(
+        (range) =>
+          range.row === candidate.row && range.startCol <= col && range.endCol >= end,
+      )
+    ) {
+      return false;
+    }
+    col = end;
+  }
+  return col > candidate.startCol;
 }
 
 /** 只有新正文出现在光标所在 composer，才允许进入稳定计时。 */
@@ -407,6 +433,7 @@ function hasComposerNewline(before: ScreenSnapshot, after: ScreenSnapshot, proof
 type SubmitObservation =
   | { kind: "changed" }
   | { kind: "newline"; snapshot: ScreenSnapshot }
+  | { kind: "dialog"; summary: string }
   | { kind: "mismatch" }
   | { kind: "unchanged" }
   | { kind: "gone" };
@@ -429,8 +456,10 @@ async function observeSubmission(
     const snapshot = await asd.peekSnapshot(session);
     if (snapshot === null) return { kind: "gone" };
     const { screen } = snapshot;
-    // 提交后出现对话框也是明确的状态迁移。这里绝不能再补 Enter，否则会替用户确认。
-    if (detectDialog(screen) !== undefined) return { kind: "changed" };
+    // 对话框证明界面变了，却不能证明是本任务触发的；旧 turn 或外部 attach 也可能
+    // 同时弹框。绝不能补 Enter，也不能在 proof 未确认离开 composer 时谎报成功。
+    const dialog = detectDialog(screen);
+    if (dialog !== undefined) return { kind: "dialog", summary: dialog.summary };
     const payloadState = composerPayloadState(snapshot, text, proof, anchor);
     // 仍能识别 composer 且唯一 proof 已经离开它，是比“整屏变了”更强的提交证据。
     if (payloadState === "absent") return { kind: "changed" };
@@ -497,6 +526,7 @@ async function waitForStableEcho(
         ok: false,
         phase: "submit",
         reason: `任务文本送出后 "${session}" 出现了对话框（${dialog.summary}），没有按回车。`,
+        retainControl: true,
       };
     }
 
@@ -511,9 +541,9 @@ async function waitForStableEcho(
     }
   }
 
-  return {
-    ok: false,
-    phase: "submit",
+  const failure = {
+    ok: false as const,
+    phase: "submit" as const,
     reason:
       (sawText
         ? `任务文本出现在 "${session}" 的屏幕上，但 ${ECHO_TIMEOUT_MS / 1000}s 内一直没有稳定。`
@@ -521,6 +551,7 @@ async function waitForStableEcho(
       `没有按回车（此刻输入框里可能是别的东西，回车会误触它）。` +
       `用 asd_peek("${session}") 看看它卡在什么界面上。`,
   };
+  return sawText ? { ...failure, retainControl: true } : failure;
 }
 
 async function retryEnter(
@@ -544,7 +575,15 @@ async function retryEnter(
     };
   }
   const retryScreen = retrySnapshot.screen;
-  if (detectDialog(retryScreen) !== undefined) return { ok: true };
+  const retryDialog = detectDialog(retryScreen);
+  if (retryDialog !== undefined) {
+    return {
+      ok: false,
+      phase: "submit",
+      reason: `补发回车前 "${session}" 出现了对话框（${retryDialog.summary}）；当前任务可能已提交，但无法由这屏证明，没有补按键。`,
+      retainControl: true,
+    };
+  }
   const retryState = composerPayloadState(retrySnapshot, text, proof, anchor);
   if (retryState === "absent") return { ok: true };
   if (
@@ -563,6 +602,7 @@ async function retryEnter(
       ok: false,
       phase: "submit",
       reason: `文本已输入 "${session}"，但补发回车前 composer 状态又发生变化；为避免误提交，没有补按键。`,
+      retainControl: true,
     };
   }
 
@@ -584,16 +624,29 @@ async function retryEnter(
       gone: true,
     };
   }
+  if (second.kind === "dialog") {
+    return {
+      ok: false,
+      phase: "submit",
+      reason: `补发回车后 "${session}" 出现了对话框（${second.summary}）；当前任务可能已提交，但无法由这屏证明。`,
+      retainControl: true,
+    };
+  }
   return {
     ok: false,
     phase: "submit",
-    reason: `文本已输入 "${session}"，但两次回车后仍未确认提交；不会重发任务或改派。`,
+    reason:
+      second.kind === "mismatch"
+        ? `文本已输入 "${session}"，但两次回车后 composer 已发生变化，仍未确认提交；不会重发任务或改派。`
+        : `文本已输入 "${session}"，但两次回车后仍未确认提交；不会重发任务或改派。`,
+    ...(second.kind === "mismatch" ? {} : { pendingComposer: true as const }),
+    retainControl: true,
   };
 }
 
 async function deliver(deps: DeliveryDeps, session: string, text: string): Promise<Delivery> {
   const { asd } = deps;
-  const before = await asd.peekSnapshot(session);
+  let before = await asd.peekSnapshot(session);
   if (before === null) {
     return {
       ok: false,
@@ -610,7 +663,55 @@ async function deliver(deps: DeliveryDeps, session: string, text: string): Promi
       reason: `"${session}" 正停在对话框上（${initialDialog.summary}），没有发送任务，也没有按回车。`,
     };
   }
-  const anchor = emptyComposerAnchor(before);
+  let anchor = emptyComposerAnchor(before);
+  if (anchor === undefined) {
+    const candidate = placeholderCandidate(before);
+    if (candidate !== undefined) {
+      let styled: StyledScreenSnapshot | null | undefined;
+      try {
+        styled = await asd.peekStyledSnapshot(session);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        return {
+          ok: false,
+          phase: "text",
+          reason: `无法验证 "${session}" 的灰显 placeholder：${detail}；没有发送任务或按键。`,
+        };
+      }
+      if (styled === null) {
+        return {
+          ok: false,
+          phase: "text",
+          reason: `"${session}" 的 session 已经不在了`,
+          gone: true,
+        };
+      }
+      if (styled === undefined) {
+        return {
+          ok: false,
+          phase: "text",
+          reason: `当前 asd 不支持样式快照，无法安全区分 "${session}" 的 placeholder 与旧草稿；请升级 asd。没有发送任务或按键。`,
+        };
+      }
+      const styledDialog = detectDialog(styled.screen);
+      if (styledDialog !== undefined) {
+        return {
+          ok: false,
+          phase: "text",
+          reason: `"${session}" 正停在对话框上（${styledDialog.summary}），没有发送任务，也没有按回车。`,
+        };
+      }
+      if (!sameSnapshot(before, styled) || !candidateIsFaint(styled, candidate)) {
+        return {
+          ok: false,
+          phase: "text",
+          reason: `"${session}" 的输入框里已有未提交内容，或样式快照期间界面发生变化；没有追加任务，也没有按回车。`,
+        };
+      }
+      before = styled;
+      anchor = candidate.anchor;
+    }
+  }
   if (anchor === undefined) {
     return {
       ok: false,
@@ -651,11 +752,25 @@ async function deliver(deps: DeliveryDeps, session: string, text: string): Promi
       gone: true,
     };
   }
-  if (first.kind === "unchanged") {
+  if (first.kind === "dialog") {
     return {
       ok: false,
       phase: "submit",
-      reason: `文本已输入 "${session}"，但第一颗回车后屏幕完全未变化，无法确认提交；没有盲目补第二颗回车。`,
+      reason: `第一颗回车后 "${session}" 出现了对话框（${first.summary}）；当前任务可能已提交，但无法由这屏证明，没有补第二颗。`,
+      retainControl: true,
+    };
+  }
+  if (first.kind === "unchanged") {
+    // 屏幕完全不变既可能是 Enter 被 TUI 吞掉，也可能只是 daemon 已排队、TUI 尚未
+    // 消费。没有端到端 key-consumed ACK，自动再送一颗会让两颗 Enter 稍后连续落下，
+    // 第二颗可能误确认任务启动后弹出的权限框。保留控制权、明确标出 composer 仍有
+    // 本次 proof，让用户看屏幕后用 nav 显式决定；绝不重发正文。
+    return {
+      ok: false,
+      phase: "submit",
+      reason: `文本已输入 "${session}"，但第一颗回车后屏幕完全未变化；它可能被吞掉，也可能仍在等待 TUI 处理，无法自动补第二颗。`,
+      retainControl: true,
+      pendingComposer: true,
     };
   }
   if (first.kind === "mismatch") {
@@ -663,6 +778,7 @@ async function deliver(deps: DeliveryDeps, session: string, text: string): Promi
       ok: false,
       phase: "submit",
       reason: `文本已输入 "${session}"，但第一颗回车后唯一 proof 仍在 composer，且全文已发生变化；为避免误提交，没有补第二颗回车。`,
+      retainControl: true,
     };
   }
   return await retryEnter(

@@ -9,16 +9,17 @@ import path from "node:path";
 import type { Asd, SessionInfo } from "./cli.ts";
 import type { Registry } from "./registry.ts";
 import { detectDialog } from "./dialog.ts";
-import { createDeliver, type Delivery } from "./delivery.ts";
+import { createDeliver } from "./delivery.ts";
+import type { Delivery } from "./delivery-contract.ts";
 import { formatDuration, type WatcherPool } from "./watcher.ts";
 
 export {
   ECHO_POLL_MS,
   ECHO_STABLE_MS,
   ECHO_TIMEOUT_MS,
-  screenHasText,
   SUBMIT_STABLE_MS,
-} from "./delivery.ts";
+} from "./delivery-contract.ts";
+export { screenHasText } from "./delivery-screen.ts";
 
 /**
  * 屏幕上最后一行有内容的文字，用作"它最后在干什么"的凭据。
@@ -601,8 +602,12 @@ function deliveryErr(
   delivery: Extract<Delivery, { ok: false }>,
 ): ToolResult {
   return {
-    text: `${kind}未投递成功：${delivery.reason}`,
-    details: { phase: delivery.phase },
+    text:
+      `${kind}未投递成功：${delivery.reason}` +
+      (delivery.pendingComposer === true
+        ? ` 输入框里仍能识别出带本次唯一 proof 的内容；不会重发正文，session 已保留在监视列表。上一颗 Enter 也可能仍待处理；先用 asd_peek 核对，只有用户明确决定再次提交时才用 asd_nav 补一颗 Enter。`
+        : ""),
+    details: { phase: delivery.phase, pendingComposer: delivery.pendingComposer === true },
     isError: true,
   };
 }
@@ -797,6 +802,24 @@ export function createTools(deps: ToolDeps): Tools {
           registry.remove(session);
           watchers.stop(session);
         }
+        if (sent.retainControl === true && sent.gone !== true) {
+          // 正文已经送过，哪怕无法确认 Enter 是否生效，这个 session 也已经被我们
+          // 修改过。以前只在 delivery 成功后登记，失败时就留下带正文的 composer，
+          // steer/nav 又因台账为空拒绝输入，形成只能绕过工具直写 PTY 的死锁。
+          registry.add(
+            known === undefined
+              ? {
+                  session,
+                  task,
+                  cwd: card.cwd,
+                  agent,
+                  createdAt: now(),
+                  createdByUs: false,
+                }
+              : { ...known, task },
+          );
+          rewatch(session, wantWatch);
+        }
         return deliveryErr("任务", sent);
       }
       if (known === undefined) {
@@ -900,9 +923,18 @@ export function createTools(deps: ToolDeps): Tools {
                 details: { session: target.session, agent, cwd: target.cwd, reused: true, watching },
               };
             }
+            if (sent.phase === "submit" && sent.gone === true) {
+              // 正文已经送过，session 随后才消失：清掉幽灵记录，但仍不能改派，
+              // 因为无法证明它在退出前没有开始执行任务。
+              registry.remove(target.session);
+              watchers.stop(target.session);
+              return deliveryErr("任务", sent);
+            }
             if (sent.phase === "submit") {
               // 正文已经进了 composer，只是无法证明 turn 已启动。绝不能清台账并
               // 改道新建，否则旧 session 稍后也可能提交，造成任务重复执行。
+              registry.add({ ...target, task: p.task });
+              rewatch(target.session, wantWatch);
               return deliveryErr("任务", sent);
             }
             // text 失败时任务没进去，可以放行预留并继续新建；但只有真 gone 才清
@@ -952,7 +984,23 @@ export function createTools(deps: ToolDeps): Tools {
             return deliveryErr("任务", ready);
           }
           const sent = await deliver(session, p.task);
-          if (!sent.ok) return deliveryErr("任务", sent);
+          if (!sent.ok) {
+            if (sent.retainControl === true && sent.gone !== true) {
+              // 这是自己刚 new 出来的 session；正文可能已经在 composer 里时必须
+              // 留下 kill/nav 权限，不能因为未确认提交就把它变成无人管理的孤儿。
+              registry.add({
+                session,
+                task: p.task,
+                cwd,
+                agent,
+                createdAt: now(),
+                createdByUs: true,
+                persistent: p.persistent === true,
+              });
+              rewatch(session, wantWatch);
+            }
+            return deliveryErr("任务", sent);
+          }
         }
 
         registry.add({
@@ -1200,6 +1248,7 @@ export function createTools(deps: ToolDeps): Tools {
             const gone = dropGone(p.session);
             return { ...gone, details: { ...gone.details, phase: sent.phase }, isError: true };
           }
+          if (sent.phase === "submit") rewatch(p.session, true);
           return deliveryErr("消息", sent);
         }
         const watching = rewatch(p.session, true);

@@ -64,11 +64,12 @@ function realExec(root: string): Exec {
 const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   "sh-probe": {
     command: () => "sh -c 'exit 2'", // deliver: send 不走 argv；误走时让测试立即暴露。
-    // raw PTY 探针：正文里的换行只回显，不触发提交；只有独立 CR（--key Enter）
-    // 才打印 GOT。这样追加投递 proof 后，e2e 仍然真正验证“Enter 创建 turn”。
+    // raw PTY 探针：正文里的换行只回显，不触发提交；整个 session 的第一颗独立
+    // CR 被静默吞掉，后续 CR 才打印 GOT。这样真实覆盖“第一颗 Enter 完全无效，
+    // session 仍进入台账，调用方 peek 后可用 nav 只补 Enter、不重发正文”的恢复路径。
     bare:
-      `node -e 'process.stdout.write("› "); process.stdin.setRawMode(true); let b=[]; ` +
-      `process.stdin.on("data",d=>{for(const x of d){if(x===13){const s=Buffer.from(b).toString(); ` +
+      `node -e 'process.stdout.write("› "); process.stdin.setRawMode(true); let b=[]; let swallowed=false; ` +
+      `process.stdin.on("data",d=>{for(const x of d){if(x===13){if(!swallowed){swallowed=true;continue} const s=Buffer.from(b).toString(); ` +
       `process.stdout.write("\\r\\nGOT:"+s.replace(/\\n/g,"\\\\n")+"\\r\\n› "); b=[]}else{b.push(x); ` +
       `process.stdout.write(Buffer.from([x]))}}})'`,
     piChild: false,
@@ -76,7 +77,7 @@ const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   },
 };
 
-test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { timeout: 60_000 }, async (t) => {
+test("e2e：第一颗 Enter 被吞后保留控制权，可显式恢复并继续工作流", { timeout: 60_000 }, async (t) => {
   if (!(await hasAsd())) {
     t.skip("asd 不在 PATH 上，跳过");
     return;
@@ -112,9 +113,14 @@ test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { time
     await asd.kill(primer);
 
     const spawned = await tools.spawn({ task: "HELLO-E2E", name: "one", watch: false });
-    assert.equal(spawned.isError, undefined, spawned.text);
-    const session = String(spawned.details?.session);
+    assert.equal(spawned.isError, true, "第一颗 Enter 无可见效果时必须停下来，不能自动补键");
+    assert.equal(spawned.details?.phase, "submit");
+    assert.equal(spawned.details?.pendingComposer, true);
+    const session = "pi-e2e-one";
     assert.equal(session, "pi-e2e-one");
+    assert.equal(registry.get(session)?.createdByUs, true, "失败后必须保留 nav/kill 权");
+    const recovered = await tools.nav({ session, keys: ["Enter"] });
+    assert.equal(recovered.isError, undefined, recovered.text);
 
     // 等 raw probe 把输入 prompt 打出来。
     const deadline = Date.now() + 10_000;
@@ -165,7 +171,14 @@ test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { time
     assert.equal(killed.isError, undefined, killed.text);
     assert.equal(registry.size, 0);
 
-    const after = await asd.list();
+    // daemon 的 kill ACK 与 session 从 ListSessions 消失不是同一个原子动作；紧接着
+    // list 偶尔还能看见旧条目几十毫秒。只等这个明确的状态收敛，不用固定 sleep。
+    const goneDeadline = Date.now() + 2_000;
+    let after = await asd.list();
+    while (after.some((s) => s.session === session) && Date.now() < goneDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      after = await asd.list();
+    }
     assert.ok(!after.some((s) => s.session === session), "kill 之后 session 不该还在");
   } finally {
     watchers.stopAll();

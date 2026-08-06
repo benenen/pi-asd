@@ -124,6 +124,49 @@ test("peekSnapshot 缺少终端尺寸时拒绝猜测 pi 横线框宽度", async 
   await assert.rejects(() => createAsd(exec).peekSnapshot("pi-a"), AsdError);
 });
 
+test("peekStyledSnapshot 用公开 --styles JSON 返回 faint cell 范围", async () => {
+  const stdout = JSON.stringify({
+    session: "pi-a",
+    title: "",
+    rows: 24,
+    cols: 80,
+    cursor: { row: 21, col: 2 },
+    screen: "SCREEN\n› 任意动态提示语",
+    faint_ranges: [{ row: 21, start_col: 2, end_col: 18 }],
+  });
+  const { exec, calls } = fakeExec([{ stdout }]);
+
+  assert.deepEqual(await createAsd(exec).peekStyledSnapshot("pi-a"), {
+    screen: "SCREEN\n› 任意动态提示语",
+    cursor: { row: 21, col: 2 },
+    rows: 24,
+    cols: 80,
+    faintRanges: [{ row: 21, startCol: 2, endCol: 18 }],
+  });
+  assert.deepEqual(calls[0].args, ["peek", "pi-a", "--json", "--styles"]);
+});
+
+test("peekStyledSnapshot 遇到旧 asd 不支持 --styles 时返回 undefined", async () => {
+  const { exec } = fakeExec([
+    { code: 2, stderr: "error: unexpected argument '--styles' found" },
+  ]);
+
+  assert.equal(await createAsd(exec).peekStyledSnapshot("pi-a"), undefined);
+});
+
+test("peekStyledSnapshot 拒绝越界或畸形的 faint 范围", async () => {
+  const stdout = JSON.stringify({
+    rows: 24,
+    cols: 80,
+    cursor: { row: 21, col: 2 },
+    screen: "› hint",
+    faint_ranges: [{ row: 21, start_col: 2, end_col: 81 }],
+  });
+  const { exec } = fakeExec([{ stdout }]);
+
+  await assert.rejects(() => createAsd(exec).peekStyledSnapshot("pi-a"), AsdError);
+});
+
 /**
  * 回归：send 必须**分两次**发 —— 正文一次，`--key Enter` 一次。
  *

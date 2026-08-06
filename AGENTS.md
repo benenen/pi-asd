@@ -216,8 +216,18 @@ pty 在之后异步发生，失败只 `debug!` 一行。
    把光标移到旧草稿开头或中间时，右边、下边仍是同一份草稿。注意 raw `screen` 会省略底部
    空白行，cursor.row 仍按完整终端上报，解析时要按 rows 补齐。实测 Codex/Claude 的根
    prompt 在第 0 列，正文里的 `>` / `›` / `❯` 会被编辑器缩进；footer 文案可以由用户输入，
-   只有它同时是屏幕最后一条非空行、前面有空分隔行时才算结构。只对已验证的精确 placeholder
-   文案例外。pi 没有 prompt，输入区由**恰好一对终端全宽的 Unicode
+   只有它同时是屏幕最后一条非空行、前面有空分隔行时才算结构。Codex 的 ghost placeholder
+   文案会动态变化，**不许维护固定文案列表，也不许用 Space/Backspace 等输入按键探测**：纯文本
+   快照只能筛出「根 prompt、光标在单行文字起点」的候选，随后必须调用
+   `peek --json --styles`，要求前后 screen/cursor/尺寸完全一致，并且候选占用的每一个终端 cell
+   都落在 SGR faint 范围内，才按空 composer 处理。样式能力缺失、范围畸形、混合样式、模态框
+   或复核期间重绘都 fail closed，正文和按键一个也不送。样式 peek 会短暂 attach，但 asd 会在
+   Detach 后用普通 Peek 做一致性锚定；这条路径只用于上述窄候选，而且 session 已有 viewer 时
+   直接拒绝。当前 CLI-only 兼容实现用 0×0 observer 避免后台 session resize，但
+   `ListSessions → Attach` 仍不是 daemon 端原子操作：若有人恰好在这个毫秒级窗口 attach，可能
+   短暂拿到旧尺寸首屏；彻底消除要等 daemon 增加 attach-free style snapshot 并在可重启时升级。
+   pi 没有 prompt，输入区由
+   **恰好一对终端全宽的 Unicode
    `─`** 包住（长输入上框可带 `↑ N more`）；ASCII/短横线不是边框，多出第三条全宽候选也
    属于歧义，一律拒绝猜最近一条。发送前上框已是 `↑ N more` 就证明隐藏着旧草稿，
    即使可见行为空也必须在 `sendText` 前拒绝。确认为空后保存这个结构锚点
@@ -240,9 +250,13 @@ pty 在之后异步发生，失败只 `debug!` 一行。
    后屏幕已变化」的判据。proof 若仍在 composer，状态栏自己变化不能冒充提交；只有「proof
    结束前的布局逐字符不动、结束后只增加空白」并稳定了一个窗口，才算 Enter 只在原 composer
    末尾插了换行。整屏仍能搜到任务不够——任务可能已经移到历史区；屏幕原样不动也可能是
-   TUI 尚未处理按键，都不能盲补
+   TUI 把第一颗 Enter 整颗吞掉，也可能只是按键仍在队列里，不能直接报成功或自动补键
 4. 补 Enter 前仍要用光标重新确认任务还在当前 composer，不能拿历史区的同任务文字当
-   凭据；最多补一次，两次都无法确认就报「文本已输入但未确认提交」，绝不重发正文
+   凭据。只有第一颗 Enter 产生了「proof 前布局不动、之后只增加空白或光标下移」的明确
+   换行证据，才允许在无模态框、唯一 proof 仍在原 composer 时补一次；屏幕/光标完全不动
+   时不能自动补——daemon ACK 不能证明第一颗已被 TUI 消费，两颗延迟 Enter 可能连续落到
+   后续权限框。此时保留控制权并报 submit 未确认，由用户 peek 后决定是否显式 nav Enter。
+   任何路径都绝不重发正文
 
 两个不能改的细节：
 
@@ -258,8 +272,17 @@ pty 在之后异步发生，失败只 `debug!` 一行。
 发送前卡模态框的 session 仍要保留 kill/nav 权限。`sendText` 一旦收到
 asd ACK，之后任何失败（包括 5s 内没看到回显）都属于 `submit` 未知态：ACK 只说明 daemon
 排过队，不能证明 PTY 最终没收到。此时必须保留已有台账并立即报错，**绝不能自动改派新
-session，也不能重发正文**，否则旧 session 稍后也开始执行时会把同一任务跑两遍。新
-session 仍然只有确认投递成功后才记台账 —— 记早了就等于宣称「已派出」。
+session，也不能重发正文**，否则旧 session 稍后也开始执行时会把同一任务跑两遍。
+
+这里还有一道防死锁规则：若屏幕证据已经证明正文进入过 composer（`retainControl`），即使
+最终仍报 submit 未确认，指名的外部 session 也要以 `createdByUs: false` 纳入台账，自己刚
+new 的则保留 `createdByUs: true`，并按 `watch` 设置 watcher。**这不是宣称任务已派出**；
+工具仍返回错误，只是不能把已被我们修改过的 session 留在台账外，否则 `asd_steer` /
+`asd_nav` 会一起拒绝，输入框里的正文又挡住下一次 spawn，形成只能绕过工具直写 PTY 的
+死锁。唯一 proof 仍在原 composer、可见正文按 TUI 布局空白归一化后匹配时返回
+`pendingComposer: true`；这不是字节级 exact，也不能证明上一颗 Enter 不在队列，所以只提示
+先 peek、由用户明确决定是否 nav Enter，不能自动补。正文已变异时绝不能给这条提示。仅有
+ACK、5s 内一次正文回显都没看到时仍不新增台账，因为 ACK 本身不是 PTY 写入证据。
 
 ### 7. 启动期的模态 UI 要按 preset 过掉
 

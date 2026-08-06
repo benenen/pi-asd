@@ -72,6 +72,9 @@ function harness(
     async peekSnapshot() {
       return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
     },
+    async peekStyledSnapshot() {
+      return undefined;
+    },
     async send() {
       return true;
     },
@@ -471,6 +474,9 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
     async peekSnapshot() {
       return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
     },
+    async peekStyledSnapshot() {
+      return undefined;
+    },
     async send() {
       return true;
     },
@@ -638,6 +644,9 @@ function confirmHarness(o: {
     },
     async peekSnapshot() {
       return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
+    },
+    async peekStyledSnapshot() {
+      return undefined;
     },
     async send() {
       return true;
