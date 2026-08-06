@@ -80,6 +80,20 @@ export type FollowOutcome =
   | { kind: "timeout"; text: string }
   | { kind: "gone" };
 
+/** `asd peek --json` 给出的终端光标位置（0-based）。 */
+export interface ScreenCursor {
+  row: number;
+  col: number;
+}
+
+/** 投递校验既要屏幕文字，也要光标来定位真正的 composer。 */
+export interface ScreenSnapshot {
+  screen: string;
+  cursor: ScreenCursor;
+  rows: number;
+  cols: number;
+}
+
 export interface Asd {
   /** `asd new`；返回 asd 实际用的名字（它自己会回显到 stdout）。 */
   create(o: { name: string; cwd: string; cmd: string }): Promise<string>;
@@ -88,6 +102,8 @@ export interface Asd {
   cards(): Promise<CardInfo[]>;
   /** session 不存在时返回 null。 */
   peek(name: string, scrollback?: number): Promise<string | null>;
+  /** `asd peek --json`：保留光标位置，避免把历史区里的同任务文字误认成输入框回显。 */
+  peekSnapshot(name: string): Promise<ScreenSnapshot | null>;
   /**
    * 送一段文本**并回车**。session 不存在时返回 false。
    *
@@ -263,6 +279,38 @@ export function createAsd(exec: Exec, options: AsdOptions = {}): Asd {
       if (r.code === NO_SESSION) return null;
       if (r.code !== 0) fail(r, "peek");
       return r.stdout;
+    },
+
+    async peekSnapshot(name) {
+      const r = await run(["peek", name, "--json"]);
+      if (r.code === NO_SESSION) return null;
+      if (r.code !== 0) fail(r, "peek --json");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(r.stdout);
+      } catch {
+        throw new AsdError(1, `asd peek --json 的输出不是 JSON：${r.stdout.slice(0, 200)}`);
+      }
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        typeof (parsed as { screen?: unknown }).screen !== "string" ||
+        typeof (parsed as { cursor?: { row?: unknown } }).cursor?.row !== "number" ||
+        typeof (parsed as { cursor?: { col?: unknown } }).cursor?.col !== "number" ||
+        !Number.isInteger((parsed as { rows?: unknown }).rows) ||
+        !Number.isInteger((parsed as { cols?: unknown }).cols) ||
+        (parsed as { rows: number }).rows <= 0 ||
+        (parsed as { cols: number }).cols <= 0
+      ) {
+        throw new AsdError(1, "asd peek --json 缺少 screen、cursor 或终端尺寸");
+      }
+      const snapshot = parsed as ScreenSnapshot;
+      return {
+        screen: snapshot.screen,
+        cursor: snapshot.cursor,
+        rows: snapshot.rows,
+        cols: snapshot.cols,
+      };
     },
 
     async sendText(name, text) {

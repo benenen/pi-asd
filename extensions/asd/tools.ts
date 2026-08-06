@@ -9,7 +9,16 @@ import path from "node:path";
 import type { Asd, SessionInfo } from "./cli.ts";
 import type { Registry } from "./registry.ts";
 import { detectDialog } from "./dialog.ts";
+import { createDeliver, type Delivery } from "./delivery.ts";
 import { formatDuration, type WatcherPool } from "./watcher.ts";
+
+export {
+  ECHO_POLL_MS,
+  ECHO_STABLE_MS,
+  ECHO_TIMEOUT_MS,
+  screenHasText,
+  SUBMIT_STABLE_MS,
+} from "./delivery.ts";
 
 /**
  * 屏幕上最后一行有内容的文字，用作"它最后在干什么"的凭据。
@@ -65,29 +74,6 @@ export interface ToolResult {
   details?: Record<string, unknown>;
   isError?: boolean;
 }
-
-/**
- * 任务文本有没有真的出现在 agent 屏幕上。
- *
- * 归一化之后再比。要去掉的不只是空白：TUI 把输入框画成带边框的盒子，长文本在
- * 盒子里折行时**每一行两端都会插进边框字符**，原样 `includes` 几乎必然假阴性。
- * 这里的假阴性代价很实在 —— 会把一次成功的投递误报成"未投递成功"。
- *
- * 只取前 `SIGNATURE_CHARS` 个字符做特征：长任务在输入框里会被截断显示，拿整段
- * 去比同样是假阴性。
- */
-const SIGNATURE_CHARS = 24;
-
-/** 空白 + 制表符绘图区（U+2500–U+257F，各家 TUI 的边框）+ 几个常见装饰符。 */
-const NOISE = /[\s─-╿│█│┃┆┊|>❯»·]+/g;
-
-export function screenHasText(screen: string, text: string): boolean {
-  const strip = (s: string): string => s.replace(NOISE, "");
-  const needle = strip(text).slice(0, SIGNATURE_CHARS);
-  return needle.length > 0 && strip(screen).includes(needle);
-}
-
-export type Delivery = { ok: true } | { ok: false; reason: string };
 
 /**
  * 送按键之间的间隔。
@@ -548,8 +534,6 @@ export interface ToolDeps {
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** 送出文本之后、peek 校验之前等多久，给 TUI 一点渲染时间。 */
-export const ECHO_WAIT_MS = 400;
 /** 裸启动之后最多等 agent 就绪多久。 */
 export const STARTUP_TIMEOUT_MS = 90_000;
 /** 启动期轮询间隔。 */
@@ -612,6 +596,17 @@ function err(text: string): ToolResult {
   return { text, isError: true };
 }
 
+function deliveryErr(
+  kind: "任务" | "消息",
+  delivery: Extract<Delivery, { ok: false }>,
+): ToolResult {
+  return {
+    text: `${kind}未投递成功：${delivery.reason}`,
+    details: { phase: delivery.phase },
+    isError: true,
+  };
+}
+
 function preview(task: string): string {
   const line = task.replace(/\s+/g, " ").trim();
   return line.length <= TASK_PREVIEW_MAX ? line : `${line.slice(0, TASK_PREVIEW_MAX)}…`;
@@ -627,12 +622,12 @@ export function createTools(deps: ToolDeps): Tools {
   let listAllowed = true;
 
   /**
-   * 并发 spawn 之间的临界区屏障：正在处理中、还没落盘到 registry 的 session
-   * 名字（复用目标的名字，或者刚 allocateName 出来还没 asd create 完的新名字）。
+   * session 输入/创建的临界区屏障：正在投递文本，或还没落盘到 registry 的 session
+   * 名字（复用目标、指名目标，或者刚 allocateName 出来还没 asd create 完的新名字）。
    *
    * pi 扩展的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn` 是并发跑
    * 的，会在同一份 `await asd.list()` 快照上各自决策 —— 不设这道屏障，两个
-   * 并发 spawn 可能抢中同一个空闲 agent（都 send 进去，后者覆盖前者的任务），
+   * 并发 spawn/steer 可能抢中同一个 agent（两份 payload 合成一个 turn），
    * 或者撞同一个新名字（第二个 `asd new` 被拒）。这个集合只活在这一个
    * `createTools` 实例的闭包里，不是模块级全局，避免多个实例互相干扰。
    */
@@ -640,43 +635,7 @@ export function createTools(deps: ToolDeps): Tools {
 
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-  /**
-   * 把一段文本投进 session，**并校验它真的进去了**。
-   *
-   * 为什么不能直接用 `asd.send`：那个方法返回 true 只代表 asd 把字节排进了队列
-   * （daemon 是 `let _ = tx.send(...)` 之后无条件 Ack，见 cli.ts `sendText` 的
-   * 注释），既不代表 agent 收到、更不代表它开始干活。pi-asd 以前拿它当"已送达"，
-   * 于是任务丢了也照报"已派出 xxx"，然后你干等一个永远不来的结果。
-   *
-   * 校验必须卡在"文本已送、回车未送"这个窗口里 —— 回车会清空输入框，按下去之后
-   * 屏幕上有没有这段文本就再也分不出"没送到"和"送到了并且已提交"。
-   *
-   * 校验不过就**不按回车**：此刻输入框里是别的东西（比如一个模态对话框），
-   * 那一下回车会去提交/确认那个别的东西。同 cli.ts 里"正文没进去就别按回车"。
-   */
-  async function deliver(session: string, text: string): Promise<Delivery> {
-    if (!(await asd.sendText(session, text))) {
-      return { ok: false, reason: `"${session}" 的 session 已经不在了` };
-    }
-    await sleep(ECHO_WAIT_MS);
-
-    const screen = await asd.peek(session);
-    if (screen === null) return { ok: false, reason: `"${session}" 的 session 已经不在了` };
-    if (!screenHasText(screen, text)) {
-      return {
-        ok: false,
-        reason:
-          `任务文本没有出现在 "${session}" 的屏幕上 —— 它没被 agent 的输入框收下。` +
-          `没有按回车（此刻输入框里可能是别的东西，回车会误触它）。` +
-          `用 asd_peek("${session}") 看看它卡在什么界面上。`,
-      };
-    }
-
-    if (!(await asd.key(session, "Enter"))) {
-      return { ok: false, reason: `"${session}" 在按回车之前消失了；任务未提交` };
-    }
-    return { ok: true };
-  }
+  const deliver = createDeliver({ asd, sleep });
 
   /**
    * 裸启动之后等 agent 就绪，顺手过掉启动期的模态 UI。
@@ -691,19 +650,32 @@ export function createTools(deps: ToolDeps): Tools {
 
     while (now() < deadline) {
       const screen = await asd.peek(session);
-      if (screen === null) return { ok: false, reason: `"${session}" 启动过程中就消失了` };
+      if (screen === null) {
+        return {
+          ok: false,
+          phase: "text",
+          reason: `"${session}" 启动过程中就消失了`,
+          gone: true,
+        };
+      }
 
       const dialog = (preset.startupDialogs ?? []).find((d) => d.match.test(screen));
       if (dialog !== undefined) {
         if (dismissed.has(dialog.what)) {
           return {
             ok: false,
+            phase: "text",
             reason: `"${session}" 停在「${dialog.what}」上，送了 ${dialog.keys.join("+")} 也没过去`,
           };
         }
         for (const k of dialog.keys) {
           if (!(await asd.key(session, k))) {
-            return { ok: false, reason: `"${session}" 在过「${dialog.what}」时消失了` };
+            return {
+              ok: false,
+              phase: "text",
+              reason: `"${session}" 在过「${dialog.what}」时消失了`,
+              gone: true,
+            };
           }
         }
         dismissed.add(dialog.what);
@@ -719,7 +691,11 @@ export function createTools(deps: ToolDeps): Tools {
       }
       await sleep(STARTUP_POLL_MS);
     }
-    return { ok: false, reason: `"${session}" 在 ${STARTUP_TIMEOUT_MS / 1000}s 内没有就绪` };
+    return {
+      ok: false,
+      phase: "text",
+      reason: `"${session}" 在 ${STARTUP_TIMEOUT_MS / 1000}s 内没有就绪`,
+    };
   }
 
   /** 发送文字/按键会修改 session，只允许已经明确纳入监视列表的目标。 */
@@ -815,12 +791,13 @@ export function createTools(deps: ToolDeps): Tools {
       const known = registry.get(session);
       const sent = await deliver(session, task);
       if (!sent.ok) {
-        // 投递失败时不要留下"已派出"的假象：台账里那条要清掉、watcher 要停。
-        if (known !== undefined) {
+        // 只有 session 真 gone 才清记录。发送前的模态框虽然属于 text 失败，但
+        // session 还活着；清台账会让自建 session 永久丢失 kill/nav 权限。
+        if (known !== undefined && sent.gone === true) {
           registry.remove(session);
           watchers.stop(session);
         }
-        return err(`任务未投递成功：${sent.reason}`);
+        return deliveryErr("任务", sent);
       }
       if (known === undefined) {
         registry.add({
@@ -923,10 +900,17 @@ export function createTools(deps: ToolDeps): Tools {
                 details: { session: target.session, agent, cwd: target.cwd, reused: true, watching },
               };
             }
-            // 没投进去 —— 清掉它、放行预留，继续往下走新建。这条路径上"改道新建"
-            // 是安全的：任务一个字都没提交进去，不会出现两处都在跑同一个任务。
-            registry.remove(target.session);
-            watchers.stop(target.session);
+            if (sent.phase === "submit") {
+              // 正文已经进了 composer，只是无法证明 turn 已启动。绝不能清台账并
+              // 改道新建，否则旧 session 稍后也可能提交，造成任务重复执行。
+              return deliveryErr("任务", sent);
+            }
+            // text 失败时任务没进去，可以放行预留并继续新建；但只有真 gone 才清
+            // 台账。发送前卡模态框的 session 还活着，必须保留它的 kill/nav 权限。
+            if (sent.gone === true) {
+              registry.remove(target.session);
+              watchers.stop(target.session);
+            }
             release(target.session);
           }
         }
@@ -965,10 +949,10 @@ export function createTools(deps: ToolDeps): Tools {
           if (!ready.ok) {
             // 起没起来都不留台账记录 —— 留下就等于宣称"已派出"。session 本身
             // 不动：可能还活着，用户可以 asd attach 进去看它卡在哪。
-            return err(`任务未投递成功：${ready.reason}`);
+            return deliveryErr("任务", ready);
           }
           const sent = await deliver(session, p.task);
-          if (!sent.ok) return err(`任务未投递成功：${sent.reason}`);
+          if (!sent.ok) return deliveryErr("任务", sent);
         }
 
         registry.add({
@@ -1196,19 +1180,36 @@ export function createTools(deps: ToolDeps): Tools {
     },
 
     async steer(p) {
+      if (typeof p.message !== "string" || p.message.trim().length === 0) {
+        return err("message 不能为空 —— 发给 agent 的补充内容必须有实际文字。");
+      }
       const bad = requireMonitoredForInput(p.session);
       if (bad) return bad;
-      const sent = await deliver(p.session, p.message);
-      if (!sent.ok) {
-        // session 真没了才清台账；只是没投进去的话记录要留着，那个 agent 还活着。
-        if (/已经不在了|消失了/.test(sent.reason)) return dropGone(p.session);
-        return err(`消息未投递成功：${sent.reason}`);
+      // 必须在第一个 await 前同步占住：否则两个并发 steer 都能看见空 composer，
+      // 再各写一份 payload；后一份 proof 会把两条消息一起提交成一个 turn。
+      // 与 spawn 共用 reserved，顺手挡住 spawn + steer 的交叉写入。
+      if (reserved.has(p.session)) {
+        return err(`"${p.session}" 正在被另一次输入处理，稍后再试。`);
       }
-      const watching = rewatch(p.session, true);
-      return {
-        text: `已把消息送给 "${p.session}"。${watching ? "watcher 已重挂。" : ""}`,
-        details: { session: p.session, watching },
-      };
+      reserved.add(p.session);
+      try {
+        const sent = await deliver(p.session, p.message);
+        if (!sent.ok) {
+          // session 真没了才清台账；只是没投进去的话记录要留着，那个 agent 还活着。
+          if (sent.gone === true) {
+            const gone = dropGone(p.session);
+            return { ...gone, details: { ...gone.details, phase: sent.phase }, isError: true };
+          }
+          return deliveryErr("消息", sent);
+        }
+        const watching = rewatch(p.session, true);
+        return {
+          text: `已把消息送给 "${p.session}"。${watching ? "watcher 已重挂。" : ""}`,
+          details: { session: p.session, watching },
+        };
+      } finally {
+        reserved.delete(p.session);
+      }
     },
 
     /**
@@ -1230,35 +1231,47 @@ export function createTools(deps: ToolDeps): Tools {
       const parsed = resolveNavKeys(p.keys);
       if (!parsed.ok) return err(parsed.message);
 
-      // 逐个发、中间留空档。见 NAV_KEY_DELAY_MS：一次送一串会挤在同一个 payload
-      // 里，而且对话框来不及重绘。
-      const sent: string[] = [];
-      for (const key of parsed.keys) {
-        if (!(await asd.key(p.session, key))) {
-          registry.remove(p.session);
-          watchers.stop(p.session);
-          return err(
-            sent.length === 0
-              ? `"${p.session}" 的 session 已经不在了，一个键都没送出去。`
-              : `"${p.session}" 在送 ${key} 时消失了。已经送出去的：${sent.join(" ")}。`,
-          );
-        }
-        sent.push(key);
-        await sleep(NAV_KEY_DELAY_MS);
+      // nav 也是往同一个 TUI 写输入。它若绕过 spawn/steer 共用的预留，
+      // Enter 可能在 deliver 的 proof 还没稳定时抢先提交，两串 nav 也可能
+      // 交错选中另一个对话框项。必须在第一个 await 前占住，直到最后一屏读完。
+      if (reserved.has(p.session)) {
+        return err(`"${p.session}" 正在被另一次输入处理，稍后再试。`);
       }
+      reserved.add(p.session);
 
-      // 按完之后 agent 可能就开始干活了（比如刚确认掉一个对话框），watcher 要重挂。
-      const watching = rewatch(p.session, true);
-      const screen = await asd.peek(p.session);
-      if (screen === null) return dropGone(p.session);
+      try {
+        // 逐个发、中间留空档。见 NAV_KEY_DELAY_MS：一次送一串会挤在同一个 payload
+        // 里，而且对话框来不及重绘。
+        const sent: string[] = [];
+        for (const key of parsed.keys) {
+          if (!(await asd.key(p.session, key))) {
+            registry.remove(p.session);
+            watchers.stop(p.session);
+            return err(
+              sent.length === 0
+                ? `"${p.session}" 的 session 已经不在了，一个键都没送出去。`
+                : `"${p.session}" 在送 ${key} 时消失了。已经送出去的：${sent.join(" ")}。`,
+            );
+          }
+          sent.push(key);
+          await sleep(NAV_KEY_DELAY_MS);
+        }
 
-      return {
-        text:
-          `已向 "${p.session}" 送出：${sent.join(" ")}。` +
-          `${watching ? "watcher 已重挂。" : ""}\n` +
-          `--- 按键之后的屏幕 ---\n${screen}`,
-        details: { session: p.session, keys: sent, watching },
-      };
+        // 按完之后 agent 可能就开始干活了（比如刚确认掉一个对话框），watcher 要重挂。
+        const watching = rewatch(p.session, true);
+        const screen = await asd.peek(p.session);
+        if (screen === null) return dropGone(p.session);
+
+        return {
+          text:
+            `已向 "${p.session}" 送出：${sent.join(" ")}。` +
+            `${watching ? "watcher 已重挂。" : ""}\n` +
+            `--- 按键之后的屏幕 ---\n${screen}`,
+          details: { session: p.session, keys: sent, watching },
+        };
+      } finally {
+        reserved.delete(p.session);
+      }
     },
 
     /**

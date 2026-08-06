@@ -69,6 +69,9 @@ function harness(
       }
       return o.peek === undefined ? "SCREEN" : o.peek;
     },
+    async peekSnapshot() {
+      return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
+    },
     async send() {
       return true;
     },
@@ -465,6 +468,9 @@ test("notify 自己抛异常时不会变成未处理 rejection，也不会挡住
     async peek() {
       return "SCREEN";
     },
+    async peekSnapshot() {
+      return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
+    },
     async send() {
       return true;
     },
@@ -629,6 +635,9 @@ function confirmHarness(o: {
     async peek() {
       peekCalls += 1;
       return next();
+    },
+    async peekSnapshot() {
+      return { screen: "SCREEN", cursor: { row: 0, col: 6 }, rows: 24, cols: 80 };
     },
     async send() {
       return true;

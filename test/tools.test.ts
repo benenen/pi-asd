@@ -62,6 +62,33 @@ function card(session: string, cwd: string, docs: string[] = []): {
   return { session, status: "idle", cwd, docs };
 }
 
+interface ScreenFixture {
+  screen: string;
+  cursor: { row: number; col: number };
+  cols?: number;
+}
+
+/** fake `asd peek` 同时支持 raw 和 `--json`；默认光标在最后一个可见字符后。 */
+function peekStdout(
+  args: string[],
+  screen: string,
+  cursor?: { row: number; col: number },
+  cols = 181,
+): string {
+  if (!args.includes("--json")) return screen;
+  const lines = screen.split("\n");
+  // 真 `peek --json` 会省略 raw screen 尾部的空白行，但 cursor 仍指向完整终端行。
+  const rendered = screen.replace(/\n+$/, "");
+  return JSON.stringify({
+    session: args[1],
+    title: "",
+    rows: lines.length,
+    cols,
+    cursor: cursor ?? { row: lines.length - 1, col: lines.at(-1)?.length ?? 0 },
+    screen: rendered,
+  });
+}
+
 /**
  * 假 exec：按子命令决定回什么。live 数组由测试直接改，改完下一次 asd list 就生效。
  * follow 永远挂住不返回 —— watcher 的行为在 watcher.test.ts 里测过了，这里只关心
@@ -86,6 +113,32 @@ function harness(
     swallowText?: boolean;
     /** 前几次 peek 回这些内容（模拟启动期界面），用完之后回正常屏幕。 */
     startupScreens?: string[];
+    /**
+     * 正文送出后，前几次 peek 依次回这些屏幕。用来模拟长粘贴仍在逐帧渲染；
+     * 用完之后才回完整输入框。
+     */
+    echoScreens?: string[];
+    /** echoScreens 没走完之前按 Enter，一律只当输入框换行，不算提交。 */
+    requireEchoScreensBeforeSubmit?: boolean;
+    /** Enter 的提交行为：默认提交；newline 模拟粘贴换行，ignored 模拟尚未处理按键。 */
+    enterBehavior?:
+      | "submit"
+      | "newline-once"
+      | "newline-always"
+      | "ignored"
+      | "mutated"
+      | "mutated-prompt"
+      | "history"
+      | "history-prompt";
+    /** 第一次 Enter 后弹出模态框（已经提交，但绝不能再补 Enter）。 */
+    dialogAfterFirstEnter?: boolean;
+    /** 正常输入框之前固定显示的历史内容。 */
+    screenPrefix?: string;
+    /** 正文 ACK 后固定显示的屏幕；函数形态可以按真正发送的 payload 模拟裁剪。 */
+    screenAfterText?: string | ((text: string) => string);
+    /** 光标不在屏幕末行的 TUI（例如 pi 的横线输入框）专用快照。 */
+    snapshotBeforeText?: ScreenFixture;
+    snapshotAfterText?: ScreenFixture | ((text: string) => ScreenFixture);
     /** 屏幕永远停在信任对话框上 —— 模拟"送了键也过不去"。 */
     stuckOnDialog?: boolean;
     /** peek 直接抛错 —— 验证单个失败不会搞掉整张表。 */
@@ -103,8 +156,19 @@ function harness(
 
   /** session → 最近一次 --text 送进去的内容，供假 peek 回显。 */
   const typed = new Map<string, string>();
+  /** 已真正提交的 session；假屏幕用 WORKING 表示 agent 开始执行。 */
+  const submitted = new Set<string>();
+  /** 曾经提交过的 session；下一次输入时旧 WORKING 仍留在历史区。 */
+  const completed = new Set<string>();
+  const enterCounts = new Map<string, number>();
+  const dialogSessions = new Set<string>();
+  const historySessions = new Set<string>();
+  const promptHistorySessions = new Set<string>();
+  const mutatedPromptSessions = new Set<string>();
+  const inputPrefix = o.screenPrefix ?? "› ";
   /** peek 调用次数，给 startupScreens 排队用。 */
   let peeks = 0;
+  let echoPeeks = 0;
   const exec: Exec = async (_cmd, args) => {
     calls.push(args);
     const ok = (stdout = ""): ExecResult => ({ stdout, stderr: "", code: 0 });
@@ -119,18 +183,116 @@ function harness(
         return ok(`${o.newEchoes ?? args[1]}\n`);
       case "peek": {
         if (o.peekThrows) throw new Error("peek 炸了");
-        if (o.stuckOnDialog) return ok("❯ 1. Yes, I trust this folder\n  2. No, exit\n Enter to confirm");
+        if (o.stuckOnDialog)
+          return ok(peekStdout(args, "❯ 1. Yes, I trust this folder\n  2. No, exit\n Enter to confirm"));
+        if (dialogSessions.has(args[1]!)) {
+          return ok(peekStdout(args, "❯ 1. Allow this action\n  2. Cancel\n Enter to confirm · Esc to cancel"));
+        }
         const startup = o.startupScreens ?? [];
-        if (peeks < startup.length) return ok(startup[peeks++]!);
+        if (peeks < startup.length) return ok(peekStdout(args, startup[peeks++]!));
         peeks += 1;
+        if (
+          !typed.has(args[1]!) &&
+          !submitted.has(args[1]!) &&
+          !completed.has(args[1]!) &&
+          o.snapshotBeforeText !== undefined
+        ) {
+          const fixture = o.snapshotBeforeText;
+          return ok(peekStdout(args, fixture.screen, fixture.cursor, fixture.cols));
+        }
+        const echoScreens = o.echoScreens ?? [];
+        if (typed.has(args[1]!) && echoPeeks < echoScreens.length) {
+          return ok(peekStdout(args, echoScreens[echoPeeks++]!));
+        }
+        if (typed.has(args[1]!) && o.screenAfterText !== undefined) {
+          const sentText = typed.get(args[1]!)!;
+          const screen =
+            typeof o.screenAfterText === "function"
+              ? o.screenAfterText(sentText)
+              : o.screenAfterText;
+          return ok(peekStdout(args, screen));
+        }
+        if (typed.has(args[1]!) && o.snapshotAfterText !== undefined) {
+          const sentText = typed.get(args[1]!)!;
+          const fixture =
+            typeof o.snapshotAfterText === "function"
+              ? o.snapshotAfterText(sentText)
+              : o.snapshotAfterText;
+          return ok(peekStdout(args, fixture.screen, fixture.cursor, fixture.cols));
+        }
+        if (historySessions.has(args[1]!)) {
+          // 任务已从 composer 移到历史区，但还没画出 Working；整屏归一化文字
+          // 与提交前相同，只有任务之前的空白布局变了。
+          return ok(
+            peekStdout(args, `SCREEN:${args[1]}\n• ${typed.get(args[1]!) ?? ""}\n${inputPrefix}`),
+          );
+        }
+        if (promptHistorySessions.has(args[1]!)) {
+          return ok(peekStdout(args, `SCREEN:${args[1]}\n> ${typed.get(args[1]!) ?? ""}\n> `));
+        }
         // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
         // 否则每一次 deliver() 都会判成"没投进去"。
         const echoed = o.swallowText ? "" : (typed.get(args[1]!) ?? "");
-        return ok(`SCREEN:${args[1]}\n${echoed}`);
+        if (submitted.has(args[1]!)) {
+          // agent 输出完一帧以后，光标回到下一行的空 composer；旧实现把 WORKING
+          // 和下一次输入挤在同一行，会让“重新指名交任务”的夹具制造假旧草稿。
+          return ok(peekStdout(args, `SCREEN:${args[1]}\nWORKING\n${inputPrefix}`));
+        }
+        const previousOutput = completed.has(args[1]!) ? "WORKING\n" : "";
+        const currentInputPrefix = mutatedPromptSessions.has(args[1]!) ? "❯ " : inputPrefix;
+        return ok(
+          peekStdout(args, `SCREEN:${args[1]}\n${previousOutput}${currentInputPrefix}${echoed}`),
+        );
       }
-      case "send":
-        if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
+      case "send": {
+        const session = args[1]!;
+        if (args[2] === "--text") {
+          typed.set(session, args[3] ?? "");
+          submitted.delete(session);
+          historySessions.delete(session);
+          promptHistorySessions.delete(session);
+          echoPeeks = 0;
+        }
+        if (args[2] === "--key" && args[3] === "Enter") {
+          // 启动期对话框/nav 的 Enter 没有任务正文，不是 composer 提交。
+          if (!typed.has(session)) return ok();
+          const count = (enterCounts.get(session) ?? 0) + 1;
+          enterCounts.set(session, count);
+          if (o.dialogAfterFirstEnter && count === 1) {
+            typed.delete(session);
+            dialogSessions.add(session);
+          } else {
+            const echoStillMoving =
+              o.requireEchoScreensBeforeSubmit === true && echoPeeks < (o.echoScreens?.length ?? 0);
+            const behavior = o.enterBehavior ?? "submit";
+            const newlineOnly =
+              echoStillMoving || behavior === "newline-always" || (behavior === "newline-once" && count === 1);
+            if (behavior === "history") {
+              historySessions.add(session);
+            } else if (behavior === "history-prompt") {
+              promptHistorySessions.add(session);
+            } else if (behavior === "ignored") {
+              // TUI 尚未处理 Enter，屏幕和输入框都完全没变。
+            } else if (behavior === "mutated") {
+              // Enter 没提交，外部 attach 反而抢先在 composer 前面插入了字符。
+              // 唯一 proof 仍然在当前 composer，只是全文不再精确相等。
+              typed.set(session, `X${typed.get(session) ?? ""}`);
+            } else if (behavior === "mutated-prompt") {
+              // 模拟 TUI 同时换 prompt 字形且改写 composer：原锚点无法识别，
+              // 但唯一 proof 还清清楚楚留在可见输入里。
+              typed.set(session, `X${typed.get(session) ?? ""}`);
+              mutatedPromptSessions.add(session);
+            } else if (newlineOnly) {
+              typed.set(session, `${typed.get(session) ?? ""}\n`);
+            } else {
+              typed.delete(session);
+              submitted.add(session);
+              completed.add(session);
+            }
+          }
+        }
         return ok();
+      }
       case "rename": {
         if (o.renameOutcome === "gone") return { stdout: "", stderr: "no such session", code: 3 };
         if (o.renameOutcome === "unsupported")
@@ -241,7 +403,7 @@ function raceHarness(o: { live?: SessionInfo[]; barrierCount?: number } = {}): H
       case "peek":
         // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
         // 否则每一次 deliver() 都会判成"没投进去"。
-        return ok(`SCREEN:${args[1]}\n${typed.get(args[1]!) ?? ""}`);
+        return ok(peekStdout(args, `SCREEN:${args[1]}\n› ${typed.get(args[1]!) ?? ""}`));
       case "send":
         if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
@@ -332,14 +494,10 @@ test("spawn 命中空闲 agent 时走 send 而不是 new", async () => {
 
   const r = await h.tools.spawn({ task: "新任务" });
   assert.match(r.text, /复用/);
-  // deliver()：正文 → peek 校验 → 回车。中间那次 peek 就是投递校验，
-  // 它是这次改动的重点，所以显式断言在序列里。
-  assert.deepEqual(
-    subcommands(h),
-    ["list", "send", "peek", "send", "follow"],
-    "一次送达 = 正文 send + 校验 peek + 回车 send",
-  );
+  assert.equal(subcommands(h).includes("new"), false, "命中复用就不能新建");
   assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1, "正常提交只按一次 Enter");
+  assert.ok(subcommands(h).filter((c) => c === "peek").length >= 2, "提交前后都必须观察屏幕");
   assert.equal(h.registry.get("pi-agent1")?.task, "新任务");
   assert.equal(h.watchers.isWatching("pi-agent1"), true);
   h.watchers.stopAll();
@@ -597,13 +755,50 @@ test("steer 送消息并重挂 watcher", async () => {
   });
   const r = await h.tools.steer({ session: "pi-a", message: "换个思路" });
   assert.equal(r.isError, undefined);
-  assert.deepEqual(
-    subcommands(h),
-    ["send", "peek", "send", "follow"],
-    "一次送达 = 正文 send + 校验 peek + 回车 send",
-  );
   assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1, "正常提交只按一次 Enter");
+  assert.ok(subcommands(h).filter((c) => c === "peek").length >= 2, "提交前后都必须观察屏幕");
   assert.equal(h.watchers.isWatching("pi-a"), true);
+  h.watchers.stopAll();
+});
+
+test("steer 拒绝空白消息，不能提交只有内部 proof 的空 turn", async () => {
+  const h = harness({ live: [info("pi-a")] });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.steer({ session: "pi-a", message: " \n\t " });
+  assert.equal(r.isError, true);
+  assert.match(r.text, /message 不能为空/);
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("并发 steer 同一 session 时只有一次可以进入投递状态机", async () => {
+  const h = harness({ live: [info("pi-a")] });
+  h.registry.add({
+    session: "pi-a",
+    task: "t",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const [r1, r2] = await Promise.all([
+    h.tools.steer({ session: "pi-a", message: "消息 A" }),
+    h.tools.steer({ session: "pi-a", message: "消息 B" }),
+  ]);
+  assert.equal([r1, r2].filter((r) => r.isError === undefined).length, 1);
+  assert.equal([r1, r2].filter((r) => r.isError === true).length, 1);
+  assert.equal(deliveries(h).length, 1, "同一 composer 不能并发写入两份 payload");
+  assert.equal(enterKeys(h).length, 1);
   h.watchers.stopAll();
 });
 
@@ -1010,6 +1205,33 @@ test("并发指名交给同一个 session：只有一次真正送达，另一次
   h.watchers.stopAll();
 });
 
+test("指名 spawn 与 steer 并发写同一 session 时共享同一输入预留", async () => {
+  const h = harness({
+    live: [info("mem", { running: false, command: "claude" })],
+    cards: [card("mem", "/w/mem")],
+  });
+  h.registry.add({
+    session: "mem",
+    task: "旧任务",
+    cwd: "/w/mem",
+    agent: "claude",
+    createdAt: 0,
+    createdByUs: false,
+  });
+
+  const [steered, spawned] = await Promise.all([
+    h.tools.steer({ session: "mem", message: "补充要求" }),
+    h.tools.spawn({ task: "新任务", session: "mem", watch: false }),
+  ]);
+  assert.equal([spawned, steered].filter((r) => r.isError === undefined).length, 1);
+  const rejected = [spawned, steered].filter((r) => r.isError === true);
+  assert.equal(rejected.length, 1);
+  assert.match(rejected[0]!.text, /正在被另一次.*处理/, "必须由共享输入预留在写正文前拒绝");
+  assert.equal(deliveries(h).length, 1, "spawn 和 steer 也不能把两份正文合成一个 turn");
+  assert.equal(enterKeys(h).length, 1);
+  h.watchers.stopAll();
+});
+
 test("指名交给的早退路径（目标正忙）之后，预留会被释放，下一次仍能真正送达", async () => {
   const h = harness({
     live: [info("busy", { running: true, command: "claude" })],
@@ -1113,7 +1335,7 @@ test("spawn 抛异常时预留会被释放，下一次还能拿到同一个名�
       case "peek":
         // 投递校验会 peek 确认文本进了输入框 —— 假屏幕必须模拟这个行为，
         // 否则每一次 deliver() 都会判成"没投进去"。
-        return ok(`SCREEN:${args[1]}\n${typed.get(args[1]!) ?? ""}`);
+        return ok(peekStdout(args, `SCREEN:${args[1]}\n› ${typed.get(args[1]!) ?? ""}`));
       case "send":
         if (args[2] === "--text") typed.set(args[1]!, args[3] ?? "");
         return ok();
@@ -1400,10 +1622,11 @@ test("screenHasText 空文本不算命中 —— 免得空串到处 includes 成
 });
 
 /**
- * 核心回归：文本没进到 agent 屏幕上时必须**如实报错**，而且**绝不能按回车** ——
- * 此刻输入框里可能是别的东西（比如一个模态对话框），那一下回车会去确认它。
+ * 核心回归：asd 已 ACK、但文本没出现在屏幕上时必须**如实报不确定**，而且
+ * **绝不能按回车**。ACK 只证明 daemon 排过队，不能据此断言任务一定没进去；
+ * 所以这属于 submit 未知态，不能自动改派。
  */
-test("回归：文本没出现在屏幕上 → 报错、不记台账、不按回车", async () => {
+test("回归：ACK 后文本没出现在屏幕上 → submit 报错、不记台账、不按回车", async () => {
   const h = harness({
     live: [info("mem", { command: "claude", idle_ms: 60_000 })],
     cards: [card("mem", "/w/mem")],
@@ -1413,10 +1636,408 @@ test("回归：文本没出现在屏幕上 → 报错、不记台账、不按回
   const r = await h.tools.spawn({ task: "查一下新闻", session: "mem" });
 
   assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit", "ACK 后没回显仍不能证明正文没进 PTY");
   assert.match(r.text, /任务未投递成功/);
   assert.match(r.text, /没有出现在/);
   assert.equal(h.registry.size, 0, "没投进去就不能记台账 —— 记了就等于宣称已派出");
   assert.equal(enterKeys(h).length, 0, "校验没过就绝不能按回车");
+});
+
+test("发送前已有模态框属于 text 失败，正文和 Enter 都不能发送", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    stuckOnDialog: true,
+  });
+
+  const r = await h.tools.spawn({ task: "查一下新闻", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("composer 已有旧草稿时新任务被追加也不能按 Enter", async () => {
+  const head = "任务正文里的提示符不能冒充真正输入框".repeat(2);
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› OLD-DRAFT:",
+  });
+
+  const r = await h.tools.spawn({ task: `${head}\n› ${head}`, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text", "发送前已确认旧草稿存在，任务正文根本不应写入");
+  assert.equal(deliveries(h).length, 0, "不能先追加正文再判断 composer 是否干净");
+  assert.equal(enterKeys(h).length, 0, "否则会把用户旧草稿和新任务拼在一起提交");
+});
+
+test("多行旧草稿末行恰好是空提示符时不能冒充新 composer", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "> OLD-DRAFT\n> ",
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "连续的上一行仍是草稿内容，不能发送正文");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+for (const marker of ["›", "❯"]) {
+  test(`多行旧草稿末行是空 ${marker} 时同样不能冒充新 composer`, async () => {
+    const h = harness({
+      live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+      cards: [card("mem", "/w/mem")],
+      screenPrefix: `${marker} OLD-DRAFT\n  ${marker} `,
+    });
+
+    const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+    assert.equal(r.isError, true);
+    assert.equal(r.details?.phase, "text");
+    assert.equal(deliveries(h).length, 0, "prompt 字形不能作为跳过旧草稿检查的特权");
+    assert.equal(enterKeys(h).length, 0);
+  });
+}
+
+test("多行旧草稿以普通续行和空光标行结尾时也不能发送正文", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› OLD-DRAFT\ncontinued draft\n",
+  });
+
+  const r = await h.tools.spawn({ task: "> 执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "空 continuation 上方仍属于同一个旧 composer");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("多行旧草稿内部有空行时不能把末尾空光标误认成新 composer", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› OLD-DRAFT first paragraph\n\ncontinued draft\n",
+  });
+
+  const r = await h.tools.spawn({ task: "> 执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "草稿内部空行不是 composer 生命周期边界，正文都不能追加");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("多行旧草稿内部有纯边框 continuation 时也不能发送正文", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› OLD-DRAFT first paragraph\n│\ncontinued draft\n",
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "纯边框行也可能是草稿内容，不能当作可靠分隔");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("composer 里只有 Markdown 引用符也不是空输入", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› >",
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "文本指纹会忽略 >，但 composer 判空绝不能忽略用户输入");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("无提示符输入行已有旧草稿时 shell fallback 也不能按 Enter", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "OLD-DRAFT:",
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0, "plain fallback 只能从空输入行开始，不能提交旧草稿");
+});
+
+test("无提示符多行旧草稿以空 continuation 结尾时正文也不能写入", async () => {
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "OLD-DRAFT first line\ncontinued draft\n",
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "空光标行不足以证明 pi 的无 prompt 输入框为空");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi 横线框内已有多行旧草稿时，即使光标行为空也不能写入", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\nOLD-DRAFT first line\ncontinued draft\n\n${frame}\nstatus`,
+      cursor: { row: 4, col: 0 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "必须检查上下框之间的整个输入区，不能只看 cursor 行");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("Codex 光标右侧还有旧草稿时不能把 placeholder 规则用于可编辑正文", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: "› OLD-DRAFT\n\n  gpt-5.6-sol · Context 0% used",
+      cursor: { row: 0, col: 2 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "光标左边虽为空，右边旧草稿仍属于同一输入框");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("Codex 光标下方还有多行旧草稿时发送前必须检查整个 composer", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: "› \n  OLD-DRAFT below cursor\n\n  tab to queue message            100% context left",
+      cursor: { row: 0, col: 2 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "cursor 之后的 continuation 也可能是未提交草稿");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("Codex 草稿里的 footer 文案不能截断 composer 并藏掉后续旧内容", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen:
+        "› \n\n  tab to queue message\n  OLD-DRAFT below fake footer\n\n  gpt-5.6-sol · Context 0% used",
+      cursor: { row: 0, col: 2 },
+      cols: 181,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "只有屏幕底部真实 footer 能界定 composer 下边界");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi 框内用户输入的横线不能冒充上框并藏掉旧草稿", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\nOLD-DRAFT\n--------------------\n\n${frame}\nstatus`,
+      cursor: { row: 4, col: 0 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "ASCII 正文横线不能缩短输入区的上边界");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi 框内出现第二条全宽横线时边界有歧义，保守拒绝投递", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\nOLD-DRAFT\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 4, col: 0 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "多个候选上框无法可靠定位 composer，不能猜最近一条");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi 光标下方还有旧草稿时发送前必须检查上下框之间全部内容", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\nOLD-DRAFT below cursor\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi 发送前 composer 已裁顶时，即使可见行为空也不能追加正文", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      // 上框已明确说还藏着 2 行旧草稿；可见空行不能冒充空 composer。
+      screen: `HISTORY\n${"─── ↑ 2 more ".padEnd(80, "─")}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+  });
+
+  const r = await h.tools.spawn({ task: "不能追加到隐藏草稿", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.equal(deliveries(h).length, 0, "判空时已知道有隐藏行，连正文都不能写");
+  assert.equal(enterKeys(h).length, 0);
+});
+
+test("pi proof 只画在光标右侧时不能冒充已经进入 composer", async () => {
+  const frame = "─".repeat(80);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+    snapshotAfterText: (sentText) => ({
+      screen: `HISTORY\n${frame}\n${sentText.replaceAll("\n", " ")}\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    }),
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "proof 必须位于真实光标之前，右侧预览不能授权 Enter");
+});
+
+test("中文双宽字符不能让 JS slice 越过光标并吞进右侧 proof", async () => {
+  const frame = "─".repeat(300);
+  const task = "中文任务".repeat(30);
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 300,
+    },
+    snapshotAfterText: (sentText) => ({
+      screen: `HISTORY\n${frame}\n${sentText.replaceAll("\n", " ")}\n${frame}\nstatus`,
+      cursor: { row: 2, col: [...task].length * 2 },
+      cols: 300,
+    }),
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "光标还在 proof 左侧，不能因 CJK cell 宽度误判");
+});
+
+for (const [label, grapheme] of [
+  ["国旗", "🇨🇳"],
+  ["keycap", "1️⃣"],
+] as const) {
+  test(`${label} emoji 的双列宽度不能让光标右侧 proof 被误收`, async () => {
+    const frame = "─".repeat(300);
+    const beforeCursor = grapheme.repeat(100);
+    const h = harness({
+      live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+      cards: [card("mem", "/w/mem")],
+      snapshotBeforeText: {
+        screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+        cursor: { row: 2, col: 0 },
+        cols: 300,
+      },
+      snapshotAfterText: (sentText) => ({
+        screen: `HISTORY\n${frame}\n${beforeCursor} ${sentText.replaceAll("\n", " ")}\n${frame}\nstatus`,
+        cursor: { row: 2, col: 200 },
+        cols: 300,
+      }),
+    });
+
+    const r = await h.tools.spawn({ task: "任务", session: "mem", watch: false });
+    assert.equal(r.isError, true);
+    assert.equal(r.details?.phase, "submit");
+    assert.equal(enterKeys(h).length, 0, `${label} 应按 2 cells 计算，proof 仍在 cursor 右侧`);
+  });
+}
+
+test("已登记 session 发送前卡在模态框时保留台账和 watcher", async () => {
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("pi-a", "/w")],
+    stuckOnDialog: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+  h.watchers.watch("pi-a");
+
+  const r = await h.tools.spawn({ task: "新任务", session: "pi-a", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "text");
+  assert.ok(h.registry.get("pi-a") !== undefined, "模态框不是 session gone，不能丢掉 kill/nav 权限");
+  assert.equal(h.watchers.isWatching("pi-a"), true, "投递没发生，不应擅自停止既有 watcher");
+  assert.equal(deliveries(h).length, 0);
+  assert.equal(enterKeys(h).length, 0);
+  h.watchers.stopAll();
 });
 
 test("回归：投递成功时照常记台账、挂 watcher", async () => {
@@ -1429,6 +2050,562 @@ test("回归：投递成功时照常记台账、挂 watcher", async () => {
   assert.equal(r.isError, undefined, r.text);
   assert.equal(h.registry.get("mem")?.createdByUs, false);
   assert.equal(enterKeys(h).length, 1, "校验过了才按回车");
+  h.watchers.stopAll();
+});
+
+for (const placeholder of ["Explain this codebase", "Ask anything"]) {
+  test(`Codex 已验证 placeholder「${placeholder}」不按旧草稿处理`, async () => {
+    const h = harness({
+      live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+      cards: [card("mem", "/w/mem")],
+      snapshotBeforeText: {
+        screen: `HISTORY\n› ${placeholder}\n\n  gpt-5.6-sol · Context 0% used`,
+        cursor: { row: 1, col: 2 },
+        cols: 181,
+      },
+      snapshotAfterText: (sentText) => {
+        const rendered = sentText.replaceAll("\n", "\n  ");
+        const lines = rendered.split("\n");
+        return {
+          screen: `HISTORY\n› ${rendered}\n\n  gpt-5.6-sol · Context 0% used`,
+          cursor: { row: lines.length, col: 2 + lines.at(-1)!.length },
+          cols: 181,
+        };
+      },
+    });
+
+    const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+    assert.equal(r.isError, undefined, r.text);
+    assert.equal(deliveries(h).length, 1);
+    assert.equal(enterKeys(h).length, 1);
+  });
+}
+
+test("正常历史 prompt 上方仍有旧任务时，底部空 composer 仍可接新任务", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› earlier question\nanswer already finished\n\n› ",
+  });
+
+  const r = await h.tools.spawn({ task: "执行下一项任务", session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(deliveries(h).length, 1, "历史区不能让正常的既有 session 永久无法派活");
+  assert.equal(enterKeys(h).length, 1);
+});
+
+test("长任务仍在逐帧回显时不提交，等屏幕稳定后才按 Enter", async () => {
+  const task = `长任务：${"继续检查所有模块。".repeat(40)}`;
+  const head = task.slice(0, 40);
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    echoScreens: [
+      `SCREEN:mem\n${head} 第一帧`,
+      `SCREEN:mem\n${head} 第二帧`,
+      `SCREEN:mem\n${task}`,
+    ],
+    requireEchoScreensBeforeSubmit: true,
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  const screen = await h.tools.peek({ session: "mem" });
+  assert.match(screen.text, /WORKING/, "必须等完整回显稳定后，Enter 才会真正提交");
+  assert.equal(deliveries(h).length, 1, "等待回显期间不能重发正文");
+});
+
+test("判空与 sendText 之间出现并发旧草稿时 proof 后缀不能授权 Enter", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) =>
+      `SCREEN:mem\n› OLD-DRAFT inserted concurrently:${sentText.replaceAll("\n", "\n  ")}`,
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1, "正文 ACK 后是未知态，不能自动重发");
+  assert.equal(enterKeys(h).length, 0, "非明确裁顶视图必须与完整 payload 精确相等");
+});
+
+test("判空与 sendText 之间并发输入 > 时，结构字符也必须当作草稿内容", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) =>
+      `SCREEN:mem\n› >${sentText.replaceAll("\n", "\n  ")}`,
+  });
+
+  const r = await h.tools.spawn({ task: "执行新任务", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1, "sendText ACK 后不能自动重发正文");
+  assert.equal(enterKeys(h).length, 0, "prompt 已结构化剔除，composer 里额外的 > 不能再当噪声删掉");
+});
+
+test("Codex 裁顶没有隐藏行计数时只见尾部 proof 仍保守拒绝提交", async () => {
+  const task = Array.from({ length: 40 }, (_, i) => `UNIQUE-LINE-${i + 1}`).join("\n");
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) => `SCREEN:mem\n› ↑ 35 more\n  ${sentText.slice(-80)}`,
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "没有明确裁顶结构时 proof 后缀不足以排除并发旧草稿");
+});
+
+test("pi 长任务裁顶后只有尾部证据时保守拒绝提交", async () => {
+  const frame = "─".repeat(80);
+  const task = Array.from({ length: 30 }, (_, i) => `PI-LINE-${i + 1}`).join("\n");
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+    snapshotAfterText: (sentText) => {
+      const visible = sentText.split("\n").slice(-2);
+      return {
+        screen: `HISTORY\n${"─── ↑ 29 more ".padEnd(80, "─")}\n${visible.join("\n")}\n${frame}\nstatus`,
+        cursor: { row: 3, col: visible.at(-1)!.length },
+        cols: 80,
+      };
+    },
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "被裁掉的首部无法做精确全文校验，不能授权 Enter");
+});
+
+test("pi 裁顶时旧草稿与 payload 首行合并且隐藏行数不变，仍不能按 Enter", async () => {
+  const frame = "─".repeat(80);
+  const task = Array.from({ length: 30 }, (_, i) => `PI-LINE-${i + 1}`).join("\n");
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+    snapshotAfterText: (sentText) => {
+      const visible = sentText.split("\n").slice(-2);
+      return {
+        // OLD: 和 payload 首行共用一个终端行；↑ 29 more 仍然完全对得上。
+        // 可见尾部与 proof 也都没变，所以裁顶视图根本不足以排除这个竞态。
+        screen: `HISTORY\n${"─── ↑ 29 more ".padEnd(80, "─")}\n${visible.join("\n")}\n${frame}\nstatus`,
+        cursor: { row: 3, col: visible.at(-1)!.length },
+        cols: 80,
+      };
+    },
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1, "正文仍只能 --text 一次");
+  assert.equal(enterKeys(h).length, 0, "裁顶后不能凭尾部 proof 和隐藏行数猜测全文");
+});
+
+test("pi 裁顶隐藏行数多出一行时同样不能按 Enter", async () => {
+  const frame = "─".repeat(80);
+  const task = Array.from({ length: 30 }, (_, i) => `PI-LINE-${i + 1}`).join("\n");
+  const h = harness({
+    live: [info("mem", { command: "pi", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    snapshotBeforeText: {
+      screen: `HISTORY\n${frame}\n\n${frame}\nstatus`,
+      cursor: { row: 2, col: 0 },
+      cols: 80,
+    },
+    snapshotAfterText: (sentText) => {
+      const visible = sentText.split("\n").slice(-2);
+      return {
+        // payload 共 31 行、当前可见 2 行，正常应为 ↑ 29 more；30 说明还藏着一行。
+        screen: `HISTORY\n${"─── ↑ 30 more ".padEnd(80, "─")}\n${visible.join("\n")}\n${frame}\nstatus`,
+        cursor: { row: 3, col: visible.at(-1)!.length },
+        cols: 80,
+      };
+    },
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "隐藏行数是否对得上都不足以授权裁顶 composer 提交");
+});
+
+test("合法多行任务里的 Markdown 引用符不能被误认成新的 composer 起点", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) => `SCREEN:mem\n› ${sentText.replaceAll("\n", "\n  ")}`,
+  });
+  const task = "先检查问题并记录完整证据\n> 再汇报最终结果";
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1, "任务内部的 > 不是新的输入框，正常任务仍应提交");
+});
+
+test("合法多行任务里与根 prompt 相同的字形也按真实缩进正常提交", async () => {
+  const task = "FIRST PART\n› SECOND PART";
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) => `SCREEN:mem\n› ${sentText.replaceAll("\n", "\n  ")}`,
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1);
+});
+
+test("历史里有同任务但当前 composer 是别的草稿时绝不能按 Enter", async () => {
+  const task = "历史任务特征不能越过当前 composer 命中";
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: `${task}\nOUTPUT\n\n› `,
+    screenAfterText: `SCREEN:mem\n› ${task}\nOUTPUT\n\n› OTHER-DRAFT`,
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1, "正文始终只允许送一次");
+  assert.equal(enterKeys(h).length, 0, "历史命中不能授权提交当前 OTHER-DRAFT");
+});
+
+test("历史前缀和当前 composer 后缀不能拼成一份完整任务", async () => {
+  const task = "FIRST PART\n› SECOND PART";
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "FIRST PART\n\n› ",
+    screenAfterText: "SCREEN:mem\n› FIRST PART\n\n› SECOND PART",
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "发送前当前 prompt 必须锚定，不能跨 composer 拼接证据");
+});
+
+test("不同 prompt 字形的当前后缀也不能与历史前缀拼接", async () => {
+  const task = "FIRST PART\n> SECOND PART";
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "FIRST PART\n\n› ",
+    screenAfterText: "SCREEN:mem\n› FIRST PART\n\n> SECOND PART",
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0, "第 0 列的另一个 prompt 是当前 composer，不是正文续行");
+});
+
+test("第一次 Enter 被当成粘贴换行时，稳定后补一次 Enter 并真正提交", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    enterBehavior: "newline-once",
+  });
+
+  const r = await h.tools.spawn({ task: "检查整个仓库并汇报", session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  const screen = await h.tools.peek({ session: "mem" });
+  assert.match(screen.text, /WORKING/, "补发的 Enter 应把仍在输入框里的任务提交出去");
+  assert.equal(enterKeys(h).length, 2, "只允许补一次 Enter");
+  assert.equal(deliveries(h).length, 1, "补发只补 Enter，不能重发正文");
+});
+
+test("正常提交只按一次 Enter，不走补发路径", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+  });
+
+  const r = await h.tools.spawn({ task: "正常执行这项任务", session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  const screen = await h.tools.peek({ session: "mem" });
+  assert.match(screen.text, /WORKING/);
+  assert.equal(enterKeys(h).length, 1, "屏幕已变化就不能再补 Enter");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("首次 Enter 后出现模态框时绝不补 Enter", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    dialogAfterFirstEnter: true,
+  });
+
+  const r = await h.tools.spawn({ task: "执行时可能申请权限", session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  const screen = await h.tools.peek({ session: "mem" });
+  assert.match(screen.text, /Allow this action/, "提交后的模态框应保留给用户决定");
+  assert.equal(enterKeys(h).length, 1, "第二颗 Enter 会误确认模态框，绝不能发送");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("首次 Enter 后屏幕完全未变时不补第二颗，返回 submit 未确认", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "ignored",
+  });
+
+  const r = await h.tools.spawn({ task: "等待 TUI 真正处理按键", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 1, "没有看到换行的正向证据就不能盲补 Enter");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("首次 Enter 后 composer 被外部改成 X-payload 时，proof 仍在不能冒充已提交", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "mutated",
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交确认", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.match(r.text, /proof 仍在 composer/);
+  assert.equal(deliveries(h).length, 1, "正文只能发送一次");
+  assert.equal(enterKeys(h).length, 1, "composer 已变异，不能补第二颗 Enter");
+});
+
+test("首次 Enter 后 prompt 换代且变成 X-payload 时，unknown 也必须先查可见 proof", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "mutated-prompt",
+  });
+
+  const r = await h.tools.spawn({ task: "检查 unknown 回退", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.match(r.text, /proof 仍在 composer/);
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 1, "结构换代不能让仍可见的 proof 绕过 mismatch");
+});
+
+test("任务移到历史区且底部 composer 已空时确认已提交，不补第二颗 Enter", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "history",
+  });
+
+  const r = await h.tools.spawn({ task: "任务文字会进入历史区", session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(enterKeys(h).length, 1, "唯一 proof 已离开 composer 就是提交证据，不能误补 Enter");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("第一颗 Enter 后任务进入带提示符历史且底部 composer 为空时不能补 Enter", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    enterBehavior: "history-prompt",
+  });
+
+  const r = await h.tools.spawn({ task: "任务已经进入历史区", session: "mem", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 1, "底部 composer 为空说明任务不在那里，绝不能补第二颗 Enter");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("历史区已有相同任务时仍按唯一 proof 锚定当前 composer 的提交结果", async () => {
+  const task = "重复任务前缀必须锁定输入框位置";
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: `• ${task}\n› `,
+    enterBehavior: "history",
+  });
+
+  const r = await h.tools.spawn({ task, session: "mem", watch: false });
+  assert.equal(r.isError, undefined, r.text);
+  assert.equal(enterKeys(h).length, 1, "底部 composer 已空，不能锚定旧历史后误补 Enter");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("两次 Enter 都没提交时标记 submit 失败，不能把同一任务自动改派到新 session", async () => {
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    screenPrefix: "› ",
+    enterBehavior: "newline-always",
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task: "新任务", agent: "pi", watch: false });
+  assert.equal(r.isError, true, "提交没确认时不能转去新建并谎报成功");
+  assert.equal(r.details?.phase, "submit");
+  assert.match(r.text, /文本已输入.*未确认提交/);
+  assert.equal(subcommands(h).includes("new"), false, "文本可能仍在旧输入框，不能改派新 session");
+  assert.equal(deliveries(h).length, 1, "不能重发正文");
+  assert.equal(enterKeys(h).length, 2, "最多补一次 Enter");
+  assert.ok(h.registry.get("pi-a") !== undefined, "未确认提交不能把仍存活的 agent 从台账删掉");
+});
+
+test("自动复用收到 sendText ACK 但没有回显时不能改派新 session", async () => {
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    swallowText: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task: "新任务", agent: "pi", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(subcommands(h).includes("new"), false, "ACK 后是否落进 PTY 不确定，不能自动改派");
+  assert.equal(deliveries(h).length, 1);
+  assert.equal(enterKeys(h).length, 0);
+  assert.ok(h.registry.get("pi-a") !== undefined);
+});
+
+test("历史区已有任务前缀时状态栏变化不能冒充新正文回显", async () => {
+  const task = "相同任务前缀早已出现在历史区";
+  const after = `SCREEN:pi-a\n${task}\nSTATUS:1`;
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    screenPrefix: `${task}\nSTATUS:0\n› `,
+    echoScreens: [after, after, after, after],
+    swallowText: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task, agent: "pi", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "只有状态栏变了，不能对历史区的旧前缀按 Enter");
+  assert.equal(subcommands(h).includes("new"), false);
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("历史重绘多露出一条同任务记录时不能冒充 composer 回显", async () => {
+  const task = "重复历史记录不能骗过输入框定位";
+  const redrawn = `SCREEN:pi-a\n• ${task}\n• ${task}\n› `;
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    screenPrefix: `• ${task}\n› `,
+    echoScreens: [redrawn, redrawn, redrawn, redrawn],
+    swallowText: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task, agent: "pi", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "新增命中只在历史区，composer 仍为空，不能按 Enter");
+  assert.equal(subcommands(h).includes("new"), false);
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("历史重绘露出带提示符的同任务记录时仍只认最底部空 composer", async () => {
+  const task = "历史用户消息也可能带输入提示符";
+  const redrawn = `SCREEN:pi-a\n› ${task}\n› `;
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    screenPrefix: "› ",
+    echoScreens: [redrawn, redrawn, redrawn, redrawn],
+    swallowText: true,
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.spawn({ task, agent: "pi", watch: false });
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "最底部 composer 为空，不能继续向上命中历史提示符");
+  assert.equal(deliveries(h).length, 1);
+});
+
+test("steer 补发 Enter 时正文始终只用 --text 发送一次", async () => {
+  const h = harness({
+    live: [info("pi-a", { command: "pi", idle_ms: 60_000 })],
+    screenPrefix: "› ",
+    enterBehavior: "newline-once",
+  });
+  h.registry.add({
+    session: "pi-a",
+    task: "旧任务",
+    cwd: "/w",
+    agent: "pi",
+    createdAt: 0,
+    createdByUs: true,
+  });
+
+  const r = await h.tools.steer({ session: "pi-a", message: "换个思路继续" });
+  assert.equal(r.isError, undefined, r.text);
+  const screen = await h.tools.peek({ session: "pi-a" });
+  assert.match(screen.text, /WORKING/);
+  assert.equal(deliveries(h).length, 1, "补发路径不能再送一次正文");
+  assert.equal(enterKeys(h).length, 2, "只补一颗 Enter");
   h.watchers.stopAll();
 });
 
@@ -1708,6 +2885,46 @@ test("nav 把按完之后的屏幕一并返回 —— 省掉调用方再 peek �
   h.watchers.stopAll();
 });
 
+test("nav 与 steer 并发写同一 session 时共用输入预留", async () => {
+  const h = navHarness();
+  const [navigated, steered] = await Promise.all([
+    h.tools.nav({ session: "pi-a", keys: ["ArrowDown", "Enter"] }),
+    h.tools.steer({ session: "pi-a", message: "继续执行" }),
+  ]);
+
+  assert.equal([navigated, steered].filter((r) => r.isError === undefined).length, 1);
+  assert.equal([navigated, steered].filter((r) => r.isError === true).length, 1);
+  assert.match(
+    [navigated, steered].find((r) => r.isError === true)!.text,
+    /正在被另一次输入处理/,
+  );
+  assert.equal(deliveries(h).length, 0, "nav 已占住 session 时 steer 不能再写正文");
+  assert.equal(enterKeys(h).length, 2, "只有 nav 的两个按键可以送出");
+  h.watchers.stopAll();
+});
+
+test("两个 nav 并发操作同一 session 时只有一串按键进入 TUI", async () => {
+  const h = navHarness();
+  const [first, second] = await Promise.all([
+    h.tools.nav({ session: "pi-a", keys: ["ArrowDown", "Enter"] }),
+    h.tools.nav({ session: "pi-a", keys: ["ArrowUp", "Enter"] }),
+  ]);
+
+  assert.equal([first, second].filter((r) => r.isError === undefined).length, 1);
+  assert.equal([first, second].filter((r) => r.isError === true).length, 1);
+  assert.match(
+    [first, second].find((r) => r.isError === true)!.text,
+    /正在被另一次输入处理/,
+  );
+  const keyCalls = h.calls.filter((c) => c[0] === "send" && c.includes("--key"));
+  assert.deepEqual(
+    keyCalls.map((c) => c[c.indexOf("--key") + 1]),
+    ["Down", "Enter"],
+    "两串按键不能穿插",
+  );
+  h.watchers.stopAll();
+});
+
 test("nav 认不出按键时一个都不送，也不碰 asd", async () => {
   const h = navHarness();
   const before = h.calls.length;
@@ -1792,6 +3009,7 @@ function adoptedHarness() {
   const h = harness({
     live: [info("mem", { command: "claude", idle_ms: 60_000 })],
     cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
   });
   return h;
 }

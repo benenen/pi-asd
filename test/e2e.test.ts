@@ -54,12 +54,25 @@ function realExec(root: string): Exec {
     });
 }
 
-/** 假 agent 预设：打一行 READY 然后挂住，行为足够像一个停下来等输入的 agent，
- * 又不需要真的装 claude / pi。只在这个测试文件里用，不碰模块级 `PRESETS`。 */
+/**
+ * 假 agent 预设：打一行 READY，然后逐行读 PTY 输入并回显 GOT:<正文>。
+ *
+ * 旧探针只是 `sleep 30`，不会读取 stdin；它只能证明 asd 接收了字节，证明不了 Enter
+ * 真正触发提交。这个交互探针让 e2e 覆盖和 agent TUI 相同的「输入框 → Enter → 新输出」
+ * 状态迁移，又不需要真的安装 claude / pi。
+ */
 const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   "sh-probe": {
-    command: (t) => `sh -c 'echo READY; echo ${t}; sleep 30'`,
+    command: () => "sh -c 'exit 2'", // deliver: send 不走 argv；误走时让测试立即暴露。
+    // raw PTY 探针：正文里的换行只回显，不触发提交；只有独立 CR（--key Enter）
+    // 才打印 GOT。这样追加投递 proof 后，e2e 仍然真正验证“Enter 创建 turn”。
+    bare:
+      `node -e 'process.stdout.write("› "); process.stdin.setRawMode(true); let b=[]; ` +
+      `process.stdin.on("data",d=>{for(const x of d){if(x===13){const s=Buffer.from(b).toString(); ` +
+      `process.stdout.write("\\r\\nGOT:"+s.replace(/\\n/g,"\\\\n")+"\\r\\n› "); b=[]}else{b.push(x); ` +
+      `process.stdout.write(Buffer.from([x]))}}})'`,
     piChild: false,
+    deliver: "send",
   },
 };
 
@@ -103,17 +116,17 @@ test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { time
     const session = String(spawned.details?.session);
     assert.equal(session, "pi-e2e-one");
 
-    // 等 sh 把 READY 打出来。
+    // 等 raw probe 把输入 prompt 打出来。
     const deadline = Date.now() + 10_000;
     let screen = "";
     while (Date.now() < deadline) {
       const r = await tools.peek({ session });
       screen = r.text;
-      if (screen.includes("READY")) break;
+      if (screen.includes("›")) break;
       await new Promise((r2) => setTimeout(r2, 100));
     }
-    assert.match(screen, /READY/);
-    assert.match(screen, /HELLO-E2E/);
+    assert.match(screen, /›/);
+    assert.match(screen, /GOT:HELLO-E2E/, "初始任务必须由 Enter 真正提交给探针");
 
     const listed = await tools.agents();
     assert.match(listed.text, new RegExp(session));
@@ -144,6 +157,8 @@ test("e2e：spawn + 台账外 peek/follow + steer/kill 走一遍真 asd", { time
 
     const steered = await tools.steer({ session, message: "ping" });
     assert.equal(steered.isError, undefined, steered.text);
+    const afterSteer = await tools.peek({ session });
+    assert.match(afterSteer.text, /GOT:ping/, "steer 也必须由 Enter 真正提交给探针");
     watchers.stopAll();
 
     const killed = await tools.kill({ session });

@@ -44,7 +44,7 @@ e2e 在 `asd` 不在 PATH 上时自动跳过。
 `test/e2e.test.ts` 里唯一的例外是 `asd --version`（clap 内置元数据子命令，碰 daemon 之前就
 返回）。任何会碰 daemon 的子命令都必须走那个文件里的 `realExec()`。别把这处例外当模板抄。
 
-## 架构：一层薄壳 + 六层纯逻辑
+## 架构：一层薄壳 + 可测试的纯逻辑层
 
 理解这个代码库只需要抓住一条：**`index.ts` 是唯一 import pi 的文件**。其它每一层的外部
 依赖都是注入进来的，所以整个代码库不装 pi、不装 asd 也能测。
@@ -57,7 +57,8 @@ index.ts        ← 唯一碰 pi 的文件。把 pi.exec 适配成 exec、pi.sen
   ├── watcher.ts   WatcherPool：后台 follow watcher（注入 asd / notify / now）
   ├── reaper.ts    Reaper：按 idle_ms 定时回收空闲够久的自家 session
   ├── dialog.ts    从一屏文字里认出「agent 弹了对话框在等决策」。纯函数
-  ├── tools.ts     工具逻辑（注入 asd / registry / watchers / config / mkdirp / now）。
+  ├── delivery.ts  投递状态机：稳定回显、Enter 提交确认、最多一次安全补键
+  ├── tools.ts     工具编排（注入 asd / registry / watchers / config / mkdirp / now）。
                    另有两个内部入口：`agents()` 故意不注册；`resetListAllowance()` 由生命周期调用
   ├── prompt.ts    boss mode 系统提示词。纯函数
   └── config.ts    asd.json 的读取、合并、校验
@@ -140,13 +141,18 @@ session 名前缀纯属命名约定，**没有任何安全判断依赖它**。`S
 
 ### 3. `createTools` 闭包里的 `reserved` 屏障
 
-pi 的并发工具执行模型下，同一条助手消息里的多个 `asd_spawn` 是**并发**跑的，会在同一份
-`await asd.list()` 快照上各自决策。没有这道屏障，两个并发 spawn 会抢中同一个空闲 agent
-（后者的任务覆盖前者），或者撞同一个新名字（第二个 `asd new` 被拒）。
+pi 的并发工具执行模型下，同一条助手消息里的多个工具是**并发**跑的。没有这道屏障，两个
+spawn 会在同一份 `await asd.list()` 快照上抢中同一个 agent，两个 steer 会都先看见空
+composer 再各写一份 payload（最后合成一个 turn），spawn + steer 也会交叉写；nav 的 Enter
+还可能在 proof 未稳定时抢先提交，两串 nav 则会交错选错对话框项；新建路径还会
+撞同一个名字（第二个 `asd new` 被拒）。所以 `reserved` 不只是名字避重，也是**每个 session
+的输入互斥**：adopt / 自动复用 / 新建 send / steer / nav 全部共用，且必须在第一次
+await 前同步占住，直到整段输入和最后一次 peek 结束才释放。
 
 注意它占的是「接下来会落进 registry 的那个 key」：新建路径上 `allocateName` 算出的名字和
 `asd new` 实际回显的名字可能不一样，两个都要占，否则中间那条缝隙会漏。失败、成功、复用转
-新建的中途改道，收尾时都必须放行预留。
+新建的中途改道，收尾时都必须放行预留。`asd_steer` 还要在进状态机前拒绝空白 message，
+不能让内部 proof 自己变成一个空 turn。
 
 ### 4. asd 的 `running` 不是「进程在执行」，`settle` 不是「干完了」
 
@@ -203,8 +209,40 @@ agent 的 TUI 输入框普遍按"一大坨字节一次到达"判定粘贴，那�
 `let _ = handle.tx.send(...)` —— 连排队结果都丢弃 —— 紧接着无条件回 `Ack`；真正写
 pty 在之后异步发生，失败只 `debug!` 一行。
 
-所以**任何往 session 里投任务的地方都要走 `deliver()`**，它做三步：
-`sendText` → peek 校验文本真的出现在屏幕上 → `key("Enter")`。
+所以**任何往 session 里投任务的地方都要走 `deliver()`**。完整链路不是一次 peek：
+
+1. 先用 `peek --json` 保存发送前屏幕和光标，并确认当前 composer 为空，再 `sendText`；
+   发现旧草稿就不追加正文。判空必须覆盖**整个可编辑区**，不能只看 cursor 左边/上边：用户
+   把光标移到旧草稿开头或中间时，右边、下边仍是同一份草稿。注意 raw `screen` 会省略底部
+   空白行，cursor.row 仍按完整终端上报，解析时要按 rows 补齐。实测 Codex/Claude 的根
+   prompt 在第 0 列，正文里的 `>` / `›` / `❯` 会被编辑器缩进；footer 文案可以由用户输入，
+   只有它同时是屏幕最后一条非空行、前面有空分隔行时才算结构。只对已验证的精确 placeholder
+   文案例外。pi 没有 prompt，输入区由**恰好一对终端全宽的 Unicode
+   `─`** 包住（长输入上框可带 `↑ N more`）；ASCII/短横线不是边框，多出第三条全宽候选也
+   属于歧义，一律拒绝猜最近一条。发送前上框已是 `↑ N more` 就证明隐藏着旧草稿，
+   即使可见行为空也必须在 `sendText` 前拒绝。确认为空后保存这个结构锚点
+2. 正文尾部附一行随机 UUID 的 HTML comment 作为**本次投递唯一 proof**，仍然和正文一起只走
+   一次 `sendText`，不是第二次投递。循环 `peek --json`，必须同时看到「屏幕相对发送前发生
+   变化」和 proof 确实同时位于**当前 composer 的完整内容末尾与真实光标之前**，并且连续稳定至少 250ms，才允许
+   按第一颗 Enter；总共等 5s，超时就停。不能只数历史区里的任务特征，也不能要求全文始终
+   可见。正常视图剔除已识别的 prompt/外框后，只忽略 TUI 折行与 continuation 缩进产生的
+   空白，其它字符必须与**完整 payload 精确相等**。不能拿整屏噪声规则删除 composer 里的
+   `>` / `─` 等可输入字符，否则发送前判空和 `sendText` 之间有人并发
+   写入旧草稿。任何裁顶视图都要保守报 submit 未确认：Codex/Claude 没有隐藏行计数；pi 的
+   `↑ N more` 即使与 payload 行数完全对上，也排除不了 `OLD:` 在判空后与 payload 首行拼在同一终端行，
+   此时隐藏行数和可见尾部都不变。在 asd 能原子读取完整 composer 之前，不许拿 suffix 授权 Enter
+3. 保存提交前的稳定屏幕，按 Enter 后继续 peek。还能识别 composer 时，本次唯一 proof 已
+   离开 composer 就是提交证据。「全文不再 exact」不等于「proof 已离开」：若外部 attach 改成
+   `X<payload>`，proof 还在当前 composer，必须当 mismatch 报 submit 未确认，不能报成功或补键。
+   composer 整个消失、结构已无法识别时，也要先在可见整屏查唯一 proof；prompt 从
+   `›` 换成 `❯` 不代表 turn 已启动，proof 还可见就仍当 mismatch。只有结构不可识别且可见
+   屏幕也找不到 proof 时，才退回「忽略空白/边框
+   后屏幕已变化」的判据。proof 若仍在 composer，状态栏自己变化不能冒充提交；只有「proof
+   结束前的布局逐字符不动、结束后只增加空白」并稳定了一个窗口，才算 Enter 只在原 composer
+   末尾插了换行。整屏仍能搜到任务不够——任务可能已经移到历史区；屏幕原样不动也可能是
+   TUI 尚未处理按键，都不能盲补
+4. 补 Enter 前仍要用光标重新确认任务还在当前 composer，不能拿历史区的同任务文字当
+   凭据；最多补一次，两次都无法确认就报「文本已输入但未确认提交」，绝不重发正文
 
 两个不能改的细节：
 
@@ -212,9 +250,16 @@ pty 在之后异步发生，失败只 `debug!` 一行。
   屏幕上有没有这段文本就再也分不出"没送到"和"送到了并且已提交"。
 - **校验不过就绝不按回车。** 此刻输入框里可能是别的东西（比如一个模态对话框），
   那一下回车会去确认它 —— claude 的信任对话框默认项是 "2. No, exit"。
+- **补 Enter 前也必须确认没有模态框。** 第一颗 Enter 可能真的提交成功、随后弹出权限
+  对话框；这时第二颗 Enter 会替用户确认，必须停在原处让用户决定。
 
-投递失败要如实报「任务未投递成功：<原因>」并且**不记台账** —— 记了就等于宣称
-"已派出"，正是这次要修掉的病。
+失败结果分 `phase: "text" | "submit"`。`text` 只用于发送前就被挡住，或 `sendText`
+明确返回 false，此时正文没进去，可以改走新建；但只有 session 确认真 gone 才能清台账，
+发送前卡模态框的 session 仍要保留 kill/nav 权限。`sendText` 一旦收到
+asd ACK，之后任何失败（包括 5s 内没看到回显）都属于 `submit` 未知态：ACK 只说明 daemon
+排过队，不能证明 PTY 最终没收到。此时必须保留已有台账并立即报错，**绝不能自动改派新
+session，也不能重发正文**，否则旧 session 稍后也开始执行时会把同一任务跑两遍。新
+session 仍然只有确认投递成功后才记台账 —— 记早了就等于宣称「已派出」。
 
 ### 7. 启动期的模态 UI 要按 preset 过掉
 

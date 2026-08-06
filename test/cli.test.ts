@@ -93,6 +93,37 @@ test("peek 遇到退出码 3 返回 null，不抛", async () => {
   assert.equal(await createAsd(exec).peek("pi-a"), null);
 });
 
+test("peekSnapshot 用 --json 保留 composer 光标位置", async () => {
+  const stdout = JSON.stringify({
+    session: "pi-a",
+    title: "",
+    rows: 24,
+    cols: 80,
+    cursor: { row: 21, col: 14 },
+    screen: "SCREEN\n› 正在输入的任务",
+  });
+  const { exec, calls } = fakeExec([{ stdout }]);
+
+  assert.deepEqual(await createAsd(exec).peekSnapshot("pi-a"), {
+    screen: "SCREEN\n› 正在输入的任务",
+    cursor: { row: 21, col: 14 },
+    rows: 24,
+    cols: 80,
+  });
+  assert.deepEqual(calls[0].args, ["peek", "pi-a", "--json"]);
+});
+
+test("peekSnapshot 缺少光标时拒绝把不完整 JSON 当作投递证据", async () => {
+  const { exec } = fakeExec([{ stdout: JSON.stringify({ screen: "SCREEN" }) }]);
+  await assert.rejects(() => createAsd(exec).peekSnapshot("pi-a"), AsdError);
+});
+
+test("peekSnapshot 缺少终端尺寸时拒绝猜测 pi 横线框宽度", async () => {
+  const stdout = JSON.stringify({ screen: "SCREEN", cursor: { row: 0, col: 0 } });
+  const { exec } = fakeExec([{ stdout }]);
+  await assert.rejects(() => createAsd(exec).peekSnapshot("pi-a"), AsdError);
+});
+
 /**
  * 回归：send 必须**分两次**发 —— 正文一次，`--key Enter` 一次。
  *
