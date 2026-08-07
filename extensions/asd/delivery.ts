@@ -13,7 +13,6 @@ import {
   deliveryMarker,
   screenFingerprint,
   screenHasProof,
-  screenLayout,
 } from "./delivery-screen.ts";
 type ComposerAnchor =
   | { kind: "prompt"; marker: string; prefix: string }
@@ -22,6 +21,9 @@ type ComposerAnchor =
 interface ComposerView {
   fullLines: string[];
   beforeCursorLines: string[];
+  cols: number;
+  firstLineCols: number;
+  continuationPrefix: string;
   clipped?: true;
   rootRow?: number;
 }
@@ -161,6 +163,9 @@ function framedComposerView(snapshot: ScreenSnapshot): ComposerView | undefined 
   return {
     fullLines,
     beforeCursorLines,
+    cols: snapshot.cols,
+    firstLineCols: snapshot.cols,
+    continuationPrefix: "",
     clipped: piHiddenRows(lines[top]!) === undefined ? undefined : true,
   };
 }
@@ -216,21 +221,82 @@ function promptComposerView(
         ];
   // prompt 路径只接受完整 payload：Codex/Claude 裁顶没有可校验的完整首部。
   // pi 即使给出 `↑ N more` 也同样 fail closed，见 viewHasPayload 的竞态说明。
-  return { fullLines, beforeCursorLines, rootRow };
+  const promptCells = cellWidth(rootMatch[0]);
+  return {
+    fullLines,
+    beforeCursorLines,
+    cols: snapshot.cols,
+    firstLineCols: snapshot.cols - promptCells,
+    continuationPrefix: " ".repeat(promptCells),
+    rootRow,
+  };
 }
 
-/** 完整输入与光标前内容都必须精确等于本次带唯一 proof 的 payload。 */
-function composerText(input: string): string {
-  return input.replace(/\s/g, "");
+function rowContentOptions(view: ComposerView, line: string, row: number): string[] {
+  if (row === 0 || view.continuationPrefix.length === 0) {
+    return [line];
+  }
+  // 空视觉行在 VT 文本快照里可能被裁掉纯布局空格；非空 continuation 则必须
+  // 带已由根 prompt 宽度证明的固定缩进，不能把用户自己输入的同宽空格猜成布局。
+  if (line.length === 0) return [line];
+  return line.startsWith(view.continuationPrefix)
+    ? [line.slice(view.continuationPrefix.length)]
+    : [];
 }
 
-function inputHasPayload(input: string, text: string): boolean {
-  // prompt/框线已由上层结构化剔除，这里只忽略 TUI 折行和 continuation
-  // 缩进产生的空白。`>`、`─` 等字符也可能是外部 attach 并发输入的
-  // 真实草稿，绝不能再用整屏噪声规则删掉，否则会把 `><payload>` 误当精确命中。
-  const fullText = composerText(text);
-  const actual = composerText(input);
-  return actual.length > 0 && actual === fullText;
+function rowIsFull(view: ComposerView, line: string, row: number): boolean {
+  const width = row === 0 ? view.firstLineCols : view.cols;
+  return width > 0 && cellWidth(line) >= width;
+}
+
+/**
+ * 把终端视觉行重新拼成 payload 的逻辑行。
+ *
+ * 只允许在上一视觉行确实占满终端时跨行拼接，因此用户在短行中插入的换行不会
+ * 被当作软换行吞掉。prompt continuation 的固定缩进可以剔除；其它空格全部保留。
+ */
+function linesMatchPayload(view: ComposerView, lines: string[], text: string): boolean {
+  const expectedLines = text.split("\n");
+  const memo = new Map<string, boolean>();
+
+  const matchFrom = (row: number, logicalLine: number): boolean => {
+    const key = `${row}:${logicalLine}`;
+    const cached = memo.get(key);
+    if (cached !== undefined) return cached;
+    if (logicalLine === expectedLines.length) {
+      const done = row === lines.length;
+      memo.set(key, done);
+      return done;
+    }
+
+    const expected = expectedLines[logicalLine]!;
+    let prefixes = new Set([""]);
+    for (let currentRow = row; currentRow < lines.length && prefixes.size > 0; currentRow++) {
+      const nextPrefixes = new Set<string>();
+      for (const prefix of prefixes) {
+        for (const content of rowContentOptions(view, lines[currentRow]!, currentRow)) {
+          const candidate = prefix + content;
+          if (candidate === expected && matchFrom(currentRow + 1, logicalLine + 1)) {
+            memo.set(key, true);
+            return true;
+          }
+          if (
+            candidate.length < expected.length &&
+            expected.startsWith(candidate) &&
+            rowIsFull(view, lines[currentRow]!, currentRow)
+          ) {
+            nextPrefixes.add(candidate);
+          }
+        }
+      }
+      prefixes = nextPrefixes;
+    }
+
+    memo.set(key, false);
+    return false;
+  };
+
+  return text.length > 0 && matchFrom(0, 0);
 }
 
 function viewHasPayload(view: ComposerView, text: string): boolean {
@@ -239,9 +305,12 @@ function viewHasPayload(view: ComposerView, text: string): boolean {
   // 首行拼在同一终端行：N 不变、可见尾部和 proof 也全对，但 Enter 会把
   // `OLD:<payload>` 一起提交。没有原子读完整 composer 的协议前，裁顶一律 fail closed。
   if (view.clipped === true) return false;
+  const cursorLineCount = view.beforeCursorLines.length;
+  const afterCursorRows = view.fullLines.slice(cursorLineCount);
+  if (afterCursorRows.some((line) => line.trim().length > 0)) return false;
   return (
-    inputHasPayload(view.fullLines.join("\n"), text) &&
-    inputHasPayload(view.beforeCursorLines.join("\n"), text)
+    linesMatchPayload(view, view.fullLines.slice(0, cursorLineCount), text) &&
+    linesMatchPayload(view, view.beforeCursorLines, text)
   );
 }
 
@@ -260,19 +329,20 @@ function composerPayloadState(
   // `absent` 专指唯一 proof 真的已离开当前 composer。如果 Enter 没提交，
   // 外部 attach 只是把它改成 `X<payload>`，全文虽不再 exact，proof 却还在；
   // 把这种 mismatch 当 absent 会谎报已提交。裁顶视图也只能给 mismatch。
-  const proofStillInComposer = composerText(view.fullLines.join("\n")).includes(
-    composerText(proof),
-  );
+  const proofStillInComposer = screenHasProof(view.fullLines.join("\n"), proof);
   return proofStillInComposer || view.clipped === true ? "mismatch" : "absent";
 }
 
-function composerHasText(
+function composerMatchesText(
   snapshot: ScreenSnapshot,
   text: string,
-  proof: string,
   anchor: ComposerAnchor,
 ): boolean {
-  return composerPayloadState(snapshot, text, proof, anchor) === "present";
+  const view =
+    anchor.kind === "prompt"
+      ? promptComposerView(snapshot, anchor)
+      : framedComposerView(snapshot);
+  return view !== undefined && viewHasPayload(view, text);
 }
 
 /** 发送正文前必须确认当前输入位为空，并保存之后校验要用的 prompt 锚点。 */
@@ -386,54 +456,11 @@ function hasNewComposerEcho(
   );
 }
 
-/** 找到任务特征最后一次出现时，在保留空白布局的屏幕里结束于哪个 raw offset。 */
-function signatureEnd(screen: string, text: string): number | undefined {
-  const needle = screenFingerprint(text);
-  if (needle.length === 0) return undefined;
-
-  let compact = "";
-  const rawEnds: number[] = [];
-  for (let i = 0; i < screen.length; i++) {
-    const ch = screen[i]!;
-    if (/\s/.test(ch)) continue;
-    compact += ch;
-    rawEnds.push(i + 1);
-  }
-  // 同一段任务可能早就在历史区出现过；composer 是屏幕里最后一次出现的位置。
-  const start = compact.lastIndexOf(needle);
-  if (start < 0) return undefined;
-  return rawEnds[start + needle.length - 1];
-}
-
-/**
- * 第一颗 Enter 是否只在原 composer 的任务文字**之后**多插入了空白。
- *
- * 整屏文本命中不够：提交成功后任务会移到历史区，文字仍然一模一样。这里要求任务
- * 特征结束前的布局逐字符不动，结束后只允许增加空白；任务前插入空白、移动位置或
- * 改写任何非空白内容都不算换行证据，宁可报未确认也不补 Enter。
- */
-function hasComposerNewline(before: ScreenSnapshot, after: ScreenSnapshot, proof: string): boolean {
-  const beforeLayout = screenLayout(before.screen);
-  const afterLayout = screenLayout(after.screen);
-  const end = signatureEnd(beforeLayout, proof);
-  if (end === undefined || beforeLayout.slice(0, end) !== afterLayout.slice(0, end)) return false;
-
-  const beforeTail = beforeLayout.slice(end);
-  const afterTail = afterLayout.slice(end);
-  const beforeContent = beforeTail.replace(/\s/g, "");
-  const afterContent = afterTail.replace(/\s/g, "");
-  if (beforeContent !== afterContent) return false;
-  const layoutWhitespaceGrew =
-    afterTail.length - afterContent.length > beforeTail.length - beforeContent.length;
-  // raw screen 会省略尾部空行：Enter 只插入换行时 screen 字符串可能原样不动，
-  // 但 JSON cursor 已经移到下一行。这也是正向换行证据，ignored Enter 不会移动它。
-  return layoutWhitespaceGrew || after.cursor.row > before.cursor.row;
-}
-
 type SubmitObservation =
   | { kind: "changed" }
   | { kind: "newline"; snapshot: ScreenSnapshot }
   | { kind: "dialog"; summary: string }
+  | { kind: "ambiguous" }
   | { kind: "mismatch" }
   | { kind: "unchanged" }
   | { kind: "gone" };
@@ -447,10 +474,10 @@ async function observeSubmission(
   anchor: ComposerAnchor,
 ): Promise<SubmitObservation> {
   const { asd, sleep } = deps;
-  const beforeFingerprint = screenFingerprint(before.screen);
   let candidateKey: string | undefined;
   let candidateStableForMs = 0;
   let sawMismatch = false;
+  let sawAmbiguous = false;
   for (let waitedMs = 0; waitedMs < ECHO_TIMEOUT_MS; waitedMs += ECHO_POLL_MS) {
     await sleep(ECHO_POLL_MS);
     const snapshot = await asd.peekSnapshot(session);
@@ -460,23 +487,12 @@ async function observeSubmission(
     // 同时弹框。绝不能补 Enter，也不能在 proof 未确认离开 composer 时谎报成功。
     const dialog = detectDialog(screen);
     if (dialog !== undefined) return { kind: "dialog", summary: dialog.summary };
-    const payloadState = composerPayloadState(snapshot, text, proof, anchor);
-    // 仍能识别 composer 且唯一 proof 已经离开它，是比“整屏变了”更强的提交证据。
-    if (payloadState === "absent") return { kind: "changed" };
-    // agent 开跑后输入框可能整个消失；结构已无法识别时才退回用户指定的整屏变化判据。
-    if (payloadState === "unknown") {
-      // prompt 字形/UI 换代会让原 anchor 无法识别。不能只因为整屏变了
-      // 就报提交：若 Enter 没生效而界面变成 `❯ X<payload>`，proof 仍在可见
-      // 输入里。这时只能当 mismatch；唯有可见屏幕也找不到 proof 才用布局变化兜底。
-      if (screenHasProof(screen, proof)) {
-        sawMismatch = true;
-      } else if (screenFingerprint(screen) !== beforeFingerprint) {
-        return { kind: "changed" };
-      }
-    }
-    if (payloadState === "mismatch") sawMismatch = true;
-
-    if (payloadState === "present" && hasComposerNewline(before, snapshot, proof)) {
+    // 只接受“原 payload 精确多一个尾部换行”。复用完整 composer 解析，避免整屏
+    // 噪声规则把用户真实输入的 `>`、`─` 或空白变异删掉后误补第二颗 Enter。
+    const newlineEvidence =
+      snapshot.cursor.row > before.cursor.row &&
+      composerMatchesText(snapshot, `${text}\n`, anchor);
+    if (newlineEvidence) {
       const key = `${snapshot.cursor.row}:${snapshot.cursor.col}:${screen}`;
       if (key === candidateKey) {
         candidateStableForMs += ECHO_POLL_MS;
@@ -490,9 +506,28 @@ async function observeSubmission(
     } else {
       candidateKey = undefined;
       candidateStableForMs = 0;
+      const payloadState = composerPayloadState(snapshot, text, proof, anchor);
+      // composer 仍可识别时，只有 proof 明确移到 composer 外且仍在可见历史区，才是
+      // 提交证据。proof 整个消失也可能是外部 attach 用 Ctrl-U 清空，不能报成功。
+      if (payloadState === "absent") {
+        if (screenHasProof(screen, proof)) return { kind: "changed" };
+        sawAmbiguous = true;
+      }
+      // agent 开跑后输入框可能整个消失；结构已无法识别时才退回用户指定的整屏变化判据。
+      if (payloadState === "unknown") {
+        // prompt 字形/UI 换代会让原 anchor 无法识别。proof 仍可见时无法证明它
+        // 在历史还是变异 composer；proof 消失又可能是 Ctrl-U。两种都不能报成功。
+        if (screenHasProof(screen, proof)) {
+          sawMismatch = true;
+        } else {
+          sawAmbiguous = true;
+        }
+      }
+      if (payloadState === "mismatch") sawMismatch = true;
     }
   }
-  return sawMismatch ? { kind: "mismatch" } : { kind: "unchanged" };
+  if (sawMismatch) return { kind: "mismatch" };
+  return sawAmbiguous ? { kind: "ambiguous" } : { kind: "unchanged" };
 }
 
 async function waitForStableEcho(
@@ -522,12 +557,12 @@ async function waitForStableEcho(
     const { screen } = snapshot;
     const dialog = detectDialog(screen);
     if (dialog !== undefined) {
-      return {
-        ok: false,
-        phase: "submit",
+      const failure = {
+        ok: false as const,
+        phase: "submit" as const,
         reason: `任务文本送出后 "${session}" 出现了对话框（${dialog.summary}），没有按回车。`,
-        retainControl: true,
       };
+      return sawText ? { ...failure, retainControl: true } : failure;
     }
 
     if (hasNewComposerEcho(before, snapshot, text, proof, anchor)) {
@@ -559,7 +594,6 @@ async function retryEnter(
   session: string,
   text: string,
   proof: string,
-  stable: ScreenSnapshot,
   newline: ScreenSnapshot,
   anchor: ComposerAnchor,
 ): Promise<Delivery> {
@@ -585,18 +619,12 @@ async function retryEnter(
     };
   }
   const retryState = composerPayloadState(retrySnapshot, text, proof, anchor);
-  if (retryState === "absent") return { ok: true };
+  if (retryState === "absent" && screenHasProof(retryScreen, proof)) return { ok: true };
   if (
-    retryState === "unknown" &&
-    !screenHasProof(retryScreen, proof) &&
-    screenFingerprint(retryScreen) !== screenFingerprint(stable.screen)
-  ) return { ok: true };
-  if (
-    retryState !== "present" ||
     retryScreen !== newline.screen ||
     retrySnapshot.cursor.row !== newline.cursor.row ||
     retrySnapshot.cursor.col !== newline.cursor.col ||
-    !composerHasText(retrySnapshot, text, proof, anchor)
+    !composerMatchesText(retrySnapshot, `${text}\n`, anchor)
   ) {
     return {
       ok: false,
@@ -614,7 +642,7 @@ async function retryEnter(
       gone: true,
     };
   }
-  const second = await observeSubmission(deps, session, newline, text, proof, anchor);
+  const second = await observeSubmission(deps, session, newline, `${text}\n`, proof, anchor);
   if (second.kind === "changed") return { ok: true };
   if (second.kind === "gone") {
     return {
@@ -639,7 +667,9 @@ async function retryEnter(
       second.kind === "mismatch"
         ? `文本已输入 "${session}"，但两次回车后 composer 已发生变化，仍未确认提交；不会重发任务或改派。`
         : `文本已输入 "${session}"，但两次回车后仍未确认提交；不会重发任务或改派。`,
-    ...(second.kind === "mismatch" ? {} : { pendingComposer: true as const }),
+    ...(second.kind === "unchanged" || second.kind === "newline"
+      ? { pendingComposer: true as const }
+      : {}),
     retainControl: true,
   };
 }
@@ -781,12 +811,19 @@ async function deliver(deps: DeliveryDeps, session: string, text: string): Promi
       retainControl: true,
     };
   }
+  if (first.kind === "ambiguous") {
+    return {
+      ok: false,
+      phase: "submit",
+      reason: `文本已输入 "${session}"，但第一颗回车后唯一 proof 从可见屏幕消失，而 composer 仍可识别；它可能已提交，也可能被外部输入清空，无法确认。`,
+      retainControl: true,
+    };
+  }
   return await retryEnter(
     deps,
     session,
     payload,
     proof,
-    echoed.snapshot,
     first.snapshot,
     anchor,
   );

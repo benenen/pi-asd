@@ -142,6 +142,10 @@ function harness(
       | "ignored"
       | "mutated"
       | "mutated-prompt"
+      | "cleared"
+      | "cleared-prompt"
+      | "whitespace-mutated"
+      | "newline-structural-mutation"
       | "history"
       | "history-prompt";
     /** 第一颗 composer Enter 时 session 已消失，asd send 返回退出码 3。 */
@@ -185,6 +189,7 @@ function harness(
   const historySessions = new Set<string>();
   const promptHistorySessions = new Set<string>();
   const mutatedPromptSessions = new Set<string>();
+  const submittedText = new Map<string, string>();
   const inputPrefix = o.screenPrefix ?? "› ";
   /** peek 调用次数，给 startupScreens 排队用。 */
   let peeks = 0;
@@ -272,12 +277,18 @@ function harness(
         if (submitted.has(args[1]!)) {
           // agent 输出完一帧以后，光标回到下一行的空 composer；旧实现把 WORKING
           // 和下一次输入挤在同一行，会让“重新指名交任务”的夹具制造假旧草稿。
-          return ok(peekStdout(args, `SCREEN:${args[1]}\nWORKING\n${inputPrefix}`));
+          return ok(
+            peekStdout(
+              args,
+              `SCREEN:${args[1]}\n• ${submittedText.get(args[1]!) ?? ""}\nWORKING\n${inputPrefix}`,
+            ),
+          );
         }
         const previousOutput = completed.has(args[1]!) ? "WORKING\n" : "";
         const currentInputPrefix = mutatedPromptSessions.has(args[1]!) ? "❯ " : inputPrefix;
+        const renderedEcho = echoed.replaceAll("\n", "\n  ");
         return ok(
-          peekStdout(args, `SCREEN:${args[1]}\n${previousOutput}${currentInputPrefix}${echoed}`),
+          peekStdout(args, `SCREEN:${args[1]}\n${previousOutput}${currentInputPrefix}${renderedEcho}`),
         );
       }
       case "send": {
@@ -319,9 +330,23 @@ function harness(
               // 但唯一 proof 还清清楚楚留在可见输入里。
               typed.set(session, `X${typed.get(session) ?? ""}`);
               mutatedPromptSessions.add(session);
+            } else if (behavior === "cleared") {
+              // 外部 attach 在 Enter 之后抢先清空 composer；proof 消失但任务并未提交。
+              typed.delete(session);
+            } else if (behavior === "cleared-prompt") {
+              // 清空同时 UI 换了 prompt 字形，原 anchor 无法再识别。
+              typed.delete(session);
+              mutatedPromptSessions.add(session);
+            } else if (behavior === "whitespace-mutated") {
+              // proof 仍在，但正文里的真实空格被外部 attach 改写。
+              typed.set(session, (typed.get(session) ?? "").replace("检查提交", "检查 提交"));
+            } else if (behavior === "newline-structural-mutation") {
+              // 第一颗 Enter 插入换行时，外部 attach 同时写入过去会被噪声规则删掉的字符。
+              typed.set(session, `${(typed.get(session) ?? "").replace("检查提交", "检查>提交")}\n`);
             } else if (newlineOnly) {
               typed.set(session, `${typed.get(session) ?? ""}\n`);
             } else {
+              submittedText.set(session, typed.get(session) ?? "");
               typed.delete(session);
               submitted.add(session);
               completed.add(session);
@@ -1684,6 +1709,23 @@ test("回归：ACK 后文本没出现在屏幕上 → submit 报错、不记台�
   assert.equal(enterKeys(h).length, 0, "校验没过就绝不能按回车");
 });
 
+test("ACK 后正文从未回显却出现无关对话框时不授予外部 session 控制权", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    echoScreens: ["❯ 1. Allow unrelated action\n  2. Cancel\n Enter to confirm · Esc to cancel"],
+    swallowText: true,
+  });
+
+  const r = await h.tools.spawn({ task: "检查安全边界", session: "mem" });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(h.registry.size, 0, "没有正文屏幕证据时不能把外部 session 纳入台账");
+  assert.equal(h.watchers.isWatching("mem"), false, "不能为无关对话框启动 watcher");
+  assert.equal(enterKeys(h).length, 0, "无关对话框上绝不能发送 Enter");
+});
+
 test("发送前已有模态框属于 text 失败，正文和 Enter 都不能发送", async () => {
   const h = harness({
     live: [info("mem", { command: "codex", idle_ms: 60_000 })],
@@ -2366,6 +2408,38 @@ test("判空与 sendText 之间并发输入 > 时，结构字符也必须当作�
   assert.equal(enterKeys(h).length, 0, "prompt 已结构化剔除，composer 里额外的 > 不能再当噪声删掉");
 });
 
+test("判空与 sendText 之间并发插入真实空格时不能被布局归一化吞掉", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) =>
+      `SCREEN:mem\n› ${sentText.replace("检查提交证据", "检查 提交证据").replaceAll("\n", "\n  ")}`,
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交证据", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "用户正文里的空格不是 TUI 布局，不能授权 Enter");
+});
+
+test("判空与 sendText 之间并发插入短行换行时不能冒充终端软换行", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    screenPrefix: "› ",
+    screenAfterText: (sentText) =>
+      `SCREEN:mem\n› ${sentText.replace("检查提交证据", "检查\n  提交证据").replaceAll("\n\n", "\n  \n  ")}`,
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交证据", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(enterKeys(h).length, 0, "未占满终端的短行断开是用户换行，不是软换行");
+});
+
 test("Codex 裁顶没有隐藏行计数时只见尾部 proof 仍保守拒绝提交", async () => {
   const task = Array.from({ length: 40 }, (_, i) => `UNIQUE-LINE-${i + 1}`).join("\n");
   const h = harness({
@@ -2675,6 +2749,68 @@ test("首次 Enter 后 composer 被外部改成 X-payload 时，proof 仍在不�
   assert.doesNotMatch(r.text, /asd_nav/, "变异正文不能引导调用方直接提交");
   assert.equal(deliveries(h).length, 1, "正文只能发送一次");
   assert.equal(enterKeys(h).length, 1, "composer 已变异，不能补第二颗 Enter");
+});
+
+test("首次 Enter 后外部清空 composer 时不能把 proof 消失当作提交成功", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "cleared",
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交确认", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.match(r.text, /可能已提交，也可能被外部输入清空/);
+  assert.equal(r.details?.pendingComposer, false, "proof 已不在 composer，不能建议直接补 Enter");
+  assert.equal(enterKeys(h).length, 1, "清空后的空 composer 绝不能收到第二颗 Enter");
+});
+
+test("首次 Enter 后外部清空并切换 prompt 时也不能走整屏变化回退", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "cleared-prompt",
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交确认", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.match(r.text, /可能已提交，也可能被外部输入清空/);
+  assert.equal(r.details?.pendingComposer, false);
+  assert.equal(enterKeys(h).length, 1, "结构未知且 proof 消失仍不能补键或报成功");
+});
+
+test("首次 Enter 后正文空格被改写时不能标成可恢复的原 composer", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "whitespace-mutated",
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交确认", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(r.details?.pendingComposer, false, "真实空格变化不能被当成 exact payload");
+  assert.equal(enterKeys(h).length, 1, "变异正文不能自动补第二颗 Enter");
+});
+
+test("首次 Enter 插入换行时并发写入结构字符也不能触发自动补键", async () => {
+  const h = harness({
+    live: [info("mem", { command: "codex", idle_ms: 60_000 })],
+    cards: [card("mem", "/w/mem")],
+    enterBehavior: "newline-structural-mutation",
+  });
+
+  const r = await h.tools.spawn({ task: "检查提交确认", session: "mem", watch: false });
+
+  assert.equal(r.isError, true);
+  assert.equal(r.details?.phase, "submit");
+  assert.equal(r.details?.pendingComposer, false);
+  assert.equal(enterKeys(h).length, 1, "`>` 是真实正文变异，不能被噪声规则删掉后补 Enter");
 });
 
 test("首次 Enter 后 prompt 换代且变成 X-payload 时，unknown 也必须先查可见 proof", async () => {

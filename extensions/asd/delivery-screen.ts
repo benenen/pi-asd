@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 const SIGNATURE_CHARS = 24;
 const NOISE = /[\s─-╿│█│┃┆┊|>›❯»·]+/g;
-const BORDERS = /[─-╿│█│┃┆┊|>›❯»·]+/g;
 
 export function deliveryMarker(): string {
   return `<!-- pi-asd-delivery:${randomUUID()} -->`;
@@ -10,10 +9,6 @@ export function deliveryMarker(): string {
 
 export function screenFingerprint(screen: string): string {
   return screen.replace(NOISE, "");
-}
-
-export function screenLayout(screen: string): string {
-  return screen.replace(BORDERS, "");
 }
 
 /** 结构解析失效时的最后防线：唯一 proof 是否还清楚可见在当前屏幕。 */

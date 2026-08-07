@@ -65,13 +65,14 @@ const SH_PROBE_PRESETS: Record<string, AgentPreset> = {
   "sh-probe": {
     command: () => "sh -c 'exit 2'", // deliver: send 不走 argv；误走时让测试立即暴露。
     // raw PTY 探针：正文里的换行只回显，不触发提交；整个 session 的第一颗独立
-    // CR 被静默吞掉，后续 CR 才打印 GOT。这样真实覆盖“第一颗 Enter 完全无效，
+    // CR 被静默吞掉，后续 CR 才打印 GOT。LF 字节原样留在缓冲区，显示层模拟
+    // Codex/Claude 的两列 continuation 缩进。这样真实覆盖“第一颗 Enter 完全无效，
     // session 仍进入台账，调用方 peek 后可用 nav 只补 Enter、不重发正文”的恢复路径。
     bare:
       `node -e 'process.stdout.write("› "); process.stdin.setRawMode(true); let b=[]; let swallowed=false; ` +
       `process.stdin.on("data",d=>{for(const x of d){if(x===13){if(!swallowed){swallowed=true;continue} const s=Buffer.from(b).toString(); ` +
       `process.stdout.write("\\r\\nGOT:"+s.replace(/\\n/g,"\\\\n")+"\\r\\n› "); b=[]}else{b.push(x); ` +
-      `process.stdout.write(Buffer.from([x]))}}})'`,
+      `process.stdout.write(x===10?"\\r\\n  ":Buffer.from([x]))}}})'`,
     piChild: false,
     deliver: "send",
   },

@@ -242,12 +242,12 @@ pty 在之后异步发生，失败只 `debug!` 一行。
    `↑ N more` 即使与 payload 行数完全对上，也排除不了 `OLD:` 在判空后与 payload 首行拼在同一终端行，
    此时隐藏行数和可见尾部都不变。在 asd 能原子读取完整 composer 之前，不许拿 suffix 授权 Enter
 3. 保存提交前的稳定屏幕，按 Enter 后继续 peek。还能识别 composer 时，本次唯一 proof 已
-   离开 composer 就是提交证据。「全文不再 exact」不等于「proof 已离开」：若外部 attach 改成
+   离开 composer、并且仍在 composer 外的可见历史区，才是提交证据；proof 整个消失也可能是
+   外部 attach 用 Ctrl-U 清空，必须报未确认。「全文不再 exact」不等于「proof 已离开」：若外部 attach 改成
    `X<payload>`，proof 还在当前 composer，必须当 mismatch 报 submit 未确认，不能报成功或补键。
    composer 整个消失、结构已无法识别时，也要先在可见整屏查唯一 proof；prompt 从
-   `›` 换成 `❯` 不代表 turn 已启动，proof 还可见就仍当 mismatch。只有结构不可识别且可见
-   屏幕也找不到 proof 时，才退回「忽略空白/边框
-   后屏幕已变化」的判据。proof 若仍在 composer，状态栏自己变化不能冒充提交；只有「proof
+   `›` 换成 `❯` 不代表 turn 已启动，proof 还可见就仍当 mismatch，proof 消失也可能是外部
+   清空，必须报未确认，不能拿整屏变化兜底。proof 若仍在 composer，状态栏自己变化不能冒充提交；只有「proof
    结束前的布局逐字符不动、结束后只增加空白」并稳定了一个窗口，才算 Enter 只在原 composer
    末尾插了换行。整屏仍能搜到任务不够——任务可能已经移到历史区；屏幕原样不动也可能是
    TUI 把第一颗 Enter 整颗吞掉，也可能只是按键仍在队列里，不能直接报成功或自动补键
@@ -279,7 +279,7 @@ session，也不能重发正文**，否则旧 session 稍后也开始执行时�
 new 的则保留 `createdByUs: true`，并按 `watch` 设置 watcher。**这不是宣称任务已派出**；
 工具仍返回错误，只是不能把已被我们修改过的 session 留在台账外，否则 `asd_steer` /
 `asd_nav` 会一起拒绝，输入框里的正文又挡住下一次 spawn，形成只能绕过工具直写 PTY 的
-死锁。唯一 proof 仍在原 composer、可见正文按 TUI 布局空白归一化后匹配时返回
+死锁。唯一 proof 仍在原 composer、可见正文只剔除可证明的 TUI 软换行与 continuation 缩进后精确匹配时返回
 `pendingComposer: true`；这不是字节级 exact，也不能证明上一颗 Enter 不在队列，所以只提示
 先 peek、由用户明确决定是否 nav Enter，不能自动补。正文已变异时绝不能给这条提示。仅有
 ACK、5s 内一次正文回显都没看到时仍不新增台账，因为 ACK 本身不是 PTY 写入证据。
